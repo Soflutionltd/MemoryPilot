@@ -79,7 +79,7 @@ chmod +x ~/.local/bin/MemoryPilot
 xattr -cr ~/.local/bin/MemoryPilot  # macOS only
 ```
 
-### Cursor Integration
+### Cursor Integration (Zero-Config)
 
 Add to `~/.cursor/mcp.json`:
 
@@ -92,6 +92,8 @@ Add to `~/.cursor/mcp.json`:
   }
 }
 ```
+
+**That's it.** MemoryPilot automatically injects a dynamic System Prompt into Cursor and Claude Desktop on startup. The AI will proactively act as your autonomous secretary, calling the `add_memory` tool in the background to store your architecture decisions, API keys, and bug fixes without you having to write any `.cursorrules` or prompt it manually.
 
 Or use via [McpHub](https://github.com/Soflution1/McpHub) for SSE transport with all your other MCP servers.
 
