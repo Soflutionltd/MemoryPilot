@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF-blueviolet" alt="Hybrid RRF"/>
   <img src="https://img.shields.io/badge/embeddings-fastembed_(all--MiniLM--L6--v2)-blue" alt="fastembed"/>
-  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"/>
+  <img src="https://img.shields.io/badge/license-Apache_2.0-blue" alt="Apache 2.0"/>
 </p>
 
 ---
@@ -326,4 +326,4 @@ Metrics:
 
 ## License
 
-MIT — Built by [SOFLUTION LTD](https://soflution.com)
+Apache 2.0 — Built by [SOFLUTION LTD](https://soflution.com)
