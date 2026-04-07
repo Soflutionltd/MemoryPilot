@@ -21,26 +21,27 @@
 
 AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness, semantic understanding, and automatic knowledge organization.
 
-**vs every other MCP memory server:**
+**vs the best MCP memory servers:**
 
-| Feature | MemoryPilot v4.0 | MCP Memory (Node.js) | Other Rust/Python servers |
-|---------|-----------------|----------------------|--------------------------|
-| Search | Hybrid BM25 + fastembed RRF (384-dim transformers) | Unranked filter | BM25 only |
-| Embeddings | fastembed all-MiniLM-L6-v2 (local ONNX) | None | OpenAI API calls |
-| Knowledge Graph | Temporal triples with validity periods + entity extraction | No | No |
-| GraphRAG | Auto entity extraction + graph traversal + link boosting | No | No |
+| Feature | MemoryPilot v4.0 | MemPalace | Mem0 |
+|---------|-----------------|-----------|------|
+| Search | Hybrid BM25 + fastembed RRF (384-dim) | Keyword only | Vector search (cloud API) |
+| Embeddings | fastembed all-MiniLM-L6-v2 (local ONNX) | None | OpenAI API calls (external) |
+| Knowledge Graph | Temporal triples with validity + confidence | No | Basic graph (no temporal) |
+| GraphRAG | Auto entity extraction + graph traversal | No | No |
 | Chunked RAG | Transcript auto-chunking + auto-distillation | No | No |
-| Compression | AAAK compact dialect (~3x token savings) | No | No |
+| Compression | AAAK compact dialect (~3x token savings) | AAAK dialect | No |
 | Person detection | Auto-detects team members from text | No | No |
 | Self-Healing | Background auto-linting loop | No | No |
-| Garbage collection | Heuristic merge + scoring + orphan cleanup | No | TTL only |
-| Project brain (<1500 tokens) | Yes, with team members | No | No |
-| File watcher context boost | Yes | No | No |
-| Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | No | Basic exact match |
-| HTTP API | Multi-threaded REST server (optional) | No | No |
-| Memory types | 13 types, importance 1-5 | 1 type | 2-3 types |
-| Startup | 1-2 ms | 50-100 ms | 5-20 ms |
-| Binary | 22 MB (ONNX bundled) | 200 MB+ (node_modules) | 5-50 MB |
+| Garbage collection | Heuristic merge + scoring + orphan cleanup | No | Basic TTL |
+| Project brain | Yes, with team members (<1500 tokens) | No | No |
+| File watcher | Context boost from recent edits | No | No |
+| Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity |
+| HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted |
+| Memory types | 13 types, importance 1-5 | 3 types | 1 type |
+| Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
+| Startup | 1-2 ms | ~5 ms | N/A (cloud) |
+| Binary | 22 MB single binary, zero deps | ~2 MB (Python) | SaaS / pip install |
 | Storage | SQLite WAL + FTS5 + connection pool | JSON files | SQLite basic |
 | Concurrency | Lazy embedding thread + read pool + debounced cleanup | Single-threaded | Single-threaded |
 
