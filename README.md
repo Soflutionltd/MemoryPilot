@@ -26,7 +26,7 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 | Feature | MemoryPilot v4.0 | MCP Memory (Node.js) | Other Rust/Python servers |
 |---------|-----------------|----------------------|--------------------------|
 | Search | Hybrid BM25 + fastembed RRF (384-dim transformers) | Unranked filter | BM25 only |
-| Embeddings | fastembed all-MiniLM-L6-v2 (ONNX) + TF-IDF fallback | None | OpenAI API calls |
+| Embeddings | fastembed all-MiniLM-L6-v2 (local ONNX) | None | OpenAI API calls |
 | Knowledge Graph | Temporal triples with validity periods + entity extraction | No | No |
 | GraphRAG | Auto entity extraction + graph traversal + link boosting | No | No |
 | Chunked RAG | Transcript auto-chunking + auto-distillation | No | No |
@@ -40,8 +40,7 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 | HTTP API | Multi-threaded REST server (optional) | No | No |
 | Memory types | 13 types, importance 1-5 | 1 type | 2-3 types |
 | Startup | 1-2 ms | 50-100 ms | 5-20 ms |
-| Binary (default) | 22 MB (with ONNX embeddings) | 200 MB+ (node_modules) | 5-50 MB |
-| Binary (lite) | 2.7 MB (TF-IDF only) | — | — |
+| Binary | 22 MB (ONNX bundled) | 200 MB+ (node_modules) | 5-50 MB |
 | Storage | SQLite WAL + FTS5 + connection pool | JSON files | SQLite basic |
 | Concurrency | Lazy embedding thread + read pool + debounced cleanup | Single-threaded | Single-threaded |
 
@@ -49,7 +48,7 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 
 ### 1. Hybrid Search (BM25 + fastembed RRF)
 
-Every memory gets a 384-dimension embedding vector on insert via `fastembed` (all-MiniLM-L6-v2, local ONNX inference — no API calls). Search runs both BM25 full-text and cosine similarity in parallel, then merges results with Reciprocal Rank Fusion.
+Every memory gets a 384-dimension transformer embedding on insert via `fastembed` (all-MiniLM-L6-v2, local ONNX inference — no API calls, no external services). Search runs both BM25 full-text and cosine similarity in parallel, then merges results with Reciprocal Rank Fusion.
 
 Results are boosted by importance weighting, knowledge graph link density, file watcher context, and penalized for expired knowledge triples.
 
@@ -106,8 +105,6 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 
 ## Install
 
-### Default (with fastembed — recommended)
-
 ```bash
 git clone https://github.com/Soflution1/MemoryPilot.git
 cd MemoryPilot
@@ -115,12 +112,6 @@ cargo build --release
 cp target/release/MemoryPilot ~/.local/bin/
 chmod +x ~/.local/bin/MemoryPilot
 xattr -cr ~/.local/bin/MemoryPilot  # macOS only
-```
-
-### Lite (TF-IDF only — 2.7 MB binary)
-
-```bash
-cargo build --release --no-default-features --features lite
 ```
 
 ### With HTTP server
@@ -254,7 +245,7 @@ src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server 
 src/db.rs          — SQLite engine: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
 src/tools.rs       — 28 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
-src/embedding.rs   — Dual engine: fastembed (all-MiniLM-L6-v2) + TF-IDF fallback, LRU cache
+src/embedding.rs   — fastembed (all-MiniLM-L6-v2) transformer embeddings, LRU cache
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal
 src/gc.rs          — GC scoring, heuristic memory merging, stopwords
 src/watcher.rs     — File system watcher + auto-linter with persistent DB connection
@@ -276,17 +267,17 @@ config             — key/value store
 
 ## Performance
 
-| Metric | Default (fastembed) | Lite (TF-IDF) |
-|--------|-------------------|----------------|
-| Binary size | 22 MB | 2.7 MB |
-| Startup | 1-2 ms | 1-2 ms |
-| Search (hybrid RRF) | <2 ms | <1 ms |
-| `add_memory` latency | <1 ms (lazy embed) | <1 ms (lazy embed) |
-| Embedding quality | Transformer (384-dim, all-MiniLM-L6-v2) | TF-IDF (384-dim) |
-| Backfill (1000 memories) | ~30s (skips unchanged) | ~1s |
-| RAM | ~15 MB | ~5 MB |
-| Read concurrency | 4 pooled connections | 4 pooled connections |
-| Runtime dependencies | **None** (ONNX bundled) | **None** |
+| Metric | Value |
+|--------|-------|
+| Binary size | 22 MB |
+| Startup | 1-2 ms |
+| Search (hybrid RRF) | <2 ms |
+| `add_memory` latency | <1 ms (lazy embed) |
+| Embedding quality | Transformer 384-dim (all-MiniLM-L6-v2) |
+| Backfill (1000 memories) | ~30s (skips unchanged via hash) |
+| RAM | ~15 MB |
+| Read concurrency | 4 pooled connections |
+| Runtime dependencies | **None** (ONNX bundled) |
 
 ### Optimizations
 

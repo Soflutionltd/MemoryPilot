@@ -56,7 +56,7 @@ fn handle_health() -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
         "status": "ok",
         "server": "MemoryPilot",
         "version": env!("CARGO_PKG_VERSION"),
-        "embedding_engine": if crate::embedding::is_fastembed_active() { "fastembed" } else { "tfidf" },
+        "embedding_engine": "fastembed (all-MiniLM-L6-v2)",
     });
     tiny_http::Response::from_string(serde_json::to_string_pretty(&body).unwrap())
         .with_header(content_type_json())

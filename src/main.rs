@@ -1,8 +1,8 @@
 #![recursion_limit = "256"]
 
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
-/// Hybrid search (BM25 + fastembed/TF-IDF RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
-/// (c) SOFLUTION LTD — MIT License
+/// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
+/// (c) SOFLUTION LTD — Apache 2.0 License
 mod db;
 mod protocol;
 mod tools;
@@ -102,8 +102,7 @@ fn run_migrate() {
 }
 
 fn run_backfill() {
-    let engine = if crate::embedding::is_fastembed_active() { "fastembed (all-MiniLM-L6-v2)" } else { "TF-IDF" };
-    eprintln!("Embedding engine: {}", engine);
+    eprintln!("Embedding engine: fastembed (all-MiniLM-L6-v2)");
     let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
     match db.backfill_embeddings() {
         Ok(n) => println!("✓ Generated embeddings for {} memories (missing only).", n),
@@ -119,8 +118,7 @@ fn run_http_server(port: u16) {
 }
 
 fn run_backfill_force() {
-    let engine = if crate::embedding::is_fastembed_active() { "fastembed (all-MiniLM-L6-v2)" } else { "TF-IDF" };
-    eprintln!("Embedding engine: {} (force overwrite ALL)", engine);
+    eprintln!("Embedding engine: fastembed (all-MiniLM-L6-v2) (force overwrite ALL)");
     let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
     match db.backfill_embeddings_force() {
         Ok(n) => println!("✓ Regenerated embeddings for ALL {} memories.", n),
@@ -157,7 +155,7 @@ fn print_help() {
     println!("MCP TOOLS (28):");
     println!("  recall              Load all context in one shot (start here)");
     println!("  get_project_brain   Instant project summary (<1500 tokens)");
-    println!("  search_memory       Hybrid BM25 + TF-IDF RRF search");
+    println!("  search_memory       Hybrid BM25 + fastembed RRF search");
     println!("  get_file_context    Memories related to recently modified files");
     println!("  add_memory          Store with auto-dedup, entities, graph links");
     println!("  add_memories        Bulk add multiple memories in 1 call");
@@ -187,6 +185,6 @@ fn print_help() {
     println!();
     println!("STORAGE:    ~/.MemoryPilot/memory.db");
     println!("SEARCH:     Hybrid BM25 + vector RRF + KG boost + watcher context");
-    println!("EMBEDDINGS: fastembed (all-MiniLM-L6-v2) | TF-IDF fallback");
+    println!("EMBEDDINGS: fastembed (all-MiniLM-L6-v2)");
     println!("BUILT BY:   SOFLUTION LTD");
 }
