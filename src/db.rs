@@ -660,6 +660,55 @@ impl Database {
         link_boosts
     }
 
+    fn get_kg_expansion_terms(&self, query: &str) -> Vec<String> {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        if words.len() > 15 { return Vec::new(); }
+
+        let mut terms: Vec<String> = Vec::new();
+        let query_lower = query.to_lowercase();
+
+        for word in &words {
+            if word.len() < 3 { continue; }
+            let lower = word.to_lowercase();
+
+            // KG triples: related subjects/objects
+            if let Ok(mut stmt) = self.conn.prepare(
+                "SELECT DISTINCT object FROM knowledge_triples WHERE lower(subject) = ?1 AND valid_to IS NULL LIMIT 3"
+            ) {
+                if let Ok(rows) = stmt.query_map(params![&lower], |r| r.get::<_, String>(0)) {
+                    for r in rows.flatten() {
+                        if !query_lower.contains(&r.to_lowercase()) && r.len() >= 2 { terms.push(r.to_lowercase()); }
+                    }
+                }
+            }
+            if let Ok(mut stmt) = self.conn.prepare(
+                "SELECT DISTINCT subject FROM knowledge_triples WHERE lower(object) = ?1 AND valid_to IS NULL LIMIT 3"
+            ) {
+                if let Ok(rows) = stmt.query_map(params![&lower], |r| r.get::<_, String>(0)) {
+                    for r in rows.flatten() {
+                        if !query_lower.contains(&r.to_lowercase()) && r.len() >= 2 { terms.push(r.to_lowercase()); }
+                    }
+                }
+            }
+
+            // Entity co-occurrence
+            if let Ok(mut stmt) = self.conn.prepare(
+                "SELECT DISTINCT b.entity_value FROM memory_entities a \
+                 JOIN memory_entities b ON a.memory_id = b.memory_id AND a.entity_value != b.entity_value \
+                 WHERE lower(a.entity_value) = ?1 LIMIT 4"
+            ) {
+                if let Ok(rows) = stmt.query_map(params![lower], |r| r.get::<_, String>(0)) {
+                    for r in rows.flatten() {
+                        if !query_lower.contains(&r.to_lowercase()) && r.len() >= 2 { terms.push(r.to_lowercase()); }
+                    }
+                }
+            }
+        }
+
+        terms.truncate(12);
+        terms
+    }
+
     fn build_adjacency_set(&self, ids: &[String]) -> std::collections::HashSet<(String, String)> {
         let mut adj = std::collections::HashSet::new();
         if ids.is_empty() { return adj; }
@@ -1936,16 +1985,20 @@ impl Database {
     pub fn search(&self, query: &str, limit: usize, project: Option<&str>,
                   kind: Option<&str>, tags: Option<&[String]>, watcher_keywords: Option<&[String]>) -> Result<Vec<SearchResult>, String> {
         let canonical_project = Self::canonical_project(project);
+
+        // Build FTS terms from original query (no expansion — keeps precision)
         let fts_terms: String = query.split_whitespace()
             .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" ");
         if fts_terms.is_empty() { return Ok(Vec::new()); }
 
-        // Clean expired before search
         let _ = self.cleanup_expired();
 
         let query_emb = cached_embed_text(query);
+
+        // Pre-compute KG expansion terms for post-retrieval scoring boost
+        let kg_expansion = self.get_kg_expansion_terms(query);
 
         // 1. BM25 Search
         let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
@@ -2043,14 +2096,42 @@ impl Database {
         // Batch-query knowledge triple counts (avoids N+1)
         let triple_counts = self.batch_triple_counts(&candidate_ids);
         
+        let now_ts = Utc::now().timestamp() as f64;
+
         for (id, mem) in &all_memories {
             let bm25_rank = bm25_results.get(id).copied().unwrap_or(1000);
             let vec_rank = vector_results.get(id).copied().unwrap_or(1000);
             let mut score = crate::embedding::rrf_score(bm25_rank, vec_rank);
             
-            // Boost score by importance (1.0 to 5.0 factor approx)
-            score = score * (mem.importance as f64 / 3.0); 
-            
+            // Importance-weighted scoring: smooth curve centered at 3
+            // imp 5 → 1.20x, imp 4 → 1.10x, imp 3 → 1.0x, imp 2 → 0.92x, imp 1 → 0.85x
+            let imp_factor = match mem.importance {
+                5 => 1.20, 4 => 1.10, 3 => 1.00, 2 => 0.92, _ => 0.85,
+            };
+            score *= imp_factor;
+
+            // Temporal recency boost: memories from last 7 days get up to +15%, decaying over 90 days
+            if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&mem.updated_at) {
+                let age_days = (now_ts - updated.timestamp() as f64) / 86400.0;
+                let recency = if age_days <= 7.0 {
+                    1.15
+                } else if age_days <= 90.0 {
+                    1.0 + 0.15 * ((90.0 - age_days) / 83.0)
+                } else {
+                    1.0
+                };
+                score *= recency;
+            }
+
+            // KG expansion boost: reward memories mentioning related entities
+            if !kg_expansion.is_empty() {
+                let content_lower = mem.content.to_lowercase();
+                let kg_hits = kg_expansion.iter().filter(|t| content_lower.contains(t.as_str())).count();
+                if kg_hits > 0 {
+                    score *= 1.0 + (kg_hits as f64 * 0.08).min(0.30);
+                }
+            }
+
             // PageRank-like link boost
             if let Some(lb) = link_boosts.get(id) {
                 if *lb < 0.0 {

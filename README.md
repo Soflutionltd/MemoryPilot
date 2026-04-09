@@ -72,7 +72,7 @@ Entities (technologies, files, components, people) are automatically extracted f
 
 Every memory is automatically analyzed for entities: technologies, file paths, components, projects, and **people**. Entities are stored in a dedicated table. Memories sharing entities are auto-linked with inferred relationship types (`resolves`, `implements`, `depends_on`, `deprecates`...).
 
-When searching, MemoryPilot traverses the knowledge graph from the top matches to pull in related context — e.g., finding the architecture decision that led to a specific bug fix. A **combinatorial reranker** then selects the best *cluster* of connected memories rather than independent top-K results, producing cohesive context (98% cluster coherence).
+When searching, MemoryPilot traverses the knowledge graph from the top matches to pull in related context — e.g., finding the architecture decision that led to a specific bug fix. A **combinatorial reranker** then selects the best *cluster* of connected memories rather than independent top-K results, producing cohesive context (95.7% cluster coherence). Query-time KG expansion, temporal recency boost, and importance-weighted scoring push NDCG@10 to 85.6%.
 
 ### 4. Chunked RAG (Transcripts)
 
@@ -294,6 +294,9 @@ config             — key/value store
 - **Debounced cleanup**: expired memory cleanup runs max once per 60 seconds
 - **Prepared statements**: graph traversal prepares SQL once, not per node
 - **Combinatorial reranker**: greedy subgraph selection boosts connected memory clusters (+15% per connection)
+- **KG query expansion**: post-retrieval scoring boost from knowledge graph related terms (+8% per entity match)
+- **Temporal recency boost**: memories from last 7 days get +15%, decaying over 90 days
+- **Importance-weighted scoring**: importance 5 → 1.20x, importance 1 → 0.85x (smooth curve)
 
 ## Benchmarks
 
@@ -301,11 +304,11 @@ config             — key/value store
 
 | Metric | MemoryPilot v4.0 |
 |--------|-----------------|
-| **R@5** | **90%** |
+| **R@5** | **93.3%** |
 | **R@10** | **100%** |
-| **NDCG@10** | **75.4%** |
-| **Cluster Coherence** | **98%** |
-| **Avg Search Latency** | **9.86 ms** |
+| **NDCG@10** | **85.6%** |
+| **Cluster Coherence** | **95.7%** |
+| **Avg Search Latency** | **~10 ms** |
 
 > Measured on a real multi-project memory base (500 memories across 6 projects) with the combinatorial reranker enabled. Cluster coherence measures the percentage of top-5 results that share entity connections — higher means the returned context is more cohesive and useful.
 
