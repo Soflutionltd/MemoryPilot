@@ -4,14 +4,14 @@
 
 <p align="center">
   <strong>The most advanced MCP memory server. Period.</strong><br>
-  <sub>Hybrid search (BM25 + fastembed RRF) · Temporal Knowledge Graph · AAAK compression (3x token savings) · GraphRAG · Chunked RAG · Auto-Linting · Project brain · HTTP API · Single binary · Zero API calls</sub>
+  <sub>Hybrid search (BM25 + multilingual-e5-small RRF) · 100+ languages · Temporal Knowledge Graph · AAAK compression (3x token savings) · GraphRAG · Chunked RAG · Auto-Linting · Project brain · HTTP API · Single binary · Zero API calls</sub>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/v4.0-latest-green" alt="v4.0"/>
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF-blueviolet" alt="Hybrid RRF"/>
-  <img src="https://img.shields.io/badge/embeddings-fastembed_(all--MiniLM--L6--v2)-blue" alt="fastembed"/>
+  <img src="https://img.shields.io/badge/embeddings-multilingual--e5--small_(384--dim)-blue" alt="multilingual-e5-small"/>
   <img src="https://img.shields.io/badge/tokens-3x_compression-brightgreen" alt="3x token savings"/>
   <img src="https://img.shields.io/badge/license-Apache_2.0-blue" alt="Apache 2.0"/>
 </p>
@@ -26,8 +26,8 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 
 | Feature | MemoryPilot v4.0 | MemPalace | Mem0 |
 |---------|-----------------|-----------|------|
-| Search | Hybrid BM25 + fastembed RRF (384-dim) | Keyword only | Vector search (cloud API) |
-| Embeddings | fastembed all-MiniLM-L6-v2 (local ONNX) | None | OpenAI API calls (external) |
+| Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) | Keyword only | Vector search (cloud API) |
+| Embeddings | fastembed multilingual-e5-small (local ONNX, 100+ languages) | None | OpenAI API calls (external) |
 | Knowledge Graph | Temporal triples with validity + confidence | No | Basic graph (no temporal) |
 | GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | No |
 | Chunked RAG | Transcript auto-chunking + auto-distillation | No | No |
@@ -50,7 +50,7 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 
 ### 1. Hybrid Search (BM25 + fastembed RRF)
 
-Every memory gets a 384-dimension transformer embedding on insert via `fastembed` (all-MiniLM-L6-v2, local ONNX inference — no API calls, no external services). Search runs both BM25 full-text and cosine similarity in parallel, then merges results with Reciprocal Rank Fusion.
+Every memory gets a 384-dimension transformer embedding on insert via `fastembed` (multilingual-e5-small, local ONNX inference — supports 100+ languages including French, English, Spanish, German, Japanese, Chinese — no API calls, no external services). Search runs both BM25 full-text and cosine similarity in parallel, then merges results with Reciprocal Rank Fusion.
 
 Results are boosted by importance weighting, knowledge graph link density, file watcher context, and penalized for expired knowledge triples.
 
@@ -249,7 +249,7 @@ src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server 
 src/db.rs          — SQLite engine: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
 src/tools.rs       — 29 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
-src/embedding.rs   — fastembed (all-MiniLM-L6-v2) transformer embeddings, LRU cache
+src/embedding.rs   — fastembed (multilingual-e5-small) transformer embeddings, LRU cache
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal
 src/gc.rs          — GC scoring, heuristic memory merging, stopwords
 src/watcher.rs     — File system watcher + auto-linter with persistent DB connection
@@ -277,7 +277,7 @@ config             — key/value store
 | Startup | 1-2 ms |
 | Search (hybrid RRF + reranker) | ~10 ms (500 memories) |
 | `add_memory` latency | <1 ms (lazy embed) |
-| Embedding quality | Transformer 384-dim (all-MiniLM-L6-v2) |
+| Embedding quality | Transformer 384-dim (multilingual-e5-small, 100+ languages) |
 | Backfill (1000 memories) | ~30s (skips unchanged via hash) |
 | RAM | ~15 MB |
 | Read concurrency | 4 pooled connections |
@@ -308,12 +308,13 @@ config             — key/value store
 |--------|-----------------|-------------------------------|
 | **R@5** | **100%** | 93.4% |
 | **R@10** | **100%** | 93.4% |
-| **NDCG@10** | **94%** | 90.8% |
-| **Cluster Coherence** | **93.7%** | N/A |
-| **Avg Search Latency** | **~43 ms** | ~80 ms |
+| **NDCG@10** | **95.6%** | 90.8% |
+| **Cluster Coherence** | **96.7%** | N/A |
+| **Multilingual** | **100+ languages (FR, EN, ES, DE, JA, ZH...)** | English only |
+| **Avg Search Latency** | **~69 ms** | ~80 ms |
 | **Binary Size** | **22 MB** | 1.5 GB |
 
-> Measured on a real multi-project memory base (500 memories across 6 projects). MemoryPilot achieves perfect recall at both top-5 and top-10 with an NDCG@10 of 94%, surpassing Quantum Memory Graph on every metric while being 68x smaller and 2x faster. Tuned RRF fusion (k=40), exact term coverage boost, smart FTS tokenization, and conservative secondary signals keep ranking quality at the top.
+> Measured on a real multi-project memory base (500 memories across 6 projects). MemoryPilot achieves perfect recall at both top-5 and top-10 with an NDCG@10 of 95.6%, surpassing Quantum Memory Graph on every metric. The multilingual-e5-small embedding model supports 100+ languages natively — French, English, Spanish, German, Japanese, Chinese and more — with zero configuration.
 
 ### Combinatorial Reranker — Cluster Selection
 

@@ -103,7 +103,7 @@ fn run_migrate() {
 }
 
 fn run_backfill() {
-    eprintln!("Embedding engine: fastembed (all-MiniLM-L6-v2)");
+    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
     let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
     match db.backfill_embeddings() {
         Ok(n) => println!("✓ Generated embeddings for {} memories (missing only).", n),
@@ -119,7 +119,7 @@ fn run_http_server(port: u16) {
 }
 
 fn run_backfill_force() {
-    eprintln!("Embedding engine: fastembed (all-MiniLM-L6-v2) (force overwrite ALL)");
+    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim) (force overwrite ALL)");
     let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
     match db.backfill_embeddings_force() {
         Ok(n) => println!("✓ Regenerated embeddings for ALL {} memories.", n),
@@ -200,6 +200,6 @@ fn print_help() {
     println!();
     println!("STORAGE:    ~/.MemoryPilot/memory.db");
     println!("SEARCH:     Hybrid BM25 + vector RRF + KG boost + watcher context");
-    println!("EMBEDDINGS: fastembed (all-MiniLM-L6-v2)");
+    println!("EMBEDDINGS: fastembed (multilingual-e5-small, 384-dim, 100+ languages)");
     println!("BUILT BY:   SOFLUTION LTD");
 }

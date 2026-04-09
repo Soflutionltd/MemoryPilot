@@ -2694,16 +2694,17 @@ impl Database {
         let mut skipped = 0usize;
         for r in rows.flatten() {
             let (id, content, existing_hash) = r;
-            let new_hash = content_hash(&content);
-            if force && existing_hash.as_deref() == Some(&new_hash) {
-                // Content unchanged — check if embedding already exists
-                let has_emb: bool = self.conn.query_row(
-                    "SELECT embedding IS NOT NULL FROM memories WHERE id = ?1",
-                    params![&id], |r| r.get(0)
-                ).unwrap_or(false);
-                if has_emb {
-                    skipped += 1;
-                    continue;
+            if !force {
+                let new_hash = content_hash(&content);
+                if existing_hash.as_deref() == Some(&new_hash) {
+                    let has_emb: bool = self.conn.query_row(
+                        "SELECT embedding IS NOT NULL FROM memories WHERE id = ?1",
+                        params![&id], |r| r.get(0)
+                    ).unwrap_or(false);
+                    if has_emb {
+                        skipped += 1;
+                        continue;
+                    }
                 }
             }
             to_embed.push((id, content));

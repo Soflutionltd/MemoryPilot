@@ -1,5 +1,6 @@
 /// MemoryPilot v4.0 — Embedding Engine.
-/// fastembed transformer (all-MiniLM-L6-v2, 384-dim, local ONNX inference).
+/// fastembed transformer (multilingual-e5-small, 384-dim, local ONNX inference).
+/// Supports 100+ languages including French and English natively.
 use std::sync::{Mutex, OnceLock};
 
 const VECTOR_DIM: usize = 384;
@@ -8,7 +9,7 @@ static FASTEMBED_MODEL: OnceLock<Mutex<fastembed::TextEmbedding>> = OnceLock::ne
 
 fn get_model() -> &'static Mutex<fastembed::TextEmbedding> {
     FASTEMBED_MODEL.get_or_init(|| {
-        let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+        let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
             .with_show_download_progress(false);
         let model = fastembed::TextEmbedding::try_new(opts)
             .expect("[MemoryPilot] fastembed init failed — cannot start without embedding engine");
