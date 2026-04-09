@@ -33,6 +33,7 @@ fn main() {
     if args.iter().any(|a| a == "--backfill-force") { run_backfill_force(); return; }
     if args.iter().any(|a| a == "--backfill") { run_backfill(); return; }
     if args.iter().any(|a| a == "--benchmark-recall") { run_benchmark_recall(&args); return; }
+    if args.iter().any(|a| a == "--benchmark-search") { run_benchmark_search(&args); return; }
     #[cfg(feature = "http")]
     {
         if let Some(pos) = args.iter().position(|a| a == "--http") {
@@ -139,6 +140,19 @@ fn run_benchmark_recall(args: &[String]) {
     }
 }
 
+fn run_benchmark_search(args: &[String]) {
+    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let scenario_limit = args
+        .windows(2)
+        .find(|window| window[0] == "--scenario-limit")
+        .and_then(|window| window[1].parse::<usize>().ok())
+        .unwrap_or(20);
+    match db.benchmark_search(scenario_limit) {
+        Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())),
+        Err(error) => { eprintln!("✗ Search benchmark failed: {}", error); std::process::exit(1); }
+    }
+}
+
 fn print_help() {
     println!("MemoryPilot v{} — MCP memory server with SQLite FTS5", VERSION);
     println!();
@@ -149,10 +163,11 @@ fn print_help() {
     println!("  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
+    println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot --help           Show this help");
     println!();
-    println!("MCP TOOLS (28):");
+    println!("MCP TOOLS (29):");
     println!("  recall              Load all context in one shot (start here)");
     println!("  get_project_brain   Instant project summary (<1500 tokens)");
     println!("  search_memory       Hybrid BM25 + fastembed RRF search");

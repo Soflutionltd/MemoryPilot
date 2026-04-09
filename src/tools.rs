@@ -196,6 +196,16 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "benchmark_search",
+            "description": "Search quality benchmark. Measures R@5, R@10, NDCG@10, cluster coherence (combinatorial reranker quality), and average search latency. Uses real memories as targets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scenario_limit": { "type": "integer", "default": 20 }
+                }
+            }
+        },
+        {
             "name": "get_global_prompt",
             "description": "Load GLOBAL_PROMPT.md. Auto-scans: 1) configured path, 2) ~/.MemoryPilot/GLOBAL_PROMPT.md, 3) project root GLOBAL_PROMPT.md.",
             "inputSchema": {
@@ -338,6 +348,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "list_projects" => handle_list_projects(db),
         "get_stats" => handle_stats(db),
         "benchmark_recall" => handle_benchmark_recall(db, args),
+        "benchmark_search" => handle_benchmark_search(db, args),
         "get_global_prompt" => handle_global_prompt(db, args),
         "export_memories" => handle_export(db, args),
         "set_config" => handle_set_config(db, args),
@@ -573,6 +584,14 @@ fn handle_stats(db: &Database) -> Value {
 fn handle_benchmark_recall(db: &Database, args: &Value) -> Value {
     let scenario_limit = args.get("scenario_limit").and_then(|v| v.as_u64()).unwrap_or(12) as usize;
     match db.benchmark_recall(scenario_limit) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(error) => tool_error(&error),
+    }
+}
+
+fn handle_benchmark_search(db: &Database, args: &Value) -> Value {
+    let scenario_limit = args.get("scenario_limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    match db.benchmark_search(scenario_limit) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(error) => tool_error(&error),
     }

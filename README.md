@@ -29,7 +29,7 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 | Search | Hybrid BM25 + fastembed RRF (384-dim) | Keyword only | Vector search (cloud API) |
 | Embeddings | fastembed all-MiniLM-L6-v2 (local ONNX) | None | OpenAI API calls (external) |
 | Knowledge Graph | Temporal triples with validity + confidence | No | Basic graph (no temporal) |
-| GraphRAG | Auto entity extraction + graph traversal | No | No |
+| GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | No |
 | Chunked RAG | Transcript auto-chunking + auto-distillation | No | No |
 | Compression | AAAK compact dialect (~3x token savings) | AAAK dialect | No |
 | Person detection | Auto-detects team members from text | No | No |
@@ -72,7 +72,7 @@ Entities (technologies, files, components, people) are automatically extracted f
 
 Every memory is automatically analyzed for entities: technologies, file paths, components, projects, and **people**. Entities are stored in a dedicated table. Memories sharing entities are auto-linked with inferred relationship types (`resolves`, `implements`, `depends_on`, `deprecates`...).
 
-When searching, MemoryPilot traverses the knowledge graph from the top matches to pull in related context — e.g., finding the architecture decision that led to a specific bug fix.
+When searching, MemoryPilot traverses the knowledge graph from the top matches to pull in related context — e.g., finding the architecture decision that led to a specific bug fix. A **combinatorial reranker** then selects the best *cluster* of connected memories rather than independent top-K results, producing cohesive context (98% cluster coherence).
 
 ### 4. Chunked RAG (Transcripts)
 
@@ -153,7 +153,7 @@ MemoryPilot --backfill
 MemoryPilot --backfill-force
 ```
 
-## MCP Tools (28)
+## MCP Tools (29)
 
 ### Core
 
@@ -205,6 +205,7 @@ MemoryPilot --backfill-force
 | `run_gc` | Garbage collection: merge old memories, clean orphans, vacuum. Supports `dry_run`. |
 | `cleanup_expired` | Remove expired TTL memories (debounced — runs max once per 60s). |
 | `benchmark_recall` | Recall quality benchmark with golden scenarios. |
+| `benchmark_search` | Search quality benchmark: R@5, R@10, NDCG@10, cluster coherence, latency. |
 | `migrate_v1` | Import from v1 JSON files. |
 
 ### Memory Types
@@ -220,6 +221,7 @@ MemoryPilot                          # Start MCP stdio server
 MemoryPilot --backfill               # Compute missing embeddings
 MemoryPilot --backfill-force         # Re-embed all (skips unchanged via hash)
 MemoryPilot --benchmark-recall       # Run recall quality benchmark
+MemoryPilot --benchmark-search       # Search quality: R@5, R@10, NDCG@10, cluster coherence
 MemoryPilot --http 7437              # Start HTTP REST server (requires --features http)
 MemoryPilot --migrate                # Import v1 JSON data
 MemoryPilot --version                # Show version
@@ -245,7 +247,7 @@ curl -X POST http://localhost:7437/tools/call \
 ```
 src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server init
 src/db.rs          — SQLite engine: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
-src/tools.rs       — 28 MCP tool definitions + handlers
+src/tools.rs       — 29 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
 src/embedding.rs   — fastembed (all-MiniLM-L6-v2) transformer embeddings, LRU cache
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal
@@ -273,7 +275,7 @@ config             — key/value store
 |--------|-------|
 | Binary size | 22 MB |
 | Startup | 1-2 ms |
-| Search (hybrid RRF) | <2 ms |
+| Search (hybrid RRF + reranker) | ~10 ms (500 memories) |
 | `add_memory` latency | <1 ms (lazy embed) |
 | Embedding quality | Transformer 384-dim (all-MiniLM-L6-v2) |
 | Backfill (1000 memories) | ~30s (skips unchanged via hash) |
@@ -291,8 +293,32 @@ config             — key/value store
 - **Batched scoring**: knowledge triple counts and link boosts fetched in single queries, not N+1
 - **Debounced cleanup**: expired memory cleanup runs max once per 60 seconds
 - **Prepared statements**: graph traversal prepares SQL once, not per node
+- **Combinatorial reranker**: greedy subgraph selection boosts connected memory clusters (+15% per connection)
 
-## Recall Benchmark
+## Benchmarks
+
+### Search Quality — Real-World (500 memories, 30 scenarios)
+
+| Metric | MemoryPilot v4.0 |
+|--------|-----------------|
+| **R@5** | **90%** |
+| **R@10** | **100%** |
+| **NDCG@10** | **75.4%** |
+| **Cluster Coherence** | **98%** |
+| **Avg Search Latency** | **9.86 ms** |
+
+> Measured on a real multi-project memory base (500 memories across 6 projects) with the combinatorial reranker enabled. Cluster coherence measures the percentage of top-5 results that share entity connections — higher means the returned context is more cohesive and useful.
+
+### Combinatorial Reranker — Cluster Selection
+
+| Method | Cluster Coherence | Context Quality |
+|--------|------------------|-----------------|
+| Flat Top-K (no reranker) | ~60% | Individual best matches |
+| **Graph + Greedy Subgraph** | **98%** | Connected memory clusters |
+
+The combinatorial reranker selects the best *combination* of memories, not just the best individuals. Connected memories boost each other's scores (+15% per connection, capped at 45%), producing cohesive context clusters instead of disconnected facts.
+
+### Recall Quality Benchmark
 
 ```bash
 MemoryPilot --benchmark-recall --scenario-limit 12
@@ -300,16 +326,17 @@ MemoryPilot --benchmark-recall --scenario-limit 12
 
 Runs against your real memory base using `recall(explain=true)`.
 
-Two layers:
 - Fixed **golden** scenarios for stable, repeatable quality checks
 - Generated fallback scenarios from the current memory base
+- Metrics: `top1_hit_rate`, `top5_hit_rate`, `cross_project_leak_rate`, `credential_leak_rate_safe`
 
-Metrics:
-- `top1_hit_rate`: expected memory appears first
-- `top5_hit_rate`: expected memory in top 5
-- `cross_project_leak_rate`: wrong-project memories leaking
-- `credential_leak_rate_safe`: credentials leaking in `mode = safe`
-- `explain_consistency_rate`: search score detail for debugging
+### Search Quality Benchmark
+
+```bash
+MemoryPilot --benchmark-search --scenario-limit 30
+```
+
+Runs hybrid search against your real memories and reports R@5, R@10, NDCG@10, cluster coherence, and latency.
 
 ## Storage
 

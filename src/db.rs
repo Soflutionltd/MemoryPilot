@@ -660,6 +660,44 @@ impl Database {
         link_boosts
     }
 
+    fn build_adjacency_set(&self, ids: &[String]) -> std::collections::HashSet<(String, String)> {
+        let mut adj = std::collections::HashSet::new();
+        if ids.is_empty() { return adj; }
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT source_id, target_id FROM memory_links WHERE source_id IN ({0}) AND target_id IN ({0})",
+            placeholders.join(",")
+        );
+        if let Ok(mut stmt) = self.conn.prepare(&sql) {
+            // Bind each id twice (once for source_id IN, once for target_id IN)
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(ids.len());
+            for id in ids { params.push(id as &dyn rusqlite::types::ToSql); }
+            if let Ok(rows) = stmt.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            }) {
+                for row in rows.flatten() { adj.insert(row); }
+            }
+        }
+
+        // Also connect via shared entities
+        let ent_sql = format!(
+            "SELECT DISTINCT a.memory_id, b.memory_id FROM memory_entities a \
+             JOIN memory_entities b ON a.entity_value = b.entity_value AND a.entity_kind = b.entity_kind AND a.memory_id != b.memory_id \
+             WHERE a.memory_id IN ({0}) AND b.memory_id IN ({0})",
+            placeholders.join(",")
+        );
+        if let Ok(mut stmt) = self.conn.prepare(&ent_sql) {
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(ids.len());
+            for id in ids { params.push(id as &dyn rusqlite::types::ToSql); }
+            if let Ok(rows) = stmt.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            }) {
+                for row in rows.flatten() { adj.insert(row); }
+            }
+        }
+        adj
+    }
+
     fn batch_triple_counts(&self, candidate_ids: &[&String]) -> std::collections::HashMap<String, (i64, i64)> {
         let mut counts: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
         if candidate_ids.is_empty() { return counts; }
@@ -2082,11 +2120,62 @@ impl Database {
             }
         }
 
-        // Re-sort because graph traversal may have added items at the end
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        // We can truncate to limit if we don't want the graph traversal to exceed the limit
-        // results.truncate(limit); // Commented out so GraphRAG can actually expand the context
-        
+        // 5. Combinatorial Reranker — boost connected clusters
+        // Greedy subgraph selection: prefer memories that are connected to other selected memories
+        if results.len() > 2 {
+            let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
+            let adjacency = self.build_adjacency_set(&result_ids);
+
+            let mut selected: Vec<usize> = Vec::with_capacity(results.len());
+            let mut remaining: Vec<usize> = (0..results.len()).collect();
+
+            // Seed: pick the highest-scoring result
+            selected.push(remaining.remove(0));
+
+            while !remaining.is_empty() && selected.len() < results.len() {
+                let mut best_idx = 0;
+                let mut best_combined = f64::NEG_INFINITY;
+
+                for (ri, &cand) in remaining.iter().enumerate() {
+                    let base_score = results[cand].score;
+                    let cand_id = &results[cand].memory.id;
+
+                    let conn_count = selected.iter()
+                        .filter(|&&si| {
+                            let sel_id = &results[si].memory.id;
+                            adjacency.contains(&(cand_id.clone(), sel_id.clone()))
+                                || adjacency.contains(&(sel_id.clone(), cand_id.clone()))
+                        })
+                        .count();
+
+                    // connectivity_bonus: 15% per connected selected memory, capped at 45%
+                    let connectivity_bonus = (conn_count as f64 * 0.15).min(0.45);
+                    let combined = base_score * (1.0 + connectivity_bonus);
+
+                    if combined > best_combined {
+                        best_combined = combined;
+                        best_idx = ri;
+                    }
+                }
+
+                selected.push(remaining.remove(best_idx));
+            }
+
+            let mut reranked: Vec<SearchResult> = selected.into_iter()
+                .map(|i| std::mem::replace(&mut results[i], SearchResult { memory: Memory { id: String::new(), content: String::new(), kind: String::new(), project: None, tags: vec![], source: String::new(), importance: 0, expires_at: None, metadata: None, created_at: String::new(), updated_at: String::new(), last_accessed_at: None, access_count: 0 }, score: 0.0 }))
+                .collect();
+
+            // Ensure monotonically decreasing scores
+            for i in 1..reranked.len() {
+                let prev = reranked[i - 1].score;
+                if reranked[i].score > prev {
+                    reranked[i].score = prev * 0.99;
+                }
+            }
+
+            results = reranked;
+        }
+
         // Update access count and timestamp for returned results
         for res in &results {
             let _ = self.conn.execute("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2", 
@@ -3436,6 +3525,130 @@ impl Database {
             "explain_consistency_rate": Self::benchmark_percentage(explain_with_search_score, scenario_count),
             "scenarios": scenario_results,
         }))
+    }
+
+    // ─── SEARCH QUALITY BENCHMARK ─────────────────────
+
+    pub fn benchmark_search(&self, scenario_limit: usize) -> Result<serde_json::Value, String> {
+        let all_memories = self.list_all_memories_for_benchmark()?;
+        if all_memories.len() < 5 {
+            return Ok(serde_json::json!({
+                "status": "insufficient_data",
+                "memory_count": all_memories.len(),
+                "message": "Need at least 5 memories to run search benchmark"
+            }));
+        }
+
+        let scenario_count = scenario_limit.min(all_memories.len()).min(50);
+        let step = all_memories.len() / scenario_count;
+
+        let mut hits_r5 = 0usize;
+        let mut hits_r10 = 0usize;
+        let mut ndcg_sum = 0.0f64;
+        let mut cluster_coherence_sum = 0.0f64;
+        let mut avg_search_ms = 0.0f64;
+        let mut scenarios = Vec::new();
+
+        for i in 0..scenario_count {
+            let target = &all_memories[i * step];
+            // Build query from first 8 words of content
+            let query_words: Vec<&str> = target.content.split_whitespace().take(8).collect();
+            if query_words.len() < 2 { continue; }
+            let query = query_words.join(" ");
+
+            let start = std::time::Instant::now();
+            let results = self.search(&query, 10, target.project.as_deref(), None, None, None)?;
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            avg_search_ms += elapsed_ms;
+
+            let result_ids: Vec<&str> = results.iter().map(|r| r.memory.id.as_str()).collect();
+
+            // R@5
+            let in_top5 = result_ids.iter().take(5).any(|id| *id == target.id);
+            if in_top5 { hits_r5 += 1; }
+
+            // R@10
+            let in_top10 = result_ids.iter().take(10).any(|id| *id == target.id);
+            if in_top10 { hits_r10 += 1; }
+
+            // NDCG@10 (single relevant item)
+            let ndcg = if let Some(pos) = result_ids.iter().position(|id| *id == target.id) {
+                if pos < 10 { 1.0 / (pos as f64 + 2.0).log2() } else { 0.0 }
+            } else {
+                0.0
+            };
+            ndcg_sum += ndcg;
+
+            // Cluster coherence: what fraction of top-5 results share at least one entity?
+            let coherence = self.measure_cluster_coherence(&results);
+            cluster_coherence_sum += coherence;
+
+            scenarios.push(serde_json::json!({
+                "query": query,
+                "target_id": target.id,
+                "target_kind": target.kind,
+                "target_project": target.project,
+                "r5_hit": in_top5,
+                "r10_hit": in_top10,
+                "ndcg10": (ndcg * 1000.0).round() / 1000.0,
+                "cluster_coherence": (coherence * 1000.0).round() / 1000.0,
+                "search_ms": (elapsed_ms * 100.0).round() / 100.0,
+                "results_returned": results.len(),
+            }));
+        }
+
+        let actual_count = scenarios.len().max(1);
+        let r5_rate = (hits_r5 as f64 / actual_count as f64 * 1000.0).round() / 10.0;
+        let r10_rate = (hits_r10 as f64 / actual_count as f64 * 1000.0).round() / 10.0;
+        let ndcg10 = (ndcg_sum / actual_count as f64 * 1000.0).round() / 10.0;
+        let coherence = (cluster_coherence_sum / actual_count as f64 * 1000.0).round() / 10.0;
+        avg_search_ms = (avg_search_ms / actual_count as f64 * 100.0).round() / 100.0;
+
+        Ok(serde_json::json!({
+            "status": "ok",
+            "memory_count": all_memories.len(),
+            "scenario_count": actual_count,
+            "metrics": {
+                "R@5": format!("{}%", r5_rate),
+                "R@10": format!("{}%", r10_rate),
+                "NDCG@10": format!("{}%", ndcg10),
+                "cluster_coherence": format!("{}%", coherence),
+                "avg_search_ms": format!("{:.2}ms", avg_search_ms),
+            },
+            "scenarios": scenarios,
+        }))
+    }
+
+    fn list_all_memories_for_benchmark(&self) -> Result<Vec<Memory>, String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count \
+             FROM memories WHERE kind != 'transcript_chunk' AND length(content) > 20 ORDER BY created_at DESC LIMIT 500"
+        ).map_err(|e| format!("Benchmark list: {}", e))?;
+        let rows = stmt.query_map([], |r| Ok(row_to_memory(r))).map_err(|e| format!("Benchmark query: {}", e))?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn measure_cluster_coherence(&self, results: &[SearchResult]) -> f64 {
+        if results.len() < 2 { return 1.0; }
+        let top5: Vec<&str> = results.iter().take(5).map(|r| r.memory.id.as_str()).collect();
+        if top5.len() < 2 { return 1.0; }
+
+        let placeholders: Vec<String> = (1..=top5.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT COUNT(DISTINCT a.memory_id || ':' || b.memory_id) FROM memory_entities a \
+             JOIN memory_entities b ON a.entity_value = b.entity_value AND a.entity_kind = b.entity_kind AND a.memory_id < b.memory_id \
+             WHERE a.memory_id IN ({0}) AND b.memory_id IN ({0})",
+            placeholders.join(",")
+        );
+
+        let connected_pairs: i64 = if let Ok(mut stmt) = self.conn.prepare(&sql) {
+            let params: Vec<&dyn rusqlite::types::ToSql> = top5.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+            stmt.query_row(params.as_slice(), |r| r.get(0)).unwrap_or(0)
+        } else { 0 };
+
+        let max_pairs = (top5.len() * (top5.len() - 1)) / 2;
+        if max_pairs == 0 { return 1.0; }
+        (connected_pairs as f64 / max_pairs as f64).min(1.0)
     }
 
     // ─── IMPORT / MIGRATE ─────────────────────────────
