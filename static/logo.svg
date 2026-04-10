@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 180" fill="none">
+  <defs>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#FB923C"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F97316" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#FB923C" stop-opacity="0.1"/>
+    </linearGradient>
+  </defs>
+  <!-- Compass / Navigation icon -->
+  <g transform="translate(100, 90)">
+    <!-- Outer ring -->
+    <circle cx="0" cy="0" r="62" stroke="url(#ring)" stroke-width="3" fill="none"/>
+    <!-- Inner compass body -->
+    <circle cx="0" cy="0" r="48" fill="url(#accent)" opacity="0.08"/>
+    <circle cx="0" cy="0" r="48" stroke="url(#accent)" stroke-width="2.5" fill="none"/>
+    <!-- Compass needle N -->
+    <polygon points="0,-42 -8,-8 0,-14 8,-8" fill="#F97316"/>
+    <!-- Compass needle S -->
+    <polygon points="0,42 -8,8 0,14 8,8" fill="#FB923C" opacity="0.5"/>
+    <!-- Cross hairs -->
+    <line x1="-48" y1="0" x2="-20" y2="0" stroke="#F97316" stroke-width="1.5" opacity="0.4"/>
+    <line x1="20" y1="0" x2="48" y2="0" stroke="#F97316" stroke-width="1.5" opacity="0.4"/>
+    <line x1="0" y1="-48" x2="0" y2="-20" stroke="#F97316" stroke-width="1.5" opacity="0.4"/>
+    <line x1="0" y1="20" x2="0" y2="48" stroke="#F97316" stroke-width="1.5" opacity="0.4"/>
+    <!-- Center dot -->
+    <circle cx="0" cy="0" r="4" fill="#F97316"/>
+    <!-- Cardinal dots -->
+    <circle cx="55" cy="0" r="3" fill="#F97316" opacity="0.6"/>
+    <circle cx="-55" cy="0" r="3" fill="#F97316" opacity="0.6"/>
+    <circle cx="0" cy="55" r="3" fill="#F97316" opacity="0.6"/>
+    <circle cx="0" cy="-55" r="3" fill="#F97316" opacity="0.6"/>
+    <!-- Orbital dots (data/memory nodes) -->
+    <circle cx="44" cy="-44" r="2.5" fill="#FB923C" opacity="0.4"/>
+    <circle cx="-44" cy="44" r="2.5" fill="#FB923C" opacity="0.4"/>
+    <circle cx="44" cy="44" r="2.5" fill="#FB923C" opacity="0.4"/>
+    <circle cx="-44" cy="-44" r="2.5" fill="#FB923C" opacity="0.4"/>
+  </g>
+  <!-- Text: MemoryPilot -->
+  <text x="190" y="92" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="64" font-weight="800" letter-spacing="-2" fill="#0F172A">
+    Memory<tspan fill="#F97316">Pilot</tspan>
+  </text>
+  <!-- Tagline -->
+  <text x="192" y="130" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="400" fill="#64748B" letter-spacing="0.5">
+    MCP Memory Server
+  </text>
+</svg>

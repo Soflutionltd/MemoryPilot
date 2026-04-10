@@ -1,9 +1,11 @@
 <p align="center">
-  <img src="static/banner.png" alt="MemoryPilot" width="900"/>
+  <br/>
+  <img src="static/logo.png" alt="MemoryPilot" width="520"/>
+  <br/><br/>
 </p>
 
 <p align="center">
-  <strong>The most advanced MCP memory server. Period.</strong><br>
+  <strong>The most advanced MCP memory server. Period.</strong><br><br>
   <sub>Hybrid search (BM25 + multilingual-e5-small RRF) · 100+ languages · Temporal Knowledge Graph · AAAK compression (3x token savings) · GraphRAG · Chunked RAG · Auto-Linting · Project brain · HTTP API · Single binary · Zero API calls</sub>
 </p>
 
@@ -13,7 +15,7 @@
   <img src="https://img.shields.io/badge/search-Hybrid_RRF-blueviolet" alt="Hybrid RRF"/>
   <img src="https://img.shields.io/badge/embeddings-multilingual--e5--small_(384--dim)-blue" alt="multilingual-e5-small"/>
   <img src="https://img.shields.io/badge/tokens-3x_compression-brightgreen" alt="3x token savings"/>
-  <img src="https://img.shields.io/badge/license-Apache_2.0-blue" alt="Apache 2.0"/>
+  <img src="https://img.shields.io/badge/license-Source_Available-orange" alt="Source Available"/>
 </p>
 
 ---
@@ -130,6 +132,29 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 
 ## Install
 
+### One-liner (recommended)
+
+```bash
+git clone https://github.com/Soflution1/MemoryPilot.git && cd MemoryPilot && ./install.sh
+```
+
+The installer builds MemoryPilot, installs the binary to `~/.local/bin/`, detects your IDEs, and configures each one automatically.
+
+**Supported IDEs:**
+
+| IDE | Config file | Auto-configured |
+|-----|------------|-----------------|
+| **Cursor** | `~/.cursor/mcp.json` | ✓ |
+| **VS Code** | `~/.vscode/mcp.json` | ✓ |
+| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` | ✓ (macOS) |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | ✓ |
+| **Claude Code** | `claude mcp add` | ✓ (CLI) |
+| **Codex** | `codex mcp add` | ✓ (CLI) |
+
+The script is idempotent — run it again to update without breaking existing MCP configs.
+
+### Manual install
+
 ```bash
 git clone https://github.com/Soflution1/MemoryPilot.git
 cd MemoryPilot
@@ -139,27 +164,17 @@ chmod +x ~/.local/bin/MemoryPilot
 xattr -cr ~/.local/bin/MemoryPilot  # macOS only
 ```
 
+Then add MemoryPilot to your IDE's MCP config manually (see table above for file paths).
+
 ### With HTTP server
 
 ```bash
 cargo build --release --features http
 ```
 
-### Cursor Integration (Zero-Config)
+### How it works
 
-Add to `~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "MemoryPilot": {
-      "command": "/Users/you/.local/bin/MemoryPilot"
-    }
-  }
-}
-```
-
-**That's it.** MemoryPilot automatically injects a dynamic System Prompt into Cursor and Claude Desktop on startup. The AI will proactively call `add_memory` in the background to store your architecture decisions, API keys, and bug fixes without manual intervention.
+**That's it.** MemoryPilot automatically injects a dynamic System Prompt into your IDE on startup. The AI will proactively call `add_memory` in the background to store your architecture decisions, API keys, and bug fixes without manual intervention. All configured IDEs share the same memory database.
 
 Or use via [McpHub](https://github.com/Soflution1/McpHub) for SSE transport with all your other MCP servers.
 
@@ -338,4 +353,6 @@ MemoryPilot --benchmark-recall --scenario-limit 12    # top1/top5 hit rate, cros
 
 ## License
 
-Apache 2.0 — Built by [SOFLUTION LTD](https://soflution.com)
+**Soflution Source Available License** — free to use, not to fork or modify. See [LICENSE](LICENSE) for details.
+
+Built by [SOFLUTION LTD](https://soflution.com)
