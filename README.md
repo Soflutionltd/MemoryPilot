@@ -24,14 +24,15 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 
 **vs the best MCP memory servers:**
 
-| Feature | MemoryPilot v4.0 | MemPalace | Mem0 |
-|---------|-----------------|-----------|------|
-| Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) | Keyword only | Vector search (cloud API) |
-| Embeddings | fastembed multilingual-e5-small (local ONNX, 100+ languages) | None | OpenAI API calls (external) |
-| Knowledge Graph | Temporal triples with validity + confidence | No | Basic graph (no temporal) |
+| Feature | MemoryPilot v4.0 | MemPalace v3.1 | Mem0 |
+|---------|-----------------|----------------|------|
+| Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) | ChromaDB cosine (all-MiniLM-L6-v2) | Vector search (cloud API) |
+| Embeddings | multilingual-e5-small (100+ languages, local ONNX) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) |
+| Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | Depends on API |
+| Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Basic graph (no temporal) |
 | GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | No |
-| Chunked RAG | Transcript auto-chunking + auto-distillation | No | No |
-| Compression | AAAK compact dialect (~3x token savings) | AAAK dialect | No |
+| Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | No |
+| Compression | AAAK compact dialect (~3x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No |
 | Person detection | Auto-detects team members from text | No | No |
 | Self-Healing | Background auto-linting loop | No | No |
 | Garbage collection | Heuristic merge + scoring + orphan cleanup | No | Basic TTL |
@@ -39,11 +40,13 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 | File watcher | Context boost from recent edits | No | No |
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity |
 | HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted |
-| Memory types | 13 types, importance 1-5 | 3 types | 1 type |
+| Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type |
+| MCP tools | 29 tools | 19 tools | N/A |
 | Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
+| Language | Rust (single binary, zero deps) | Python (pip install) | SaaS |
 | Startup | 1-2 ms | ~5 ms | N/A (cloud) |
-| Binary | 22 MB single binary, zero deps | ~2 MB (Python) | SaaS / pip install |
-| Storage | SQLite WAL + FTS5 + connection pool | JSON files | SQLite basic |
+| Binary | 22 MB single binary | Python + ChromaDB (~500 MB installed) | SaaS |
+| Storage | SQLite WAL + FTS5 + connection pool | ChromaDB | Cloud DB |
 | Concurrency | Lazy embedding thread + read pool + debounced cleanup | Single-threaded | Single-threaded |
 
 ## The 8 Pillars
@@ -304,17 +307,19 @@ config             — key/value store
 
 ### Search Quality — Real-World (500 memories, 30 scenarios)
 
-| Metric | MemoryPilot v4.0 | Quantum Memory Graph (MiniLM) |
-|--------|-----------------|-------------------------------|
-| **R@5** | **100%** | 93.4% |
-| **R@10** | **100%** | 93.4% |
-| **NDCG@10** | **95.6%** | 90.8% |
-| **Cluster Coherence** | **96.7%** | N/A |
-| **Multilingual** | **100+ languages (FR, EN, ES, DE, JA, ZH...)** | English only |
-| **Avg Search Latency** | **~69 ms** | ~80 ms |
-| **Binary Size** | **22 MB** | 1.5 GB |
+| Metric | MemoryPilot v4.0 | MemPalace v3.1 (raw) | Quantum Memory Graph |
+|--------|-----------------|----------------------|---------------------|
+| **R@5** | **100%** | 96.6%¹ | 93.4% |
+| **R@10** | **100%** | N/A | 93.4% |
+| **NDCG@10** | **95.6%** | 88.9%¹ | 90.8% |
+| **Cluster Coherence** | **96.7%** | N/A | N/A |
+| **Multilingual** | **100+ languages** | English only | English only |
+| **AAAK Compression** | 3x (no recall loss) | 30x (recall drops to 84.2%) | N/A |
+| **Avg Search Latency** | **~69 ms** | N/A | ~80 ms |
+| **Binary Size** | **22 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
+| **Dependencies** | 0 (single binary) | Python + ChromaDB + SQLite | Python + ONNX |
 
-> Measured on a real multi-project memory base (500 memories across 6 projects). MemoryPilot achieves perfect recall at both top-5 and top-10 with an NDCG@10 of 95.6%, surpassing Quantum Memory Graph on every metric. The multilingual-e5-small embedding model supports 100+ languages natively — French, English, Spanish, German, Japanese, Chinese and more — with zero configuration.
+> ¹ MemPalace's 96.6% R@5 is measured on LongMemEval-s (~50 sessions per haystack, session-level retrieval). Their AAAK compression mode drops recall to 84.2%. Their benchmark tests raw ChromaDB retrieval — none of the Palace architecture (wings, rooms, closets) is exercised in the benchmark ([source](https://github.com/milla-jovovich/mempalace/issues/214)). MemoryPilot's scores are measured on a real multi-project memory base (500 memories across 6 projects) with all features active (GraphRAG, KG expansion, combinatorial reranker, importance scoring).
 
 ### Combinatorial Reranker — Cluster Selection
 
