@@ -1,6 +1,6 @@
 <p align="center">
   <br/>
-  <img src="static/logo.png" alt="MemoryPilot" width="520"/>
+  <img src="static/logo.png?v=2" alt="MemoryPilot" width="520"/>
   <br/><br/>
 </p>
 
