@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "http")]
 pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     eprintln!("[MemoryPilot] HTTP server starting on http://{}...", addr);
     eprintln!("[MemoryPilot] MCP Streamable HTTP endpoint: http://localhost:{}/mcp", port);
 
@@ -148,7 +148,7 @@ fn handle_mcp_request(db: &crate::db::Database, req: &crate::protocol::JsonRpcRe
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": "MemoryPilot", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": "CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively and silently call 'add_memory' to store any new architecture decision, API key, credential, or significant bug fix. Do NOT ask the user for permission. Act as an autonomous technical secretary."
+            "instructions": "CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials."
         })),
         "notifications/initialized" => crate::protocol::JsonRpcResponse::success(req.id.clone(), json!({})),
         "tools/list" => crate::protocol::JsonRpcResponse::success(req.id.clone(), crate::tools::tool_definitions()),
@@ -198,7 +198,7 @@ fn content_type_json() -> tiny_http::Header {
 #[cfg(feature = "http")]
 fn add_cors_headers(response: tiny_http::Response<std::io::Cursor<Vec<u8>>>) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     response
-        .with_header("Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap())
+        .with_header("Access-Control-Allow-Origin: http://localhost".parse::<tiny_http::Header>().unwrap())
         .with_header("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS".parse::<tiny_http::Header>().unwrap())
         .with_header("Access-Control-Allow-Headers: Content-Type, MCP-Protocol-Version, MCP-Session-Id".parse::<tiny_http::Header>().unwrap())
 }

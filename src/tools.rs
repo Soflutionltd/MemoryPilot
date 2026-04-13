@@ -616,8 +616,26 @@ fn handle_export(db: &Database, args: &Value) -> Value {
 }
 
 fn handle_set_config(db: &Database, args: &Value) -> Value {
+    const ALLOWED_KEYS: &[&str] = &["global_prompt_path", "auto_lint", "compact_default"];
     let key = match args.get("key").and_then(|v| v.as_str()) { Some(k) => k, _ => return tool_error("key required") };
     let value = match args.get("value").and_then(|v| v.as_str()) { Some(v) => v, _ => return tool_error("value required") };
+    if !ALLOWED_KEYS.contains(&key) {
+        return tool_error(&format!("Unknown config key '{}'. Allowed: {}", key, ALLOWED_KEYS.join(", ")));
+    }
+    if key == "global_prompt_path" {
+        let path = std::path::Path::new(value);
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            let home = dirs::home_dir().unwrap_or_default();
+            if !canonical.starts_with(&home) {
+                return tool_error("global_prompt_path must be within your home directory");
+            }
+            if !canonical.to_string_lossy().ends_with(".md") {
+                return tool_error("global_prompt_path must point to a .md file");
+            }
+        } else if !value.starts_with("~/") && !value.starts_with(&dirs::home_dir().unwrap_or_default().to_string_lossy().to_string()) {
+            return tool_error("global_prompt_path must be within your home directory");
+        }
+    }
     match db.set_config(key, value) {
         Ok(()) => tool_result(&format!("Config '{}' = '{}'", key, value)),
         Err(e) => tool_error(&e),
