@@ -69,6 +69,11 @@ fn main() {
                 let _ = out.flush(); continue;
             }
         };
+        if request.id.is_none() {
+            // JSON-RPC notification — no response expected
+            let _ = handle_request(&db_arc, &request);
+            continue;
+        }
         let response = handle_request(&db_arc, &request);
         let _ = writeln!(out, "{}", serde_json::to_string(&response).unwrap());
         let _ = out.flush();
