@@ -8,19 +8,31 @@ use std::sync::Arc;
 
 #[cfg(feature = "http")]
 pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
-    let addr = format!("127.0.0.1:{}", port);
-    eprintln!("[MemoryPilot] HTTP server starting on http://{}...", addr);
-    eprintln!("[MemoryPilot] MCP Streamable HTTP endpoint: http://localhost:{}/mcp", port);
-
-    let server = match tiny_http::Server::http(&addr) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("[MemoryPilot] HTTP server failed to start: {}", e);
-            return;
+    let mut actual_port = port;
+    let mut server_result = None;
+    for attempt in 0..10u16 {
+        let try_port = port.saturating_add(attempt);
+        let addr = format!("127.0.0.1:{}", try_port);
+        match tiny_http::Server::http(&addr) {
+            Ok(s) => {
+                actual_port = try_port;
+                server_result = Some(s);
+                break;
+            }
+            Err(e) => {
+                if attempt < 9 {
+                    eprintln!("[MemoryPilot] Port {} in use, trying {}...", try_port, try_port + 1);
+                } else {
+                    eprintln!("[MemoryPilot] HTTP server failed to start (ports {}-{} all in use): {}", port, try_port, e);
+                    return;
+                }
+            }
         }
-    };
+    }
+    let server = Arc::new(server_result.unwrap());
 
-    eprintln!("[MemoryPilot] HTTP server listening on port {}", port);
+    eprintln!("[MemoryPilot] HTTP server listening on http://127.0.0.1:{}", actual_port);
+    eprintln!("[MemoryPilot] MCP Streamable HTTP endpoint: http://localhost:{}/mcp", actual_port);
 
     let num_workers = 4;
     let mut handles = Vec::new();
@@ -33,6 +45,9 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
             };
             for mut request in srv.incoming_requests() {
                 let url = request.url().to_string();
+                let origin = request.headers().iter()
+                    .find(|h| h.field.equiv("Origin"))
+                    .map(|h| h.value.as_str().to_string());
                 let response = match (request.method(), url.as_str()) {
                     (&tiny_http::Method::Get, "/health") => handle_health(),
                     (&tiny_http::Method::Post, "/tools/call") => handle_tool_call(&local_db, &mut request),
@@ -47,7 +62,7 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
                             .with_header(content_type_json())
                     }
                 };
-                let response = add_cors_headers(response);
+                let response = add_cors_headers(response, origin.as_deref());
                 let _ = request.respond(response);
             }
         }));
@@ -196,9 +211,20 @@ fn content_type_json() -> tiny_http::Header {
 }
 
 #[cfg(feature = "http")]
-fn add_cors_headers(response: tiny_http::Response<std::io::Cursor<Vec<u8>>>) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+fn is_localhost_origin(origin: &str) -> bool {
+    let lower = origin.to_lowercase();
+    lower == "http://localhost" || lower.starts_with("http://localhost:")
+        || lower == "http://127.0.0.1" || lower.starts_with("http://127.0.0.1:")
+}
+
+#[cfg(feature = "http")]
+fn add_cors_headers(response: tiny_http::Response<std::io::Cursor<Vec<u8>>>, origin: Option<&str>) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let allowed_origin = match origin {
+        Some(o) if is_localhost_origin(o) => o.to_string(),
+        _ => "http://localhost".to_string(),
+    };
     response
-        .with_header("Access-Control-Allow-Origin: http://localhost".parse::<tiny_http::Header>().unwrap())
+        .with_header(format!("Access-Control-Allow-Origin: {}", allowed_origin).parse::<tiny_http::Header>().unwrap())
         .with_header("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS".parse::<tiny_http::Header>().unwrap())
         .with_header("Access-Control-Allow-Headers: Content-Type, MCP-Protocol-Version, MCP-Session-Id".parse::<tiny_http::Header>().unwrap())
 }
