@@ -3817,6 +3817,245 @@ impl Database {
         }
         self.import_batch(&batch)
     }
+    // ─── LongMemEval Benchmark (ICLR 2025) ────────────────────
+    // Pure retrieval evaluation on the standard academic benchmark.
+    // For each question: index ~48 sessions into a temp DB, search, check if gold session is in top-K.
+
+    pub fn benchmark_longmemeval(dataset_path: &str, limit: Option<usize>) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+
+        eprintln!("[LongMemEval] Loading dataset: {}", dataset_path);
+        let raw = std::fs::read_to_string(dataset_path)
+            .map_err(|e| format!("Cannot read dataset: {}", e))?;
+
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&raw)
+            .map_err(|e| format!("Invalid JSON: {}", e))?;
+
+        let total = entries.len();
+        eprintln!("[LongMemEval] {} questions loaded", total);
+
+        // Filter out abstention questions (question_id ending with _abs)
+        let questions: Vec<&serde_json::Value> = entries.iter()
+            .filter(|e| {
+                let qid = e.get("question_id").and_then(|v| v.as_str()).unwrap_or("");
+                !qid.ends_with("_abs")
+            })
+            .collect();
+
+        let abstention_count = total - questions.len();
+        let eval_count = if let Some(lim) = limit { lim.min(questions.len()) } else { questions.len() };
+        eprintln!("[LongMemEval] Evaluating {} questions ({} abstention skipped)", eval_count, abstention_count);
+
+        let mut hits_r5 = 0usize;
+        let mut hits_r10 = 0usize;
+        let mut ndcg_sum = 0.0f64;
+        let mut mrr_sum = 0.0f64;
+        let mut total_search_ms = 0.0f64;
+        let mut category_stats: std::collections::HashMap<String, (usize, usize, usize, f64, f64)> = std::collections::HashMap::new();
+
+        for (qi, entry) in questions.iter().take(eval_count).enumerate() {
+            let question = entry.get("question").and_then(|v| v.as_str()).unwrap_or("");
+            let question_type = entry.get("question_type").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let answer_session_ids: Vec<String> = entry.get("answer_session_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let sessions = entry.get("haystack_sessions").and_then(|v| v.as_array());
+            let session_ids = entry.get("haystack_session_ids").and_then(|v| v.as_array());
+
+            if sessions.is_none() || session_ids.is_none() || question.is_empty() {
+                eprintln!("[LongMemEval] Skipping question {} (missing fields)", qi);
+                continue;
+            }
+            let sessions = sessions.unwrap();
+            let session_ids = session_ids.unwrap();
+
+            // Create temp DB
+            let tmp_path = std::env::temp_dir().join(format!("memorypilot_lme_{}.db", qi));
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(tmp_path.with_extension("db-wal"));
+            let _ = std::fs::remove_file(tmp_path.with_extension("db-shm"));
+
+            let db = match Self::open_lme_db(&tmp_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[LongMemEval] Q{}: DB open failed: {}", qi, e);
+                    continue;
+                }
+            };
+
+            eprintln!("[LongMemEval] Q{}/{} ({}): indexing {} sessions...", qi + 1, questions.len(), question_type, sessions.len());
+
+            // Index sessions at turn-level granularity with batch embedding
+            let mut all_texts: Vec<String> = Vec::new();
+            let mut all_ids: Vec<String> = Vec::new();
+
+            for (si, (session, sid_val)) in sessions.iter().zip(session_ids.iter()).enumerate() {
+                let fallback_sid = format!("session_{}", si);
+                let sid = sid_val.as_str().unwrap_or(&fallback_sid);
+                let turns = match session.as_array() {
+                    Some(t) => t,
+                    None => continue,
+                };
+                for (ti, turn) in turns.iter().enumerate() {
+                    let role = turn.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                    let content = turn.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    if content.is_empty() { continue; }
+                    all_texts.push(format!("{}: {}", role, content));
+                    all_ids.push(format!("{}__t{}", sid, ti));
+                }
+            }
+
+            if !all_texts.is_empty() {
+                eprintln!("[LongMemEval] Q{}: embedding {} turns in batches...", qi + 1, all_texts.len());
+                let now = Utc::now().to_rfc3339();
+                let batch_size = 128;
+
+                for chunk_start in (0..all_texts.len()).step_by(batch_size) {
+                    let chunk_end = (chunk_start + batch_size).min(all_texts.len());
+                    let chunk_refs: Vec<&str> = all_texts[chunk_start..chunk_end].iter().map(|s| s.as_str()).collect();
+                    let chunk_embeddings = crate::embedding::embed_batch(&chunk_refs);
+
+                    for (ci, emb) in chunk_embeddings.into_iter().enumerate() {
+                        let idx = chunk_start + ci;
+                        let blob = crate::embedding::vec_to_blob(&emb);
+                        let hash = content_hash(&all_texts[idx]);
+                        let _ = db.conn.execute(
+                            "INSERT INTO memories (id, content, kind, project, tags, source, importance, embedding, content_hash, created_at, updated_at)
+                             VALUES (?1, ?2, 'session', NULL, '[]', 'longmemeval', 3, ?3, ?4, ?5, ?5)",
+                            params![all_ids[idx], all_texts[idx], blob, hash, now],
+                        );
+                        let _ = db.conn.execute(
+                            "INSERT INTO memories_fts (rowid, content, tags, kind, project) VALUES ((SELECT rowid FROM memories WHERE id=?1), ?2, '[]', 'session', '')",
+                            params![all_ids[idx], all_texts[idx]],
+                        );
+                    }
+                }
+                eprintln!("[LongMemEval] Q{}: indexed {} turns ✓", qi + 1, all_texts.len());
+            }
+
+            // Search
+            let start = std::time::Instant::now();
+            let results = match db.search(question, 10, None, None, None, None) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[LongMemEval] Q{}: search failed: {}", qi, e);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    continue;
+                }
+            };
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            total_search_ms += elapsed_ms;
+
+            let result_ids: Vec<&str> = results.iter().map(|r| r.memory.id.as_str()).collect();
+
+            // recall_any@K: does ANY turn from a gold session appear in top-K?
+            // Turn IDs are formatted as "session_id__tN", match by prefix
+            let matches_gold = |id: &&str| -> bool {
+                answer_session_ids.iter().any(|gold| id.starts_with(gold))
+            };
+
+            let in_top5 = result_ids.iter().take(5).any(matches_gold);
+            let in_top10 = result_ids.iter().take(10).any(matches_gold);
+
+            if in_top5 { hits_r5 += 1; }
+            if in_top10 { hits_r10 += 1; }
+
+            // NDCG@10 (single relevant item — best rank)
+            let best_rank = result_ids.iter().take(10).position(matches_gold);
+            let ndcg = match best_rank {
+                Some(pos) => 1.0 / (pos as f64 + 2.0).log2(),
+                None => 0.0,
+            };
+            ndcg_sum += ndcg;
+
+            // MRR
+            let rr = match best_rank {
+                Some(pos) => 1.0 / (pos as f64 + 1.0),
+                None => 0.0,
+            };
+            mrr_sum += rr;
+
+            // Per-category stats: (count, r5_hits, r10_hits, ndcg_sum, mrr_sum)
+            let cat = category_stats.entry(question_type.to_string()).or_insert((0, 0, 0, 0.0, 0.0));
+            cat.0 += 1;
+            if in_top5 { cat.1 += 1; }
+            if in_top10 { cat.2 += 1; }
+            cat.3 += ndcg;
+            cat.4 += rr;
+
+            if (qi + 1) % 10 == 0 || qi + 1 == eval_count {
+                let running_r5 = hits_r5 as f64 / (qi + 1) as f64 * 100.0;
+                let running_r10 = hits_r10 as f64 / (qi + 1) as f64 * 100.0;
+                eprintln!("[LongMemEval] {}/{} — R@5: {:.1}% R@10: {:.1}% ({} sessions indexed)",
+                    qi + 1, eval_count, running_r5, running_r10, sessions.len());
+            }
+
+            // Cleanup temp DB
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(tmp_path.with_extension("db-wal"));
+            let _ = std::fs::remove_file(tmp_path.with_extension("db-shm"));
+        }
+
+        let actual_count = eval_count.max(1) as f64;
+        let r5 = (hits_r5 as f64 / actual_count * 1000.0).round() / 10.0;
+        let r10 = (hits_r10 as f64 / actual_count * 1000.0).round() / 10.0;
+        let ndcg10 = (ndcg_sum / actual_count * 1000.0).round() / 10.0;
+        let mrr = (mrr_sum / actual_count * 1000.0).round() / 10.0;
+        let avg_ms = (total_search_ms / actual_count * 100.0).round() / 100.0;
+
+        let mut by_category = serde_json::Map::new();
+        for (cat, (count, r5h, r10h, ndcg_s, mrr_s)) in &category_stats {
+            let c = *count as f64;
+            by_category.insert(cat.clone(), json!({
+                "count": count,
+                "recall_at_5": format!("{:.1}%", *r5h as f64 / c * 100.0),
+                "recall_at_10": format!("{:.1}%", *r10h as f64 / c * 100.0),
+                "ndcg_at_10": format!("{:.1}%", ndcg_s / c * 100.0),
+                "mrr": format!("{:.1}%", mrr_s / c * 100.0),
+            }));
+        }
+
+        Ok(json!({
+            "benchmark": "LongMemEval-S (ICLR 2025)",
+            "dataset": dataset_path,
+            "questions_total": total,
+            "questions_evaluated": eval_count,
+            "questions_abstention_skipped": abstention_count,
+            "granularity": "turn",
+            "embedding_model": "multilingual-e5-small (384-dim)",
+            "search_engine": "BM25 + cosine RRF (k=40)",
+            "metrics": {
+                "recall_at_5": format!("{}%", r5),
+                "recall_at_10": format!("{}%", r10),
+                "ndcg_at_10": format!("{}%", ndcg10),
+                "mrr": format!("{}%", mrr),
+                "avg_search_latency_ms": avg_ms,
+            },
+            "by_category": by_category,
+        }))
+    }
+
+    /// Open a lightweight DB for LongMemEval benchmarking (no backfill, no read pool)
+    fn open_lme_db(path: &Path) -> Result<Self, String> {
+        let conn = Connection::open(path).map_err(|e| format!("SQLite open: {}", e))?;
+        conn.execute_batch("
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -4000;
+            PRAGMA foreign_keys = ON;
+        ").map_err(|e| format!("Pragma: {}", e))?;
+
+        let mut read_pool = Vec::with_capacity(1);
+        let rc = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .map_err(|e| format!("Read pool: {}", e))?;
+        let _ = rc.execute_batch("PRAGMA cache_size = -2000;");
+        read_pool.push(Mutex::new(rc));
+
+        let db = Self { conn, read_pool };
+        db.init_schema()?;
+        Ok(db)
+    }
 } // end impl Database
 
 // ─── Supporting types ─────────────────────────────

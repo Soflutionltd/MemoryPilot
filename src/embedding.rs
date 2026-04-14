@@ -9,8 +9,19 @@ static FASTEMBED_MODEL: OnceLock<Mutex<fastembed::TextEmbedding>> = OnceLock::ne
 
 fn get_model() -> &'static Mutex<fastembed::TextEmbedding> {
     FASTEMBED_MODEL.get_or_init(|| {
+        // Use a stable, writable cache dir so fastembed finds the ONNX model
+        // even when launched from sandboxed environments (Claude Desktop, etc.)
+        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                format!("{}/.cache/fastembed", home)
+            });
+        let cache_path = std::path::PathBuf::from(&cache_dir);
+        std::fs::create_dir_all(&cache_path).ok();
+
         let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
-            .with_show_download_progress(false);
+            .with_show_download_progress(false)
+            .with_cache_dir(cache_path);
         let model = fastembed::TextEmbedding::try_new(opts)
             .expect("[MemoryPilot] fastembed init failed — cannot start without embedding engine");
         Mutex::new(model)

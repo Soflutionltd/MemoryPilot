@@ -34,6 +34,7 @@ fn main() {
     if args.iter().any(|a| a == "--backfill") { run_backfill(); return; }
     if args.iter().any(|a| a == "--benchmark-recall") { run_benchmark_recall(&args); return; }
     if args.iter().any(|a| a == "--benchmark-search") { run_benchmark_search(&args); return; }
+    if args.iter().any(|a| a == "--benchmark-longmemeval") { run_benchmark_longmemeval(&args); return; }
     #[cfg(feature = "http")]
     {
         if let Some(pos) = args.iter().position(|a| a == "--http") {
@@ -158,6 +159,21 @@ fn run_benchmark_search(args: &[String]) {
     }
 }
 
+fn run_benchmark_longmemeval(args: &[String]) {
+    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
+    let dataset_path = args.windows(2)
+        .find(|w| w[0] == "--benchmark-longmemeval")
+        .map(|w| w[1].as_str())
+        .unwrap_or("benchmarks/longmemeval_s_cleaned.json");
+    let limit = args.windows(2)
+        .find(|w| w[0] == "--limit")
+        .and_then(|w| w[1].parse::<usize>().ok());
+    match db::Database::benchmark_longmemeval(dataset_path, limit) {
+        Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())),
+        Err(error) => { eprintln!("✗ LongMemEval benchmark failed: {}", error); std::process::exit(1); }
+    }
+}
+
 fn print_help() {
     println!("MemoryPilot v{} — MCP memory server with SQLite FTS5", VERSION);
     println!();
@@ -169,6 +185,7 @@ fn print_help() {
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
+    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N]  LongMemEval (ICLR 2025) retrieval benchmark");
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot --help           Show this help");
     println!();

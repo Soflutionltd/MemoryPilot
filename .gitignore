@@ -2,3 +2,4 @@ target/
 .DS_Store
 .fastembed_cache/
 CURSOR_ROADMAP*.md
+benchmarks/*.json
