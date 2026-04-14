@@ -160,6 +160,7 @@ fn run_benchmark_search(args: &[String]) {
 }
 
 fn run_benchmark_longmemeval(args: &[String]) {
+    eprintln!("[LongMemEval] Starting benchmark runner...");
     eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
     let dataset_path = args.windows(2)
         .find(|w| w[0] == "--benchmark-longmemeval")
@@ -168,6 +169,7 @@ fn run_benchmark_longmemeval(args: &[String]) {
     let limit = args.windows(2)
         .find(|w| w[0] == "--limit")
         .and_then(|w| w[1].parse::<usize>().ok());
+    eprintln!("[LongMemEval] Dataset: {} (limit: {:?})", dataset_path, limit);
     match db::Database::benchmark_longmemeval(dataset_path, limit) {
         Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())),
         Err(error) => { eprintln!("✗ LongMemEval benchmark failed: {}", error); std::process::exit(1); }

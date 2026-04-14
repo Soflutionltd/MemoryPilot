@@ -3846,6 +3846,52 @@ impl Database {
         let eval_count = if let Some(lim) = limit { lim.min(questions.len()) } else { questions.len() };
         eprintln!("[LongMemEval] Evaluating {} questions ({} abstention skipped)", eval_count, abstention_count);
 
+        // Phase 1: Pre-compute all unique turn embeddings across the entire dataset
+        eprintln!("[LongMemEval] Phase 1: Pre-computing turn embeddings (global cache)...");
+        let mut embedding_cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+        let mut unique_turns: Vec<(String, String)> = Vec::new(); // (turn_key, text)
+
+        for entry in questions.iter().take(eval_count) {
+            let sessions = match entry.get("haystack_sessions").and_then(|v| v.as_array()) {
+                Some(s) => s, None => continue,
+            };
+            let session_ids = match entry.get("haystack_session_ids").and_then(|v| v.as_array()) {
+                Some(s) => s, None => continue,
+            };
+            for (si, (session, sid_val)) in sessions.iter().zip(session_ids.iter()).enumerate() {
+                let fallback_sid = format!("session_{}", si);
+                let sid = sid_val.as_str().unwrap_or(&fallback_sid);
+                let turns = match session.as_array() { Some(t) => t, None => continue };
+                for (ti, turn) in turns.iter().enumerate() {
+                    let role = turn.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                    let content = turn.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    if content.is_empty() { continue; }
+                    let key = format!("{}__t{}", sid, ti);
+                    if !embedding_cache.contains_key(&key) {
+                        embedding_cache.insert(key.clone(), Vec::new());
+                        unique_turns.push((key, format!("{}: {}", role, content)));
+                    }
+                }
+            }
+        }
+
+        eprintln!("[LongMemEval] {} unique turns to embed", unique_turns.len());
+        let batch_size = 256;
+        for chunk_start in (0..unique_turns.len()).step_by(batch_size) {
+            let chunk_end = (chunk_start + batch_size).min(unique_turns.len());
+            let chunk_texts: Vec<&str> = unique_turns[chunk_start..chunk_end].iter().map(|(_, t)| t.as_str()).collect();
+            let chunk_embeddings = crate::embedding::embed_batch(&chunk_texts);
+            for (ci, emb) in chunk_embeddings.into_iter().enumerate() {
+                let key = &unique_turns[chunk_start + ci].0;
+                embedding_cache.insert(key.clone(), emb);
+            }
+            if (chunk_start / batch_size) % 10 == 0 {
+                eprintln!("[LongMemEval] Embedded {}/{} turns...", chunk_end, unique_turns.len());
+            }
+        }
+        eprintln!("[LongMemEval] Phase 1 complete: {} embeddings cached ✓", embedding_cache.len());
+
+        // Phase 2: Evaluate each question using cached embeddings
         let mut hits_r5 = 0usize;
         let mut hits_r10 = 0usize;
         let mut ndcg_sum = 0.0f64;
@@ -3884,54 +3930,41 @@ impl Database {
                 }
             };
 
-            eprintln!("[LongMemEval] Q{}/{} ({}): indexing {} sessions...", qi + 1, questions.len(), question_type, sessions.len());
-
-            // Index sessions at turn-level granularity with batch embedding
-            let mut all_texts: Vec<String> = Vec::new();
-            let mut all_ids: Vec<String> = Vec::new();
+            // Index turns using cached embeddings (no re-computation)
+            let now = Utc::now().to_rfc3339();
+            let mut turn_count = 0usize;
 
             for (si, (session, sid_val)) in sessions.iter().zip(session_ids.iter()).enumerate() {
                 let fallback_sid = format!("session_{}", si);
                 let sid = sid_val.as_str().unwrap_or(&fallback_sid);
-                let turns = match session.as_array() {
-                    Some(t) => t,
-                    None => continue,
-                };
+                let turns = match session.as_array() { Some(t) => t, None => continue };
                 for (ti, turn) in turns.iter().enumerate() {
-                    let role = turn.get("role").and_then(|v| v.as_str()).unwrap_or("user");
                     let content = turn.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     if content.is_empty() { continue; }
-                    all_texts.push(format!("{}: {}", role, content));
-                    all_ids.push(format!("{}__t{}", sid, ti));
+                    let role = turn.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                    let key = format!("{}__t{}", sid, ti);
+                    let text = format!("{}: {}", role, content);
+                    let emb = match embedding_cache.get(&key) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    let blob = crate::embedding::vec_to_blob(emb);
+                    let hash = content_hash(&text);
+                    let _ = db.conn.execute(
+                        "INSERT INTO memories (id, content, kind, project, tags, source, importance, embedding, content_hash, created_at, updated_at)
+                         VALUES (?1, ?2, 'session', NULL, '[]', 'longmemeval', 3, ?3, ?4, ?5, ?5)",
+                        params![key, text, blob, hash, now],
+                    );
+                    let _ = db.conn.execute(
+                        "INSERT INTO memories_fts (rowid, content, tags, kind, project) VALUES ((SELECT rowid FROM memories WHERE id=?1), ?2, '[]', 'session', '')",
+                        params![key, text],
+                    );
+                    turn_count += 1;
                 }
             }
 
-            if !all_texts.is_empty() {
-                eprintln!("[LongMemEval] Q{}: embedding {} turns in batches...", qi + 1, all_texts.len());
-                let now = Utc::now().to_rfc3339();
-                let batch_size = 128;
-
-                for chunk_start in (0..all_texts.len()).step_by(batch_size) {
-                    let chunk_end = (chunk_start + batch_size).min(all_texts.len());
-                    let chunk_refs: Vec<&str> = all_texts[chunk_start..chunk_end].iter().map(|s| s.as_str()).collect();
-                    let chunk_embeddings = crate::embedding::embed_batch(&chunk_refs);
-
-                    for (ci, emb) in chunk_embeddings.into_iter().enumerate() {
-                        let idx = chunk_start + ci;
-                        let blob = crate::embedding::vec_to_blob(&emb);
-                        let hash = content_hash(&all_texts[idx]);
-                        let _ = db.conn.execute(
-                            "INSERT INTO memories (id, content, kind, project, tags, source, importance, embedding, content_hash, created_at, updated_at)
-                             VALUES (?1, ?2, 'session', NULL, '[]', 'longmemeval', 3, ?3, ?4, ?5, ?5)",
-                            params![all_ids[idx], all_texts[idx], blob, hash, now],
-                        );
-                        let _ = db.conn.execute(
-                            "INSERT INTO memories_fts (rowid, content, tags, kind, project) VALUES ((SELECT rowid FROM memories WHERE id=?1), ?2, '[]', 'session', '')",
-                            params![all_ids[idx], all_texts[idx]],
-                        );
-                    }
-                }
-                eprintln!("[LongMemEval] Q{}: indexed {} turns ✓", qi + 1, all_texts.len());
+            if qi % 50 == 0 {
+                eprintln!("[LongMemEval] Q{}/{} ({}): {} turns indexed", qi + 1, eval_count, question_type, turn_count);
             }
 
             // Search

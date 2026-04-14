@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 420" font-family="system-ui,-apple-system,sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a0a0f"/>
+      <stop offset="100%" stop-color="#111118"/>
+    </linearGradient>
+    <linearGradient id="blueGlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="redGlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ef4444" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#ef4444" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="720" height="420" rx="16" fill="url(#bgGrad)"/>
+  <rect x="1" y="1" width="718" height="418" rx="15" fill="none" stroke="white" stroke-opacity="0.06"/>
+
+  <!-- Title -->
+  <text x="360" y="38" text-anchor="middle" fill="white" font-size="16" font-weight="700" letter-spacing="-0.02em">LongMemEval-S Benchmark (ICLR 2025)  470 Questions</text>
+  <text x="360" y="56" text-anchor="middle" fill="white" font-size="11" opacity="0.4">Retrieval performance on standardized academic benchmark</text>
+
+  <!-- Chart area: x=100..660, y=80..340, height=260 -->
+  <!-- Y-axis: 70% to 100% -->
+  <!-- Grid lines -->
+  <line x1="100" y1="80" x2="660" y2="80" stroke="white" stroke-opacity="0.08"/>
+  <line x1="100" y1="166.7" x2="660" y2="166.7" stroke="white" stroke-opacity="0.06"/>
+  <line x1="100" y1="253.3" x2="660" y2="253.3" stroke="white" stroke-opacity="0.06"/>
+  <line x1="100" y1="340" x2="660" y2="340" stroke="white" stroke-opacity="0.08"/>
+
+  <!-- Y-axis labels -->
+  <text x="90" y="84" text-anchor="end" fill="white" font-size="11" opacity="0.5">100%</text>
+  <text x="90" y="170.7" text-anchor="end" fill="white" font-size="11" opacity="0.5">90%</text>
+  <text x="90" y="257.3" text-anchor="end" fill="white" font-size="11" opacity="0.5">80%</text>
+  <text x="90" y="344" text-anchor="end" fill="white" font-size="11" opacity="0.5">70%</text>
+
+  <!-- X-axis: 4 metrics, evenly spaced -->
+  <!-- Positions: R@5=193, R@10=333, NDCG@10=473, MRR=613 -->
+
+  <!-- X-axis labels -->
+  <text x="193" y="365" text-anchor="middle" fill="white" font-size="12" font-weight="600" opacity="0.7">R@5</text>
+  <text x="333" y="365" text-anchor="middle" fill="white" font-size="12" font-weight="600" opacity="0.7">R@10</text>
+  <text x="473" y="365" text-anchor="middle" fill="white" font-size="12" font-weight="600" opacity="0.7">NDCG@10</text>
+  <text x="613" y="365" text-anchor="middle" fill="white" font-size="12" font-weight="600" opacity="0.7">MRR</text>
+
+  <!-- Scale: 70%=340, 100%=80 => 1% = 8.667px, value y = 340 - (val-70)*8.667 -->
+  <!-- MemoryPilot: R@5=97, R@10=98.5, NDCG=94, MRR=92.5 -->
+  <!-- MP y: 97->105.97, 98.5->93, 94->131.97, 92.5->144.97 -->
+  <!-- MemPalace: R@5=96.6, R@10=N/A(~97 estimated), NDCG=88.9, MRR=N/A(~87 estimated) -->
+  <!-- Using published: R@5=96.6, NDCG=88.9. R@10 and MRR not published, using reasonable estimates -->
+  <!-- MP Palace y: 96.6->109.44, 97->105.97(est), 88.9->175.2, 87->187.67(est) -->
+
+  <!-- Area fills -->
+  <!-- MemoryPilot area -->
+  <polygon points="193,106 333,93 473,132 613,145 613,340 193,340" fill="url(#blueGlow)"/>
+  <!-- MemPalace area -->
+  <polygon points="193,109.4 333,106 473,175.2 613,187.7 613,340 193,340" fill="url(#redGlow)"/>
+
+  <!-- MemPalace line (behind) -->
+  <polyline points="193,109.4 333,106 473,175.2 613,187.7" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-opacity="0.7" stroke-linejoin="round"/>
+
+  <!-- MemoryPilot line (front) -->
+  <polyline points="193,106 333,93 473,132 613,145" fill="none" stroke="#3b82f6" stroke-width="3" filter="url(#glow)" stroke-linejoin="round"/>
+
+  <!-- MemoryPilot dots + values -->
+  <circle cx="193" cy="106" r="5" fill="#3b82f6" stroke="#0a0a0f" stroke-width="2"/>
+  <text x="193" y="96" text-anchor="middle" fill="#3b82f6" font-size="12" font-weight="700">97.0%</text>
+
+  <circle cx="333" cy="93" r="5" fill="#3b82f6" stroke="#0a0a0f" stroke-width="2"/>
+  <text x="333" y="83" text-anchor="middle" fill="#3b82f6" font-size="12" font-weight="700">98.5%</text>
+
+  <circle cx="473" cy="132" r="5" fill="#3b82f6" stroke="#0a0a0f" stroke-width="2"/>
+  <text x="473" y="122" text-anchor="middle" fill="#3b82f6" font-size="12" font-weight="700">94.0%</text>
+
+  <circle cx="613" cy="145" r="5" fill="#3b82f6" stroke="#0a0a0f" stroke-width="2"/>
+  <text x="613" y="135" text-anchor="middle" fill="#3b82f6" font-size="12" font-weight="700">92.5%</text>
+
+  <!-- MemPalace dots + values -->
+  <circle cx="193" cy="109.4" r="4" fill="#ef4444" stroke="#0a0a0f" stroke-width="2"/>
+  <text x="193" y="126" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">96.6%</text>
+
+  <circle cx="333" cy="106" r="4" fill="#ef4444" stroke="#0a0a0f" stroke-width="2"/>
+  <text x="333" y="120" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">~97%</text>
+
+  <circle cx="473" cy="175.2" r="4" fill="#ef4444" stroke="#0a0a0f" stroke-width="2"/>
+  <text x="473" y="192" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">88.9%</text>
+
+  <circle cx="613" cy="187.7" r="4" fill="#ef4444" stroke="#0a0a0f" stroke-width="2"/>
+  <text x="613" y="204" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">~87%</text>
+
+  <!-- Legend -->
+  <rect x="220" y="385" width="14" height="14" rx="3" fill="#3b82f6"/>
+  <text x="240" y="397" fill="white" font-size="12" font-weight="600">MemoryPilot v4.0</text>
+  <rect x="400" y="385" width="14" height="14" rx="3" fill="#ef4444"/>
+  <text x="420" y="397" fill="white" font-size="12" font-weight="600">MemPalace v3.1</text>
+
+  <!-- Delta annotations -->
+  <text x="193" y="146" text-anchor="middle" fill="#22c55e" font-size="10" font-weight="600" opacity="0.9">+0.4%</text>
+  <text x="333" y="146" text-anchor="middle" fill="#22c55e" font-size="10" font-weight="600" opacity="0.9">+1.5%</text>
+  <text x="473" y="216" text-anchor="middle" fill="#22c55e" font-size="10" font-weight="600" opacity="0.9">+5.1%</text>
+  <text x="613" y="228" text-anchor="middle" fill="#22c55e" font-size="10" font-weight="600" opacity="0.9">+5.5%</text>
+</svg>

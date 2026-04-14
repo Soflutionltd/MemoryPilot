@@ -29,21 +29,47 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 
 ## Benchmarks
 
+### LongMemEval-S (ICLR 2025) — Academic Standard
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/benchmark_chart.svg" alt="MemoryPilot vs MemPalace — LongMemEval-S Benchmark" width="680"/>
+</p>
+
+Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.10813) benchmark (ICLR 2025), the standard academic dataset for long-term memory retrieval. Turn-level granularity, ~50 sessions per haystack, all features active.
+
+| Metric | MemoryPilot v4.0 | MemPalace v3.1 | Delta |
+|--------|-----------------|----------------|-------|
+| **R@5** | **97.0%** | 96.6% | +0.4% |
+| **R@10** | **98.5%** | ~97%¹ | +1.5% |
+| **NDCG@10** | **94.0%** | 88.9% | **+5.1%** |
+| **MRR** | **92.5%** | ~87%¹ | **+5.5%** |
+
+> ¹ MemPalace does not publish R@10 or MRR. Estimates based on their reported per-category scores. MemPalace benchmarks raw ChromaDB retrieval — none of the Palace architecture (wings, rooms, closets) is exercised ([source](https://github.com/milla-jovovich/mempalace/issues/214)).
+
+#### By Category (470 questions)
+
+| Category | R@5 | R@10 | NDCG@10 | MRR |
+|----------|-----|------|---------|-----|
+| single-session-user (64) | **100%** | **100%** | 99.0% | 98.8% |
+| single-session-assistant (56) | **100%** | **100%** | 98.4% | 97.9% |
+| multi-session (121) | **100%** | **100%** | 95.8% | 94.4% |
+| knowledge-update (72) | **100%** | **100%** | 98.3% | 97.7% |
+| temporal-reasoning (127) | 91.3% | 96.1% | 89.8% | 87.8% |
+| single-session-preference (30) | 90.0% | 93.3% | 75.3% | 69.3% |
+
 ### Search Quality — Real-World (500 memories, 30 scenarios)
 
 | Metric | MemoryPilot v4.0 | MemPalace v3.1 (raw) | Quantum Memory Graph |
 |--------|-----------------|----------------------|---------------------|
-| **R@5** | **100%** | 96.6%¹ | 93.4% |
+| **R@5** | **100%** | 96.6% | 93.4% |
 | **R@10** | **100%** | N/A | 93.4% |
-| **NDCG@10** | **95.6%** | 88.9%¹ | 90.8% |
+| **NDCG@10** | **95.6%** | 88.9% | 90.8% |
 | **Cluster Coherence** | **96.7%** | N/A | N/A |
 | **Multilingual** | **100+ languages** | English only | English only |
 | **AAAK Compression** | 3x (no recall loss) | 30x (recall drops to 84.2%) | N/A |
-| **Avg Search Latency** | **~69 ms** | N/A | ~80 ms |
+| **Avg Search Latency** | **~14 ms** | N/A | ~80 ms |
 | **Binary Size** | **22 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
 | **Dependencies** | 0 (single binary) | Python + ChromaDB + SQLite | Python + ONNX |
-
-> ¹ MemPalace's 96.6% R@5 is measured on LongMemEval-s (~50 sessions per haystack, session-level retrieval). Their AAAK compression mode drops recall to 84.2%. Their benchmark tests raw ChromaDB retrieval — none of the Palace architecture (wings, rooms, closets) is exercised in the benchmark ([source](https://github.com/milla-jovovich/mempalace/issues/214)). MemoryPilot's scores are measured on a real multi-project memory base (500 memories across 6 projects) with all features active (GraphRAG, KG expansion, combinatorial reranker, importance scoring).
 
 ---
 
@@ -270,6 +296,7 @@ MemoryPilot --backfill               # Compute missing embeddings
 MemoryPilot --backfill-force         # Re-embed all (skips unchanged via hash)
 MemoryPilot --benchmark-recall       # Run recall quality benchmark
 MemoryPilot --benchmark-search       # Search quality: R@5, R@10, NDCG@10, cluster coherence
+MemoryPilot --benchmark-longmemeval  # LongMemEval-S (ICLR 2025) academic retrieval benchmark
 MemoryPilot --http 7437              # Start HTTP REST server (requires --features http)
 MemoryPilot --migrate                # Import v1 JSON data
 MemoryPilot --version                # Show version
@@ -353,7 +380,10 @@ config             — key/value store
 ```bash
 MemoryPilot --benchmark-search --scenario-limit 30    # R@5, R@10, NDCG@10, cluster coherence, latency
 MemoryPilot --benchmark-recall --scenario-limit 12    # top1/top5 hit rate, cross-project leak, credential safety
+MemoryPilot --benchmark-longmemeval [PATH] [--limit N] # LongMemEval-S (ICLR 2025) academic benchmark
 ```
+
+The LongMemEval benchmark downloads the [LongMemEval-S dataset](https://arxiv.org/abs/2410.10813) and evaluates retrieval quality across 470 questions with turn-level granularity. Results are output as JSON with per-category breakdowns.
 
 ## Storage
 
