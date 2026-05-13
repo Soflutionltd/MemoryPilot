@@ -40,6 +40,54 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "remember_working",
+            "description": "Store ephemeral working memory for the current session/thread/window. Process-local, ultra-fast, not persisted to SQLite, and automatically capped. Use for scratchpad context that should not become durable memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string" },
+                    "project": { "type": ["string","null"] },
+                    "tags": { "type": "array", "items": { "type": "string" }, "default": [] },
+                    "importance": { "type": "integer", "minimum": 1, "maximum": 5, "default": 3 },
+                    "session_id": { "type": ["string","null"] },
+                    "thread_id": { "type": ["string","null"] },
+                    "window_id": { "type": ["string","null"] }
+                },
+                "required": ["content"]
+            }
+        },
+        {
+            "name": "recall_working",
+            "description": "Recall ephemeral working memory from the current MCP process. Supports project/session/thread/window scope plus lightweight keyword filtering.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": ["string","null"] },
+                    "project": { "type": ["string","null"] },
+                    "working_dir": { "type": ["string","null"] },
+                    "limit": { "type": "integer", "default": 10 },
+                    "session_id": { "type": ["string","null"] },
+                    "thread_id": { "type": ["string","null"] },
+                    "window_id": { "type": ["string","null"] }
+                }
+            }
+        },
+        {
+            "name": "clear_working",
+            "description": "Clear ephemeral working memory. Requires all=true or at least one project/session/thread/window filter.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "all": { "type": "boolean", "default": false },
+                    "project": { "type": ["string","null"] },
+                    "working_dir": { "type": ["string","null"] },
+                    "session_id": { "type": ["string","null"] },
+                    "thread_id": { "type": ["string","null"] },
+                    "window_id": { "type": ["string","null"] }
+                }
+            }
+        },
+        {
             "name": "add_memory",
             "description": "Store a new memory with dedup. If near-duplicate exists, merges instead of creating. Kinds: fact, preference, decision, pattern, snippet, bug, credential, todo, note.",
             "inputSchema": {
@@ -453,6 +501,9 @@ pub fn tool_definitions() -> Value {
 pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
     match name {
         "recall" => handle_recall(db, args),
+        "remember_working" => handle_remember_working(args),
+        "recall_working" => handle_recall_working(db, args),
+        "clear_working" => handle_clear_working(db, args),
         "add_memory" => handle_add(db, args),
         "add_memories" => handle_add_bulk(db, args),
         "add_transcript" => handle_add_transcript(db, args),
@@ -512,6 +563,39 @@ fn scope_from_args(args: &Value) -> MemoryScope {
     }
 }
 
+fn detected_project_from_args(db: &Database, args: &Value) -> Option<String> {
+    args.get("project")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            args.get("working_dir")
+                .and_then(|v| v.as_str())
+                .and_then(|working_dir| db.detect_project(working_dir).ok().flatten())
+        })
+}
+
+fn working_filter_from_args(
+    db: &Database,
+    args: &Value,
+) -> crate::working_memory::WorkingMemoryFilter {
+    let scope = scope_from_args(args);
+    crate::working_memory::WorkingMemoryFilter {
+        project: detected_project_from_args(db, args),
+        session_id: scope.session_id,
+        thread_id: scope.thread_id,
+        window_id: scope.window_id,
+        query: args
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(String::from),
+        limit: args
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(10)
+            .min(50) as usize,
+    }
+}
+
 fn handle_recall(db: &Database, args: &Value) -> Value {
     let project = args.get("project").and_then(|v| v.as_str());
     let working_dir = args.get("working_dir").and_then(|v| v.as_str());
@@ -530,9 +614,96 @@ fn handle_recall(db: &Database, args: &Value) -> Value {
         Err(error) => return tool_error(&error),
     };
     match db.recall(project, working_dir, hints, mode, explain, compact, &scope) {
-        Ok(ctx) => tool_result(&serde_json::to_string_pretty(&ctx).unwrap()),
+        Ok(mut ctx) => {
+            let working_context =
+                crate::working_memory::recall(&crate::working_memory::WorkingMemoryFilter {
+                    project: detected_project_from_args(db, args),
+                    session_id: scope.session_id,
+                    thread_id: scope.thread_id,
+                    window_id: scope.window_id,
+                    query: hints.map(String::from),
+                    limit: 8,
+                });
+            if !working_context.is_empty() {
+                if let Some(object) = ctx.as_object_mut() {
+                    object.insert("working_context".into(), json!(working_context));
+                }
+            }
+            tool_result(&serde_json::to_string_pretty(&ctx).unwrap())
+        }
         Err(e) => tool_error(&e),
     }
+}
+
+fn handle_remember_working(args: &Value) -> Value {
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(content) if !content.trim().is_empty() => content,
+        _ => return tool_error("content is required"),
+    };
+    let scope = scope_from_args(args);
+    let project = args
+        .get("project")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let tags = args
+        .get("tags")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let importance = args
+        .get("importance")
+        .and_then(|value| value.as_i64())
+        .map(|value| value as i32)
+        .unwrap_or(3);
+
+    match crate::working_memory::remember(
+        content,
+        project,
+        tags,
+        importance,
+        scope.session_id,
+        scope.thread_id,
+        scope.window_id,
+    ) {
+        Ok(item) => tool_result(&serde_json::to_string_pretty(&item).unwrap()),
+        Err(error) => tool_error(&error),
+    }
+}
+
+fn handle_recall_working(db: &Database, args: &Value) -> Value {
+    let items = crate::working_memory::recall(&working_filter_from_args(db, args));
+    tool_result(
+        &serde_json::to_string_pretty(&json!({
+            "count": items.len(),
+            "items": items
+        }))
+        .unwrap(),
+    )
+}
+
+fn handle_clear_working(db: &Database, args: &Value) -> Value {
+    let all = args
+        .get("all")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let filter = working_filter_from_args(db, args);
+    let has_filter = filter.project.is_some()
+        || filter.session_id.is_some()
+        || filter.thread_id.is_some()
+        || filter.window_id.is_some();
+    if !all && !has_filter {
+        return tool_error(
+            "clear_working requires all=true or a project/session/thread/window filter",
+        );
+    }
+
+    let report = crate::working_memory::clear(&filter, all);
+    tool_result(&serde_json::to_string_pretty(&report).unwrap())
 }
 
 fn handle_add(db: &Database, args: &Value) -> Value {

@@ -105,7 +105,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity |
 | HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type |
-| MCP tools | 38 tools | 29 tools | N/A |
+| MCP tools | 41 tools | 29 tools | N/A |
 | Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
 | Language | Rust (single binary, zero deps) | Python (pip install) | SaaS |
 | Startup | 1-2 ms | ~5 ms | N/A (cloud) |
@@ -120,6 +120,8 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 Every memory gets a 384-dimension transformer embedding on insert via `fastembed` (multilingual-e5-small, local ONNX inference — supports 100+ languages including French, English, Spanish, German, Japanese, Chinese — no API calls, no external services). Search runs both BM25 full-text and cosine similarity in parallel, then merges results with Reciprocal Rank Fusion.
 
 Results are boosted by importance weighting, knowledge graph link density, file watcher context, and penalized for expired knowledge triples.
+
+Ephemeral working memory is available in the same MCP through `remember_working`, `recall_working`, and `clear_working`. It keeps fast session scratchpad context in RAM, capped to 256 items, without polluting SQLite or durable recall.
 
 **Performance optimizations:**
 - Lazy embedding: `add_memory` returns instantly, embeddings computed in background thread
@@ -368,11 +370,12 @@ src/db.rs          — SQLite facade: hybrid search, CRUD, KG, GC, brain, recall
 src/db/benchmark.rs — Internal recall/search quality benchmark helpers
 src/db/benchmark_longmemeval.rs — LongMemEval-S benchmark runner + regression guard support
 src/db/transcript.rs — Transcript/session ingestion and local-only distillation
-src/tools.rs       — 38 MCP tool definitions + handlers
+src/tools.rs       — 41 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
 src/embedding.rs   — fastembed (multilingual-e5-small) transformer embeddings, LRU cache
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal
 src/gc.rs          — GC scoring, heuristic memory merging, stopwords
+src/working_memory.rs — In-process scoped scratchpad memory for current MCP sessions
 src/watcher.rs     — File system watcher + auto-linter with persistent DB connection
 src/http.rs        — Optional multi-threaded HTTP REST server (feature-gated)
 ```

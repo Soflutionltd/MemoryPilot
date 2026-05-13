@@ -19,6 +19,7 @@ mod session_fusion;
 mod splitter;
 mod tools;
 mod watcher;
+mod working_memory;
 
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde_json::json;
@@ -353,8 +354,11 @@ fn print_help() {
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot --help           Show this help");
     println!();
-    println!("MCP TOOLS (38):");
+    println!("MCP TOOLS (41):");
     println!("  recall              Load all context in one shot (start here)");
+    println!("  remember_working    Store ephemeral session scratchpad context");
+    println!("  recall_working      Recall current in-process working memory");
+    println!("  clear_working       Clear scoped working memory");
     println!("  get_project_brain   Instant project summary (<1500 tokens)");
     println!("  search_memory       Hybrid BM25 + fastembed RRF search");
     println!("  get_file_context    Memories related to recently modified files");
