@@ -1,4 +1,7 @@
 pub fn split_memory_text(content: &str, target_chars: usize) -> Vec<String> {
+    if let Some(chunks) = crate::code_chunker::split_code_chunks(content, target_chars) {
+        return chunks;
+    }
     if looks_code_like(content) {
         return split_code_like_text(content, target_chars);
     }

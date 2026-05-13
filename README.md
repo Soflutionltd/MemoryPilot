@@ -86,6 +86,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Corpus origin detection | AI transcript/codebase/notes/platform detection | v3.3.4 prep | No |
 | Agent/persona disambiguation | Agents are separate from real people | v3.3.4 prep | No |
 | Topic tunnels | Cross-project topic links via KG | v3.3.4 prep | No |
+| Code-aware chunking | Tree-sitter Rust/Python/TS/TSX/JS + Svelte script extraction | Tree-sitter code chunking | No |
 | Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | No |
 | Compression | AAAK + Memory Capsules (5-10x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No |
 | Auto-Classification | Zero-shot kind/importance/TTL on insert | No | No |
@@ -143,6 +144,8 @@ When searching, MemoryPilot traverses the knowledge graph from the top matches t
 ### 4. Chunked RAG (Transcripts)
 
 Save full conversation transcripts without polluting the LLM context window. The `add_transcript` tool automatically chunks large texts into ~2000 character blocks and links them together. Chunks are excluded from `recall` but fully searchable.
+
+For source code, MemoryPilot uses local tree-sitter parsing by default for Rust, Python, TypeScript, TSX, and JavaScript, with Svelte support via `<script>` extraction plus markup chunking. Code is split on semantic boundaries such as functions, classes, impl blocks, interfaces, and exports instead of arbitrary paragraphs. Build with `--no-default-features` to disable code-aware chunking and keep the smallest possible binary.
 
 Auto-distillation extracts structured memories from transcripts: `decision`, `preference`, `todo`, `bug`, `milestone`, `problem`, and `note`. Smart disambiguation: a segment mentioning both a bug and its resolution is classified as `milestone`, not `bug`.
 
@@ -360,6 +363,7 @@ curl -X POST http://localhost:7437/tools/call \
 
 ```
 src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server init
+src/code_chunker.rs — Tree-sitter code-aware chunking for Rust/Python/TS/TSX/JS + Svelte scripts
 src/db.rs          — SQLite facade: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
 src/db/benchmark.rs — Internal recall/search quality benchmark helpers
 src/db/benchmark_longmemeval.rs — LongMemEval-S benchmark runner + regression guard support
@@ -390,7 +394,7 @@ config             — key/value store
 
 | Metric | Value |
 |--------|-------|
-| Binary size | 22 MB |
+| Binary size | 27 MB default with code-aware chunking / 22 MB with `--no-default-features` |
 | Startup | 1-2 ms |
 | Search (hybrid RRF + reranker) | ~10 ms (500 memories) |
 | `add_memory` latency | <1 ms (lazy embed) |
@@ -411,6 +415,7 @@ config             — key/value store
 - **Debounced cleanup**: expired memory cleanup runs max once per 60 seconds
 - **Prepared statements**: graph traversal prepares SQL once, not per node
 - **Tuned RRF fusion**: k=40 for sharper top-K discrimination vs standard k=60
+- **Code-aware chunking**: tree-sitter splits Rust/Python/TypeScript/TSX/JavaScript on semantic units, with Svelte `<script>` extraction
 - **Exact term coverage boost**: +10% when 80%+ of query terms appear in memory content
 - **Combinatorial reranker**: greedy subgraph selection, conservative +5% per connection (cap 15%)
 - **KG query expansion**: post-retrieval scoring boost from knowledge graph related terms (+4% per entity, cap 15%)
