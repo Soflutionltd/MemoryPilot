@@ -11,11 +11,10 @@ fn get_model() -> &'static Mutex<fastembed::TextEmbedding> {
     FASTEMBED_MODEL.get_or_init(|| {
         // Use a stable, writable cache dir so fastembed finds the ONNX model
         // even when launched from sandboxed environments (Claude Desktop, etc.)
-        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                format!("{}/.cache/fastembed", home)
-            });
+        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{}/.cache/fastembed", home)
+        });
         let cache_path = std::path::PathBuf::from(&cache_dir);
         std::fs::create_dir_all(&cache_path).ok();
 
@@ -30,20 +29,28 @@ fn get_model() -> &'static Mutex<fastembed::TextEmbedding> {
 
 pub fn embed_text(text: &str) -> Vec<f32> {
     let mut model = get_model().lock().expect("fastembed lock poisoned");
-    let mut embeddings = model.embed(vec![text], None).expect("fastembed embed failed");
+    let mut embeddings = model
+        .embed(vec![text], None)
+        .expect("fastembed embed failed");
     embeddings.pop().unwrap_or_else(|| vec![0.0; VECTOR_DIM])
 }
 
 pub fn embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
-    if texts.is_empty() { return vec![]; }
+    if texts.is_empty() {
+        return vec![];
+    }
     let mut model = get_model().lock().expect("fastembed lock poisoned");
-    model.embed(texts.to_vec(), None).expect("fastembed batch embed failed")
+    model
+        .embed(texts.to_vec(), None)
+        .expect("fastembed batch embed failed")
 }
 
 // ─── Shared Utilities ──────────────────────────────
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
@@ -73,7 +80,10 @@ mod tests {
         let v3 = embed_text("CSS grid layout flexbox styling");
         let sim_related = cosine_similarity(&v1, &v2);
         let sim_unrelated = cosine_similarity(&v1, &v3);
-        assert!(sim_related > sim_unrelated, "Related texts should have higher similarity");
+        assert!(
+            sim_related > sim_unrelated,
+            "Related texts should have higher similarity"
+        );
     }
 
     #[test]

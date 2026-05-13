@@ -1,0 +1,10 @@
+[alias]
+dev = "check"
+check-http = "check --features http"
+test-fast = "test"
+timings = "build --timings"
+build-http = "build --release --features http"
+
+# Keep linker changes opt-in on macOS. `mold` is not a safe default for Mach-O,
+# and `lld` requires a compatible LLVM install. Measure first with:
+#   cargo timings

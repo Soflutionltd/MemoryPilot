@@ -9,7 +9,7 @@
 
 <p align="center">
   <strong>The most advanced MCP memory server. Period.</strong><br><br>
-  <sub>Hybrid search (BM25 + multilingual-e5-small RRF) · 100+ languages · Temporal Knowledge Graph · AAAK compression (5-10x token savings) · GraphRAG · Chunked RAG · Auto-Compaction · Auto-Classification · Memory Capsules · Project brain · HTTP API · Single binary · Zero API calls</sub>
+  <sub>Hybrid search (BM25 + multilingual-e5-small RRF) · 100+ languages · Temporal Knowledge Graph · Query-aware ranking · Corpus origin detection · Agent/persona disambiguation · Topic tunnels · AAAK compression (5-10x token savings) · GraphRAG · Chunked RAG · Auto-Compaction · Auto-Classification · Memory Capsules · HTTP API · Single binary · Zero API calls</sub>
 </p>
 
 <p align="center">
@@ -35,27 +35,27 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
   <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/benchmark_chart.png" alt="MemoryPilot vs MemPalace - LongMemEval-S Benchmark" width="680"/>
 </p>
 
-Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.10813) benchmark (ICLR 2025), the standard academic dataset for long-term memory retrieval. Turn-level granularity, ~50 sessions per haystack, all features active.
+Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.10813) benchmark (ICLR 2025), the standard academic dataset for long-term memory retrieval. Turn-level granularity, ~50 sessions per haystack.
 
-| Metric | MemoryPilot v4.0 | MemPalace v3.1 | Delta |
+| Metric | MemoryPilot v4.1 | MemPalace v3.3.3 | Delta |
 |--------|-----------------|----------------|-------|
-| **R@5** | **97.0%** | 96.6% | +0.4% |
-| **R@10** | **98.5%** | ~97%¹ | +1.5% |
-| **NDCG@10** | **94.0%** | 88.9% | **+5.1%** |
-| **MRR** | **92.5%** | ~87%¹ | **+5.5%** |
+| **R@5** | **98.7%** default / **98.9%** adaptive ONNX / **98.9%** max ONNX | 96.6% raw / 98.4% hybrid held-out | +2.3% vs raw / +0.5% vs hybrid |
+| **R@10** | **99.4%** default / **99.4%** adaptive ONNX / **99.4%** max ONNX | ~97%¹ | +2.4% vs raw |
+| **NDCG@10** | **95.0%** default / **95.4%** adaptive ONNX / **96.2%** max ONNX | Not published | MemoryPilot publishes |
+| **MRR** | **93.6%** default / **94.1%** adaptive ONNX / **95.2%** max ONNX | Not published | MemoryPilot publishes |
 
-> ¹ MemPalace does not publish R@10 or MRR. Estimates based on their reported per-category scores. MemPalace benchmarks raw ChromaDB retrieval — none of the Palace architecture (wings, rooms, closets) is exercised ([source](https://github.com/milla-jovovich/mempalace/issues/214)).
+> ¹ MemPalace now publishes 96.6% raw R@5 and 98.4% hybrid held-out R@5 in v3.3.3. MemoryPilot v4.1 validates 98.7% R@5 in the default fast local mode, 98.9% R@5 with adaptive FastEmbed ONNX reranking (`MEMORYPILOT_CROSS_RERANK=adaptive`, top_k=6, ~365ms average search latency), and 98.9% R@5 with always-on ONNX reranking (`MEMORYPILOT_CROSS_RERANK=1`, top_k=6, ~744ms average search latency).
 
 #### By Category (470 questions)
 
 | Category | R@5 | R@10 | NDCG@10 | MRR |
 |----------|-----|------|---------|-----|
-| single-session-user (64) | **100%** | **100%** | 99.0% | 98.8% |
-| single-session-assistant (56) | **100%** | **100%** | 98.4% | 97.9% |
-| multi-session (121) | **100%** | **100%** | 95.8% | 94.4% |
-| knowledge-update (72) | **100%** | **100%** | 98.3% | 97.7% |
-| temporal-reasoning (127) | 91.3% | 96.1% | 89.8% | 87.8% |
-| single-session-preference (30) | 90.0% | 93.3% | 75.3% | 69.3% |
+| single-session-user (64) | **100%** | **100%** | 96.9% | 95.8% |
+| single-session-assistant (56) | **100%** | **100%** | 97.4% | 96.6% |
+| multi-session (121) | 99.2% | **100%** | 96.1% | 94.8% |
+| knowledge-update (72) | **100%** | **100%** | 98.7% | 98.3% |
+| temporal-reasoning (127) | 96.9% | 98.4% | 93.8% | 92.2% |
+| single-session-preference (30) | 96.7% | 96.7% | 78.6% | 72.6% |
 
 ### Search Quality — Real-World (500 memories, 30 scenarios)
 
@@ -75,13 +75,17 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 
 **vs the best MCP memory servers:**
 
-| Feature | MemoryPilot v4.0 | MemPalace v3.1 | Mem0 |
+| Feature | MemoryPilot v4.1 | MemPalace v3.3.3 | Mem0 |
 |---------|-----------------|----------------|------|
 | Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) | ChromaDB cosine (all-MiniLM-L6-v2) | Vector search (cloud API) |
 | Embeddings | multilingual-e5-small (100+ languages, local ONNX) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) |
 | Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | Depends on API |
 | Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Basic graph (no temporal) |
 | GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | No |
+| Query-aware ranking | Preference/temporal/role/update/technical intent boosts | Hybrid v4 keyword + temporal boosts | Depends on API |
+| Corpus origin detection | AI transcript/codebase/notes/platform detection | v3.3.4 prep | No |
+| Agent/persona disambiguation | Agents are separate from real people | v3.3.4 prep | No |
+| Topic tunnels | Cross-project topic links via KG | v3.3.4 prep | No |
 | Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | No |
 | Compression | AAAK + Memory Capsules (5-10x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No |
 | Auto-Classification | Zero-shot kind/importance/TTL on insert | No | No |
@@ -100,7 +104,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity |
 | HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type |
-| MCP tools | 36 tools | 19 tools | N/A |
+| MCP tools | 38 tools | 29 tools | N/A |
 | Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
 | Language | Rust (single binary, zero deps) | Python (pip install) | SaaS |
 | Startup | 1-2 ms | ~5 ms | N/A (cloud) |
@@ -271,6 +275,7 @@ MemoryPilot --backfill-force
 | `add_memory` | Store with lazy embedding, auto-dedup (hash exact + Jaccard 85%), auto entity extraction, auto graph linking, **auto-classification** (kind, importance, TTL inferred from content). |
 | `add_memories` | Bulk add multiple memories in one call with per-item dedup. |
 | `add_transcript` | Store a long transcript as chunked archive, auto-distill structured memories (`decision`, `preference`, `todo`, `bug`, `milestone`, `problem`, `note`). |
+| `ingest_session` | Ingest local Claude/Cursor/session transcripts into the same MemoryPilot MCP. Defaults to `distill_only=true`, so only high-value memories are indexed. |
 | `get_memory` | Retrieve by ID. |
 | `update_memory` | Update content, kind, tags, importance, TTL. Skips re-embedding if content unchanged (hash check). |
 | `delete_memory` | Delete by ID (cascades to entities and links). |
@@ -311,6 +316,7 @@ MemoryPilot --backfill-force
 | `bulk_delete` | Delete memories by kind, project, tag, age, or importance. Never touches pinned memories. |
 | `get_memory_health` | Health report: distribution by kind/project/importance, stale count, orphans, compression potential, DB size. |
 | `dedupe_report` | Find potential duplicates via Jaccard similarity for manual review. |
+| `analyze_corpus` | Inspect text without writing memory: origin, platform, agents/personas, and reliable topics. |
 | `benchmark_recall` | Recall quality benchmark with golden scenarios. |
 | `benchmark_search` | Search quality benchmark: R@5, R@10, NDCG@10, cluster coherence, latency. |
 | `migrate_v1` | Import from v1 JSON files. |
@@ -329,7 +335,7 @@ MemoryPilot --backfill               # Compute missing embeddings
 MemoryPilot --backfill-force         # Re-embed all (skips unchanged via hash)
 MemoryPilot --benchmark-recall       # Run recall quality benchmark
 MemoryPilot --benchmark-search       # Search quality: R@5, R@10, NDCG@10, cluster coherence
-MemoryPilot --benchmark-longmemeval  # LongMemEval-S (ICLR 2025) academic retrieval benchmark
+MemoryPilot --benchmark-longmemeval  # LongMemEval-S benchmark, supports --limit N and --min-r5 PCT
 MemoryPilot --http 7437              # Start HTTP REST server (requires --features http)
 MemoryPilot --migrate                # Import v1 JSON data
 MemoryPilot --version                # Show version
@@ -354,8 +360,11 @@ curl -X POST http://localhost:7437/tools/call \
 
 ```
 src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server init
-src/db.rs          — SQLite engine: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
-src/tools.rs       — 36 MCP tool definitions + handlers
+src/db.rs          — SQLite facade: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
+src/db/benchmark.rs — Internal recall/search quality benchmark helpers
+src/db/benchmark_longmemeval.rs — LongMemEval-S benchmark runner + regression guard support
+src/db/transcript.rs — Transcript/session ingestion and local-only distillation
+src/tools.rs       — 38 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
 src/embedding.rs   — fastembed (multilingual-e5-small) transformer embeddings, LRU cache
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal
@@ -407,19 +416,53 @@ config             — key/value store
 - **KG query expansion**: post-retrieval scoring boost from knowledge graph related terms (+4% per entity, cap 15%)
 - **Temporal recency**: gentle +5% for memories from last 3 days, decaying over 30 days
 - **Importance tiebreaker**: ±3% per level — never overrides relevance signal
+- **Optional cross-encoder reranking**: set `MEMORYPILOT_CROSS_RERANK=1` to rerank top candidates with a local FastEmbed ONNX reranker
 - **Auto-compaction**: GC triggers automatically when memory count > 500, debounced to once per 5 minutes
 - **Memory capsules**: old low-importance memories compressed into ~100-200 token summaries (5-10x savings)
 - **Zero-shot auto-classification**: pattern-based heuristics assign kind, importance, and TTL on insert without LLM
+
+## Fast Local Development
+
+Use `cargo check` for day-to-day validation; it catches type and borrow errors without paying the full linking cost.
+
+```bash
+make check          # cargo check
+make check-http     # cargo check --features http
+make test           # cargo test
+make timings        # cargo build --timings
+make check-cached   # RUSTC_WRAPPER=sccache cargo check
+```
+
+`sccache` is optional but recommended for frequent rebuilds:
+
+```bash
+make sccache-install
+make build-cached
+```
+
+Cargo aliases are also available: `cargo dev`, `cargo check-http`, `cargo test-fast`, `cargo timings`, and `cargo build-http`.
+
+Keep `cargo build --release --features http` for release validation and benchmark runs. Linker swaps such as `mold` or `lld` are intentionally not enabled by default on macOS; measure with `cargo build --timings` first before changing `.cargo/config.toml`.
 
 ## Run Benchmarks Yourself
 
 ```bash
 MemoryPilot --benchmark-search --scenario-limit 30    # R@5, R@10, NDCG@10, cluster coherence, latency
 MemoryPilot --benchmark-recall --scenario-limit 12    # top1/top5 hit rate, cross-project leak, credential safety
-MemoryPilot --benchmark-longmemeval [PATH] [--limit N] # LongMemEval-S (ICLR 2025) academic benchmark
+MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] # LongMemEval-S with regression guard
 ```
 
 The LongMemEval benchmark downloads the [LongMemEval-S dataset](https://arxiv.org/abs/2410.10813) and evaluates retrieval quality across 470 questions with turn-level granularity. Results are output as JSON with per-category breakdowns.
+
+Optional local cross-encoder reranking is available for max-accuracy experiments:
+
+```bash
+MEMORYPILOT_CROSS_RERANK=adaptive MEMORYPILOT_CROSS_RERANK_TOP_K=6 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --min-r5 98.7
+MEMORYPILOT_CROSS_RERANK=1 MEMORYPILOT_CROSS_RERANK_TOP_K=6 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --limit 300 --min-r5 98.0
+MEMORYPILOT_CROSS_RERANK=1 MEMORYPILOT_RERANKER_MODEL=bge-v2-m3 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --limit 300
+```
+
+Supported model shortcuts: `jina-v2-multilingual` (default), `bge-v2-m3`, `bge-base`, and `jina-v1`. The reranker runs locally through FastEmbed/ONNX and is disabled by default because it trades latency for quality. Validated full-run results with `top_k=6`: adaptive mode reaches **98.9% R@5**, **95.4% NDCG@10**, **94.1% MRR**, ~365ms average search latency; always-on mode reaches **98.9% R@5**, **96.2% NDCG@10**, **95.2% MRR**, ~744ms average search latency.
 
 ## Storage
 

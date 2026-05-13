@@ -60,9 +60,7 @@ impl Default for GcConfig {
             age_days: 30,
             importance_threshold: 3,
             max_merge_group: 10,
-            compressible_kinds: vec![
-                "bug".into(), "snippet".into(), "note".into(), "todo".into(),
-            ],
+            compressible_kinds: vec!["bug".into(), "snippet".into(), "note".into(), "todo".into()],
         }
     }
 }
@@ -79,7 +77,9 @@ pub fn merge_memories(contents: &[String], kind: &str, project: Option<&str>) ->
     for c in contents {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for w in c.split_whitespace() {
-            let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            let w = w
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
             if w.len() > 3 && !is_stopword(&w) && seen.insert(w.clone()) {
                 *word_freq.entry(w).or_default() += 1;
             }
@@ -89,7 +89,8 @@ pub fn merge_memories(contents: &[String], kind: &str, project: Option<&str>) ->
     // Top 5 keywords = subject
     let mut top_words: Vec<(String, usize)> = word_freq.into_iter().collect();
     top_words.sort_by(|a, b| b.1.cmp(&a.1));
-    let subject: String = top_words.iter()
+    let subject: String = top_words
+        .iter()
         .take(5)
         .map(|(w, _)| w.as_str())
         .collect::<Vec<_>>()
@@ -106,23 +107,32 @@ pub fn merge_memories(contents: &[String], kind: &str, project: Option<&str>) ->
     };
 
     // Take first sentence of each memory as bullet point
-    let bullets: Vec<String> = contents.iter()
+    let bullets: Vec<String> = contents
+        .iter()
         .filter_map(|c| {
             let trimmed = c.trim();
             // Take first sentence or first 120 chars
-            let end = trimmed.find(". ")
+            let end = trimmed
+                .find(". ")
                 .map(|i| i + 1)
                 .unwrap_or_else(|| trimmed.len().min(120));
             let sentence = &trimmed[..end];
-            if sentence.len() > 5 { Some(format!("- {}", sentence)) } else { None }
+            if sentence.len() > 5 {
+                Some(format!("- {}", sentence))
+            } else {
+                None
+            }
         })
         .take(8) // Max 8 bullets
         .collect();
 
     format!(
         "{}[MERGED] {} related to: {}. ({} items compressed)\n{}",
-        project_prefix, kind_label, subject,
-        contents.len(), bullets.join("\n")
+        project_prefix,
+        kind_label,
+        subject,
+        contents.len(),
+        bullets.join("\n")
     )
 }
 
@@ -170,13 +180,18 @@ pub fn capsule_summary(contents: &[String], kinds: &[String], project: Option<&s
     for c in contents {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for w in c.split_whitespace() {
-            let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            let w = w
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
             if w.len() > 3 && !is_stopword(&w) && seen.insert(w.clone()) {
                 *word_freq.entry(w).or_default() += 1;
             }
         }
         let trimmed = c.trim();
-        let end = trimmed.find(". ").map(|i| i + 1).unwrap_or_else(|| trimmed.len().min(100));
+        let end = trimmed
+            .find(". ")
+            .map(|i| i + 1)
+            .unwrap_or_else(|| trimmed.len().min(100));
         if end > 5 {
             fact_sentences.push(trimmed[..end].to_string());
         }
@@ -184,21 +199,31 @@ pub fn capsule_summary(contents: &[String], kinds: &[String], project: Option<&s
 
     let mut top_words: Vec<(String, usize)> = word_freq.into_iter().collect();
     top_words.sort_by(|a, b| b.1.cmp(&a.1));
-    let keywords: String = top_words.iter().take(8).map(|(w, _)| w.as_str()).collect::<Vec<_>>().join(", ");
+    let keywords: String = top_words
+        .iter()
+        .take(8)
+        .map(|(w, _)| w.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let unique_kinds: std::collections::HashSet<&str> = kinds.iter().map(|k| k.as_str()).collect();
     let kinds_label: String = unique_kinds.into_iter().collect::<Vec<_>>().join("+");
 
     let project_prefix = project.map(|p| format!("[{}] ", p)).unwrap_or_default();
 
-    let bullets: Vec<String> = fact_sentences.iter()
+    let bullets: Vec<String> = fact_sentences
+        .iter()
         .take(6)
         .map(|s| format!("- {}", s))
         .collect();
 
     format!(
         "{}[CAPSULE:{}] {} items | keywords: {}\n{}",
-        project_prefix, kinds_label, contents.len(), keywords, bullets.join("\n")
+        project_prefix,
+        kinds_label,
+        contents.len(),
+        keywords,
+        bullets.join("\n")
     )
 }
 
@@ -206,75 +231,121 @@ pub fn capsule_summary(contents: &[String], kinds: &[String], project: Option<&s
 /// Returns (importance 1-5, inferred_kind, suggested_ttl_days).
 pub fn auto_classify(content: &str) -> (i32, &'static str, Option<i64>) {
     let lower = content.to_lowercase();
+    let corpus = crate::graph::analyze_corpus(content, None);
 
     // Credential/secret detection (importance 5, no TTL)
-    if lower.contains("api_key") || lower.contains("api key") || lower.contains("secret")
-        || lower.contains("password") || lower.contains("token")
-        || lower.contains("credential") || lower.contains("private_key")
+    if lower.contains("api_key")
+        || lower.contains("api key")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("token")
+        || lower.contains("credential")
+        || lower.contains("private_key")
     {
         return (5, "credential", None);
     }
 
     // Architecture/decision (importance 4-5)
-    if lower.contains("architecture") || lower.contains("we decided")
-        || lower.contains("on a décidé") || lower.contains("stack")
-        || lower.contains("migration") || lower.contains("breaking change")
+    if lower.contains("architecture")
+        || lower.contains("we decided")
+        || lower.contains("on a décidé")
+        || lower.contains("stack")
+        || lower.contains("migration")
+        || lower.contains("breaking change")
     {
         return (5, "architecture", None);
     }
-    if lower.contains("decided") || lower.contains("decision")
-        || lower.contains("décision") || lower.contains("convention")
-        || lower.contains("approach") || lower.contains("design pattern")
+    if lower.contains("decided")
+        || lower.contains("decision")
+        || lower.contains("décision")
+        || lower.contains("convention")
+        || lower.contains("approach")
+        || lower.contains("design pattern")
     {
         return (4, "decision", None);
     }
 
     // Preference (importance 4)
-    if lower.contains("prefer") || lower.contains("always use")
-        || lower.contains("never use") || lower.contains("préfère")
-        || lower.contains("toujours utiliser") || lower.contains("jamais utiliser")
+    if lower.contains("prefer")
+        || lower.contains("always use")
+        || lower.contains("never use")
+        || lower.contains("préfère")
+        || lower.contains("toujours utiliser")
+        || lower.contains("jamais utiliser")
+        || lower.contains("i like")
+        || lower.contains("j'aime")
     {
         return (4, "preference", None);
     }
 
     // Pattern (importance 3-4)
-    if lower.contains("pattern") || lower.contains("best practice")
-        || lower.contains("convention") || lower.contains("rule")
-        || lower.contains("standard") || lower.contains("guideline")
+    if lower.contains("pattern")
+        || lower.contains("best practice")
+        || lower.contains("convention")
+        || lower.contains("rule")
+        || lower.contains("standard")
+        || lower.contains("guideline")
     {
         return (4, "pattern", None);
     }
 
     // Bug (importance 3, TTL 90 days — bugs get fixed)
-    if lower.contains("bug") || lower.contains("error") || lower.contains("fix")
-        || lower.contains("crash") || lower.contains("broken") || lower.contains("erreur")
-        || lower.contains("exception") || lower.contains("stack trace")
+    if lower.contains("bug")
+        || lower.contains("error")
+        || lower.contains("fix")
+        || lower.contains("crash")
+        || lower.contains("broken")
+        || lower.contains("erreur")
+        || lower.contains("exception")
+        || lower.contains("stack trace")
     {
         return (3, "bug", Some(90));
     }
 
     // Todo (importance 2, TTL 30 days)
-    if lower.contains("todo") || lower.contains("à faire") || lower.contains("task")
-        || lower.contains("implement") || lower.contains("need to")
-        || lower.contains("il faut") || lower.contains("should add")
+    if lower.contains("todo")
+        || lower.contains("à faire")
+        || lower.contains("task")
+        || lower.contains("implement")
+        || lower.contains("need to")
+        || lower.contains("il faut")
+        || lower.contains("should add")
     {
         return (2, "todo", Some(30));
     }
 
     // Snippet (importance 2)
-    if lower.contains("```") || lower.contains("fn ") || lower.contains("function ")
-        || lower.contains("class ") || lower.contains("import ")
-        || lower.contains("const ") || lower.contains("export ")
+    if lower.contains("```")
+        || lower.contains("fn ")
+        || lower.contains("function ")
+        || lower.contains("class ")
+        || lower.contains("import ")
+        || lower.contains("const ")
+        || lower.contains("export ")
     {
         return (2, "snippet", None);
     }
 
     // Milestone (importance 4)
-    if lower.contains("shipped") || lower.contains("deployed") || lower.contains("launched")
-        || lower.contains("released") || lower.contains("milestone")
-        || lower.contains("livré") || lower.contains("déployé") || lower.contains("v1") || lower.contains("v2")
+    if lower.contains("shipped")
+        || lower.contains("deployed")
+        || lower.contains("launched")
+        || lower.contains("released")
+        || lower.contains("milestone")
+        || lower.contains("livré")
+        || lower.contains("déployé")
+        || lower.contains("v1")
+        || lower.contains("v2")
     {
         return (4, "milestone", None);
+    }
+
+    // Conversation chunks are useful for retrieval, but should not crowd durable facts.
+    if corpus.origin == "ai_transcript"
+        || lower.trim_start().starts_with("user:")
+        || lower.trim_start().starts_with("assistant:")
+    {
+        return (2, "transcript", Some(180));
     }
 
     // Default: fact, importance 3
@@ -283,7 +354,8 @@ pub fn auto_classify(content: &str) -> (i32, &'static str, Option<i64>) {
 
 /// Common English/French stopwords to skip during keyword extraction.
 fn is_stopword(word: &str) -> bool {
-    matches!(word,
+    matches!(
+        word,
         // English
         "the" | "this" | "that" | "with" | "from" | "have" | "been" | "will"
         | "should" | "would" | "could" | "when" | "where" | "what" | "which"

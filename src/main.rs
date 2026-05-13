@@ -1,44 +1,80 @@
 #![recursion_limit = "256"]
 
+mod chunker;
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
 /// (c) SOFLUTION LTD — Apache 2.0 License
 mod db;
-mod protocol;
-mod tools;
 mod embedding;
+mod fts;
 mod gc;
 mod graph;
-mod watcher;
 #[cfg(feature = "http")]
 mod http;
+mod protocol;
+mod reranking;
+mod session_capsule;
+mod session_export;
+mod session_fusion;
+mod splitter;
+mod tools;
+mod watcher;
 
-use std::io::{self, BufRead, Write};
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde_json::json;
+use std::io::{self, BufRead, Write};
 
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub static WATCHER_STATE: OnceLock<Arc<Mutex<watcher::FileWatcherState>>> = OnceLock::new();
-pub static PROMPT_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<String, (std::time::SystemTime, String)>>> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+pub static PROMPT_CACHE: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, (std::time::SystemTime, String)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_NAME: &str = "MemoryPilot";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-v") { println!("MemoryPilot v{}", VERSION); return; }
-    if args.iter().any(|a| a == "--help" || a == "-h") { print_help(); return; }
-    if args.iter().any(|a| a == "--migrate") { run_migrate(); return; }
-    if args.iter().any(|a| a == "--backfill-force") { run_backfill_force(); return; }
-    if args.iter().any(|a| a == "--backfill") { run_backfill(); return; }
-    if args.iter().any(|a| a == "--benchmark-recall") { run_benchmark_recall(&args); return; }
-    if args.iter().any(|a| a == "--benchmark-search") { run_benchmark_search(&args); return; }
-    if args.iter().any(|a| a == "--benchmark-longmemeval") { run_benchmark_longmemeval(&args); return; }
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("MemoryPilot v{}", VERSION);
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+    if args.iter().any(|a| a == "--migrate") {
+        run_migrate();
+        return;
+    }
+    if args.iter().any(|a| a == "--backfill-force") {
+        run_backfill_force();
+        return;
+    }
+    if args.iter().any(|a| a == "--backfill") {
+        run_backfill();
+        return;
+    }
+    if args.iter().any(|a| a == "--benchmark-recall") {
+        run_benchmark_recall(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--benchmark-search") {
+        run_benchmark_search(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--benchmark-longmemeval") {
+        run_benchmark_longmemeval(&args);
+        return;
+    }
     #[cfg(feature = "http")]
     {
         if let Some(pos) = args.iter().position(|a| a == "--http") {
-            let port = args.get(pos + 1).and_then(|v| v.parse::<u16>().ok()).unwrap_or(7437);
+            let port = args
+                .get(pos + 1)
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(7437);
             run_http_server(port);
             return;
         }
@@ -46,28 +82,38 @@ fn main() {
     run_mcp_server();
 }
 
-    fn run_mcp_server() {
-        if let Ok(cwd) = std::env::current_dir() {
-            if let Some(state) = watcher::start_watcher(&cwd.to_string_lossy()) {
-                let _ = WATCHER_STATE.set(state);
-            }
+fn run_mcp_server() {
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(state) = watcher::start_watcher(&cwd.to_string_lossy()) {
+            let _ = WATCHER_STATE.set(state);
         }
-        
-        let db = match db::Database::open() {
-            Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); }
+    }
+
+    let db = match db::Database::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let db_arc = std::sync::Arc::new(db);
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) if !l.trim().is_empty() => l,
+            Ok(_) => continue,
+            Err(_) => break,
         };
-        let db_arc = std::sync::Arc::new(db);
-        
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        let mut out = stdout.lock();    for line in stdin.lock().lines() {
-        let line = match line { Ok(l) if !l.trim().is_empty() => l, Ok(_) => continue, Err(_) => break };
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, format!("Parse: {}", e));
                 let _ = writeln!(out, "{}", serde_json::to_string(&resp).unwrap());
-                let _ = out.flush(); continue;
+                let _ = out.flush();
+                continue;
             }
         };
         if request.id.is_none() {
@@ -83,16 +129,23 @@ fn main() {
 
 fn handle_request(db: &db::Database, req: &JsonRpcRequest) -> JsonRpcResponse {
     match req.method.as_str() {
-        "initialize" => JsonRpcResponse::success(req.id.clone(), json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": SERVER_NAME, "version": VERSION },
-            "instructions": "CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials."
-        })),
+        "initialize" => JsonRpcResponse::success(
+            req.id.clone(),
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": SERVER_NAME, "version": VERSION },
+                "instructions": "CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials."
+            }),
+        ),
         "notifications/initialized" => JsonRpcResponse::success(req.id.clone(), json!({})),
         "tools/list" => JsonRpcResponse::success(req.id.clone(), tools::tool_definitions()),
         "tools/call" => {
-            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
             JsonRpcResponse::success(req.id.clone(), tools::handle_tool_call(db, name, &args))
         }
@@ -101,97 +154,206 @@ fn handle_request(db: &db::Database, req: &JsonRpcRequest) -> JsonRpcResponse {
     }
 }
 fn run_migrate() {
-    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let db = match db::Database::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            std::process::exit(1);
+        }
+    };
     match db.migrate_from_v1() {
         Ok(n) => println!("✓ Migrated {} memories from v1 JSON to SQLite.", n),
-        Err(e) => { eprintln!("✗ Failed: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("✗ Failed: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
 fn run_backfill() {
     eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
-    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let db = match db::Database::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            std::process::exit(1);
+        }
+    };
     match db.backfill_embeddings() {
         Ok(n) => println!("✓ Generated embeddings for {} memories (missing only).", n),
-        Err(e) => { eprintln!("✗ Failed: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("✗ Failed: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
 #[cfg(feature = "http")]
 fn run_http_server(port: u16) {
-    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let db = match db::Database::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            std::process::exit(1);
+        }
+    };
     let db_arc = std::sync::Arc::new(db);
     http::start_http_server(db_arc, port);
 }
 
 fn run_backfill_force() {
     eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim) (force overwrite ALL)");
-    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let db = match db::Database::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            std::process::exit(1);
+        }
+    };
     match db.backfill_embeddings_force() {
         Ok(n) => println!("✓ Regenerated embeddings for ALL {} memories.", n),
-        Err(e) => { eprintln!("✗ Failed: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("✗ Failed: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
 fn run_benchmark_recall(args: &[String]) {
-    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let db = match db::Database::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            std::process::exit(1);
+        }
+    };
     let scenario_limit = args
         .windows(2)
         .find(|window| window[0] == "--scenario-limit")
         .and_then(|window| window[1].parse::<usize>().ok())
         .unwrap_or(12);
     match db.benchmark_recall(scenario_limit) {
-        Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())),
-        Err(error) => { eprintln!("✗ Benchmark failed: {}", error); std::process::exit(1); }
+        Ok(report) => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+        ),
+        Err(error) => {
+            eprintln!("✗ Benchmark failed: {}", error);
+            std::process::exit(1);
+        }
     }
 }
 
 fn run_benchmark_search(args: &[String]) {
-    let db = match db::Database::open() { Ok(d) => d, Err(e) => { eprintln!("DB error: {}", e); std::process::exit(1); } };
+    let db = match db::Database::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("DB error: {}", e);
+            std::process::exit(1);
+        }
+    };
     let scenario_limit = args
         .windows(2)
         .find(|window| window[0] == "--scenario-limit")
         .and_then(|window| window[1].parse::<usize>().ok())
         .unwrap_or(20);
     match db.benchmark_search(scenario_limit) {
-        Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())),
-        Err(error) => { eprintln!("✗ Search benchmark failed: {}", error); std::process::exit(1); }
+        Ok(report) => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+        ),
+        Err(error) => {
+            eprintln!("✗ Search benchmark failed: {}", error);
+            std::process::exit(1);
+        }
     }
 }
 
 fn run_benchmark_longmemeval(args: &[String]) {
     eprintln!("[LongMemEval] Starting benchmark runner...");
     eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
-    let dataset_path = args.windows(2)
+    let dataset_path = args
+        .windows(2)
         .find(|w| w[0] == "--benchmark-longmemeval")
         .map(|w| w[1].as_str())
         .unwrap_or("benchmarks/longmemeval_s_cleaned.json");
-    let limit = args.windows(2)
+    let limit = args
+        .windows(2)
         .find(|w| w[0] == "--limit")
         .and_then(|w| w[1].parse::<usize>().ok());
-    eprintln!("[LongMemEval] Dataset: {} (limit: {:?})", dataset_path, limit);
+    eprintln!(
+        "[LongMemEval] Dataset: {} (limit: {:?})",
+        dataset_path, limit
+    );
+    let min_r5 = args
+        .windows(2)
+        .find(|w| w[0] == "--min-r5")
+        .and_then(|w| parse_percent(&w[1]));
     match db::Database::benchmark_longmemeval(dataset_path, limit) {
-        Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())),
-        Err(error) => { eprintln!("✗ LongMemEval benchmark failed: {}", error); std::process::exit(1); }
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+            );
+            if let Some(minimum) = min_r5 {
+                let actual = report
+                    .get("metrics")
+                    .and_then(|metrics| metrics.get("recall_at_5"))
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_percent);
+                match actual {
+                    Some(value) if value + f64::EPSILON >= minimum => {
+                        eprintln!(
+                            "[LongMemEval] Guard passed: R@5 {:.1}% >= {:.1}%",
+                            value, minimum
+                        );
+                    }
+                    Some(value) => {
+                        eprintln!(
+                            "✗ LongMemEval guard failed: R@5 {:.1}% < {:.1}%",
+                            value, minimum
+                        );
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!("✗ LongMemEval guard failed: missing R@5 metric");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("✗ LongMemEval benchmark failed: {}", error);
+            std::process::exit(1);
+        }
     }
 }
 
+fn parse_percent(value: &str) -> Option<f64> {
+    value.trim().trim_end_matches('%').parse::<f64>().ok()
+}
+
 fn print_help() {
-    println!("MemoryPilot v{} — MCP memory server with SQLite FTS5", VERSION);
+    println!(
+        "MemoryPilot v{} — MCP memory server with SQLite FTS5",
+        VERSION
+    );
     println!();
     println!("USAGE:");
     println!("  MemoryPilot                  Start MCP stdio server");
     println!("  MemoryPilot --migrate        Migrate v1 JSON data to SQLite");
     println!("  MemoryPilot --backfill       Compute missing embeddings");
-    println!("  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)");
+    println!(
+        "  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)"
+    );
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
-    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N]  LongMemEval (ICLR 2025) retrieval benchmark");
+    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot --help           Show this help");
     println!();
-    println!("MCP TOOLS (30):");
+    println!("MCP TOOLS (38):");
     println!("  recall              Load all context in one shot (start here)");
     println!("  get_project_brain   Instant project summary (<1500 tokens)");
     println!("  search_memory       Hybrid BM25 + fastembed RRF search");
@@ -199,6 +361,7 @@ fn print_help() {
     println!("  add_memory          Store with auto-dedup, entities, graph links");
     println!("  add_memories        Bulk add multiple memories in 1 call");
     println!("  add_transcript      Chunk and store long transcripts");
+    println!("  ingest_session      Distill local session transcripts without raw index pollution");
     println!("  get_memory          Retrieve by ID");
     println!("  update_memory       Update content/kind/tags/importance/TTL");
     println!("  delete_memory       Delete by ID (cascades links/entities)");

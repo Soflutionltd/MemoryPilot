@@ -3,8 +3,32 @@
 
 BINARY_NAME = MemoryPilot
 INSTALL_DIR = $(HOME)/.local/bin
+SCCACHE ?= sccache
 
-.PHONY: build install sign release clean verify
+.PHONY: check check-http test timings sccache-install check-cached build-cached build install sign release clean verify
+
+# Fast dev checks
+check:
+	cargo check
+
+check-http:
+	cargo check --features http
+
+test:
+	cargo test
+
+timings:
+	cargo build --timings
+
+# Optional compiler cache
+sccache-install:
+	cargo install sccache
+
+check-cached:
+	RUSTC_WRAPPER=$(SCCACHE) cargo check
+
+build-cached:
+	RUSTC_WRAPPER=$(SCCACHE) cargo build --release --features http
 
 # Build release
 build:

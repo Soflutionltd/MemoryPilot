@@ -1,12 +1,22 @@
+use crate::db::{BulkItem, Database, MemoryScope, RecallMode};
+use crate::protocol::{tool_error, tool_result};
 /// MCP Tool definitions and handlers for MemoryPilot v2.1.
 use serde_json::{json, Value};
-use crate::db::{Database, BulkItem, MemoryScope, RecallMode};
-use crate::protocol::{tool_result, tool_error};
 
 const VALID_KINDS: &[&str] = &[
-    "fact", "preference", "decision", "pattern", "snippet",
-    "bug", "credential", "todo", "note", "transcript",
-    "milestone", "architecture", "problem",
+    "fact",
+    "preference",
+    "decision",
+    "pattern",
+    "snippet",
+    "bug",
+    "credential",
+    "todo",
+    "note",
+    "transcript",
+    "milestone",
+    "architecture",
+    "problem",
 ];
 
 pub fn tool_definitions() -> Value {
@@ -92,6 +102,27 @@ pub fn tool_definitions() -> Value {
                     "window_id": { "type": ["string","null"] }
                 },
                 "required": ["content"]
+            }
+        },
+        {
+            "name": "ingest_session",
+            "description": "Ingest a local Claude/Cursor/session transcript into MemoryPilot. Default is anti-pollution distill_only=true: stores only high-value distilled memories, not raw transcript chunks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": { "type": ["string","null"], "description": "Inline transcript content" },
+                    "path": { "type": ["string","null"], "description": "Path to one local transcript file" },
+                    "directory_path": { "type": ["string","null"], "description": "Directory containing local transcript files" },
+                    "project": { "type": ["string","null"], "description": "Project name or null for global" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "default": [] },
+                    "source": { "type": "string", "default": "local-session" },
+                    "distill_only": { "type": ["boolean","null"], "description": "Default true. When true, raw transcript chunks are not indexed." },
+                    "max_files": { "type": ["integer","null"], "default": 20 },
+                    "max_bytes": { "type": ["integer","null"], "default": 2000000 },
+                    "session_id": { "type": ["string","null"] },
+                    "thread_id": { "type": ["string","null"] },
+                    "window_id": { "type": ["string","null"] }
+                }
             }
         },
         {
@@ -228,6 +259,19 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "export_session",
+            "description": "Export a scoped session/thread/window as cleaned Markdown with YAML front matter.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": ["string","null"] },
+                    "thread_id": { "type": ["string","null"] },
+                    "window_id": { "type": ["string","null"] },
+                    "project": { "type": ["string","null"], "description": "Optional project filter" }
+                }
+            }
+        },
+        {
             "name": "set_config",
             "description": "Set a config value (e.g. global_prompt_path).",
             "inputSchema": { "type": "object", "properties": { "key": { "type": "string" }, "value": { "type": "string" } }, "required": ["key", "value"] }
@@ -245,18 +289,18 @@ pub fn tool_definitions() -> Value {
                 }
             }
         },
-        { 
-            "name": "run_gc", 
-            "description": "Trigger Garbage Collection manually. Compresses old bugs/snippets and deletes expired. `preview`/`dry_run` returns exact candidate groups with confidence and hygiene signals before mutating anything.", 
-            "inputSchema": { 
-                "type": "object", 
+        {
+            "name": "run_gc",
+            "description": "Trigger Garbage Collection manually. Compresses old bugs/snippets and deletes expired. `preview`/`dry_run` returns exact candidate groups with confidence and hygiene signals before mutating anything.",
+            "inputSchema": {
+                "type": "object",
                 "properties": {
                     "age_days": { "type": "integer", "default": 30 },
                     "importance_threshold": { "type": "integer", "default": 3 },
                     "dry_run": { "type": "boolean", "default": false },
                     "preview": { "type": "boolean", "default": false }
-                } 
-            } 
+                }
+            }
         },
         {
             "name": "toggle_auto_lint",
@@ -390,6 +434,18 @@ pub fn tool_definitions() -> Value {
                     "threshold": { "type": "number", "default": 0.7, "description": "Jaccard similarity threshold (0.0-1.0)" }
                 }
             }
+        },
+        {
+            "name": "analyze_corpus",
+            "description": "Analyze text without writing memory: detects corpus origin, platform, agents/personas, and reliable topics for graph linking.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "Text, transcript chunk, or document to analyze" },
+                    "source": { "type": ["string","null"], "description": "Optional source hint, e.g. cursor, claude, chatgpt" }
+                },
+                "required": ["content"]
+            }
         }
     ]})
 }
@@ -400,6 +456,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "add_memory" => handle_add(db, args),
         "add_memories" => handle_add_bulk(db, args),
         "add_transcript" => handle_add_transcript(db, args),
+        "ingest_session" => handle_ingest_session(db, args),
         "search_memory" => handle_search(db, args),
         "get_memory" => handle_get(db, args),
         "update_memory" => handle_update(db, args),
@@ -414,6 +471,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "benchmark_search" => handle_benchmark_search(db, args),
         "get_global_prompt" => handle_global_prompt(db, args),
         "export_memories" => handle_export(db, args),
+        "export_session" => handle_export_session(db, args),
         "set_config" => handle_set_config(db, args),
         "migrate_v1" => handle_migrate(db),
         "cleanup_expired" => handle_cleanup(db),
@@ -432,15 +490,25 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "bulk_delete" => handle_bulk_delete(db, args),
         "get_memory_health" => handle_memory_health(db),
         "dedupe_report" => handle_dedupe_report(db, args),
+        "analyze_corpus" => handle_analyze_corpus(args),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
 }
 
 fn scope_from_args(args: &Value) -> MemoryScope {
     MemoryScope {
-        session_id: args.get("session_id").and_then(|v| v.as_str()).map(String::from),
-        thread_id: args.get("thread_id").and_then(|v| v.as_str()).map(String::from),
-        window_id: args.get("window_id").and_then(|v| v.as_str()).map(String::from),
+        session_id: args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        thread_id: args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        window_id: args
+            .get("window_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 
@@ -448,8 +516,14 @@ fn handle_recall(db: &Database, args: &Value) -> Value {
     let project = args.get("project").and_then(|v| v.as_str());
     let working_dir = args.get("working_dir").and_then(|v| v.as_str());
     let hints = args.get("hints").and_then(|v| v.as_str());
-    let explain = args.get("explain").and_then(|v| v.as_bool()).unwrap_or(false);
-    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
+    let explain = args
+        .get("explain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let compact = args
+        .get("compact")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let scope = scope_from_args(args);
     let mode = match RecallMode::from_str(args.get("mode").and_then(|v| v.as_str())) {
         Ok(mode) => mode,
@@ -471,41 +545,73 @@ fn handle_add(db: &Database, args: &Value) -> Value {
     let (auto_imp, auto_kind, auto_ttl) = crate::gc::auto_classify(content);
     let user_kind = args.get("kind").and_then(|v| v.as_str());
     let kind = user_kind.unwrap_or(auto_kind);
-    if !VALID_KINDS.contains(&kind) { return tool_error(&format!("Invalid kind '{}'. Valid: {:?}", kind, VALID_KINDS)); }
+    if !VALID_KINDS.contains(&kind) {
+        return tool_error(&format!(
+            "Invalid kind '{}'. Valid: {:?}",
+            kind, VALID_KINDS
+        ));
+    }
     let project = args.get("project").and_then(|v| v.as_str());
-    let tags: Vec<String> = args.get("tags").and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
-    let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("cursor");
-    let importance = args.get("importance").and_then(|v| v.as_i64())
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let source = args
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("cursor");
+    let importance = args
+        .get("importance")
+        .and_then(|v| v.as_i64())
         .map(|v| v as i32)
         .unwrap_or(auto_imp);
-    let expires_at_owned: Option<String> = args.get("expires_at").and_then(|v| v.as_str()).map(String::from)
-        .or_else(|| auto_ttl.map(|days| {
-            (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
-        }));
+    let expires_at_owned: Option<String> = args
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            auto_ttl.map(|days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339())
+        });
     let expires_at = expires_at_owned.as_deref();
     let metadata = args.get("metadata").filter(|v| !v.is_null());
     let scope = scope_from_args(args);
 
-    match db.add_memory(content, kind, project, &tags, source, importance, expires_at, metadata, &scope) {
+    match db.add_memory(
+        content, kind, project, &tags, source, importance, expires_at, metadata, &scope,
+    ) {
         Ok((mem, was_merged)) => {
             let mut result = serde_json::to_value(&mem).unwrap_or(json!({}));
-            if was_merged { result.as_object_mut().map(|o| o.insert("_merged".into(), json!(true))); }
+            if was_merged {
+                result
+                    .as_object_mut()
+                    .map(|o| o.insert("_merged".into(), json!(true)));
+            }
             tool_result(&serde_json::to_string_pretty(&result).unwrap())
         }
         Err(e) => tool_error(&e),
     }
 }
 fn handle_add_bulk(db: &Database, args: &Value) -> Value {
-    let items: Vec<BulkItem> = match args.get("memories").and_then(|v| serde_json::from_value::<Vec<BulkItem>>(v.clone()).ok()) {
+    let items: Vec<BulkItem> = match args
+        .get("memories")
+        .and_then(|v| serde_json::from_value::<Vec<BulkItem>>(v.clone()).ok())
+    {
         Some(items) if !items.is_empty() => items,
         _ => return tool_error("memories array is required and cannot be empty"),
     };
     match db.add_memories_bulk(&items) {
-        Ok((added, merged, skipped)) => {
-            tool_result(&format!("Bulk complete: {} added, {} merged (dedup), {} skipped. Total processed: {}.",
-                added.len(), merged, skipped, items.len()))
-        }
+        Ok((added, merged, skipped)) => tool_result(&format!(
+            "Bulk complete: {} added, {} merged (dedup), {} skipped. Total processed: {}.",
+            added.len(),
+            merged,
+            skipped,
+            items.len()
+        )),
         Err(e) => tool_error(&e),
     }
 }
@@ -515,17 +621,188 @@ fn handle_add_transcript(db: &Database, args: &Value) -> Value {
         Some(c) if !c.trim().is_empty() => c,
         _ => return tool_error("content is required"),
     };
-    let project = args.get("project").and_then(|v| v.as_str()).map(String::from);
-    let tags: Vec<String> = args.get("tags").and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
-    let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("cursor").to_string();
-    let distill = args.get("distill").and_then(|v| v.as_bool()).unwrap_or(true);
+    let project = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let source = args
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("cursor")
+        .to_string();
+    let distill = args
+        .get("distill")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let scope = scope_from_args(args);
 
     match db.add_transcript(content, project.as_deref(), &tags, &source, &scope, distill) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
     }
+}
+
+fn handle_ingest_session(db: &Database, args: &Value) -> Value {
+    let project = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let mut tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    for tag in ["session-ingest", "distilled"] {
+        if !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+    let source = args
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("local-session")
+        .to_string();
+    let distill_only = args
+        .get("distill_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let max_files = args
+        .get("max_files")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .clamp(1, 200) as usize;
+    let max_bytes = args
+        .get("max_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2_000_000)
+        .clamp(1024, 20_000_000) as usize;
+    let scope = scope_from_args(args);
+
+    let transcripts = match collect_session_transcripts(args, max_files, max_bytes) {
+        Ok(items) if !items.is_empty() => items,
+        Ok(_) => return tool_error("content, path, or directory_path is required"),
+        Err(error) => return tool_error(&error),
+    };
+
+    let mut reports = Vec::new();
+    let mut total_distilled_added = 0usize;
+    let mut total_distilled_merged = 0usize;
+    let mut total_distilled_skipped = 0usize;
+
+    for (label, content) in transcripts {
+        let item_source = format!("{}:{}", source, label);
+        match db.ingest_session_transcript(
+            &content,
+            project.as_deref(),
+            &tags,
+            &item_source,
+            &scope,
+            !distill_only,
+        ) {
+            Ok(report) => {
+                total_distilled_added += report.distilled_added;
+                total_distilled_merged += report.distilled_merged;
+                total_distilled_skipped += report.distilled_skipped;
+                reports.push(json!({
+                    "source": label,
+                    "transcript_id": report.transcript_id,
+                    "chunks_total": report.chunks_total,
+                    "chunk_added": report.chunk_added,
+                    "distilled_candidates": report.distilled_candidates,
+                    "distilled_added": report.distilled_added,
+                    "distilled_merged": report.distilled_merged,
+                    "distilled_skipped": report.distilled_skipped,
+                }));
+            }
+            Err(error) => return tool_error(&error),
+        }
+    }
+
+    tool_result(
+        &serde_json::to_string_pretty(&json!({
+            "mode": if distill_only { "distill_only" } else { "store_raw_and_distill" },
+            "files_ingested": reports.len(),
+            "distilled_added": total_distilled_added,
+            "distilled_merged": total_distilled_merged,
+            "distilled_skipped": total_distilled_skipped,
+            "reports": reports,
+        }))
+        .unwrap(),
+    )
+}
+
+fn collect_session_transcripts(
+    args: &Value,
+    max_files: usize,
+    max_bytes: usize,
+) -> Result<Vec<(String, String)>, String> {
+    let mut transcripts = Vec::new();
+
+    if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
+        if !content.trim().is_empty() {
+            transcripts.push(("inline".to_string(), content.to_string()));
+        }
+    }
+
+    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        transcripts.push(read_session_file(path, max_bytes)?);
+    }
+
+    if let Some(directory_path) = args.get("directory_path").and_then(|v| v.as_str()) {
+        let mut paths = std::fs::read_dir(directory_path)
+            .map_err(|error| format!("read directory '{}': {}", directory_path, error))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_file())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "txt" | "md" | "json" | "jsonl" | "log"
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        for path in paths.into_iter().take(max_files) {
+            let path_string = path.to_string_lossy().to_string();
+            transcripts.push(read_session_file(&path_string, max_bytes)?);
+        }
+    }
+
+    Ok(transcripts)
+}
+
+fn read_session_file(path: &str, max_bytes: usize) -> Result<(String, String), String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| format!("stat '{}': {}", path, error))?;
+    if metadata.len() as usize > max_bytes {
+        return Err(format!(
+            "file '{}' is too large ({} bytes > max_bytes {})",
+            path,
+            metadata.len(),
+            max_bytes
+        ));
+    }
+    let content =
+        std::fs::read_to_string(path).map_err(|error| format!("read '{}': {}", path, error))?;
+    Ok((path.to_string(), content))
 }
 
 fn handle_search(db: &Database, args: &Value) -> Value {
@@ -536,18 +813,25 @@ fn handle_search(db: &Database, args: &Value) -> Value {
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let project = args.get("project").and_then(|v| v.as_str());
     let kind = args.get("kind").and_then(|v| v.as_str());
-    let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-        
+    let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+
     let mut watcher_keywords = Vec::new();
     if let Some(watcher) = crate::WATCHER_STATE.get() {
         if let Ok(state) = watcher.lock() {
             watcher_keywords = state.get_boost_keywords();
         }
     }
-    
-    let wk_ref = if watcher_keywords.is_empty() { None } else { Some(watcher_keywords.as_slice()) };
-    
+
+    let wk_ref = if watcher_keywords.is_empty() {
+        None
+    } else {
+        Some(watcher_keywords.as_slice())
+    };
+
     match db.search(query, limit, project, kind, tags.as_deref(), wk_ref) {
         Ok(results) => {
             let output = json!({ "query": query, "count": results.len(),
@@ -563,7 +847,10 @@ fn handle_search(db: &Database, args: &Value) -> Value {
 }
 
 fn handle_get(db: &Database, args: &Value) -> Value {
-    let id = match args.get("id").and_then(|v| v.as_str()) { Some(i) => i, _ => return tool_error("id required") };
+    let id = match args.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        _ => return tool_error("id required"),
+    };
     match db.get_memory(id) {
         Ok(Some(mem)) => tool_result(&serde_json::to_string_pretty(&mem).unwrap()),
         Ok(None) => tool_error(&format!("Not found: {}", id)),
@@ -571,14 +858,31 @@ fn handle_get(db: &Database, args: &Value) -> Value {
     }
 }
 fn handle_update(db: &Database, args: &Value) -> Value {
-    let id = match args.get("id").and_then(|v| v.as_str()) { Some(i) => i, _ => return tool_error("id required") };
+    let id = match args.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        _ => return tool_error("id required"),
+    };
     let content = args.get("content").and_then(|v| v.as_str());
     let kind = args.get("kind").and_then(|v| v.as_str());
-    let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-    let importance = args.get("importance").and_then(|v| v.as_i64()).map(|i| i as i32);
+    let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+    let importance = args
+        .get("importance")
+        .and_then(|v| v.as_i64())
+        .map(|i| i as i32);
     let expires_at = args.get("expires_at").and_then(|v| v.as_str());
-    match db.update_memory_full(id, content, kind, tags.as_deref(), importance, expires_at, None) {
+    match db.update_memory_full(
+        id,
+        content,
+        kind,
+        tags.as_deref(),
+        importance,
+        expires_at,
+        None,
+    ) {
         Ok(Some(mem)) => tool_result(&serde_json::to_string_pretty(&mem).unwrap()),
         Ok(None) => tool_error(&format!("Not found: {}", id)),
         Err(e) => tool_error(&e),
@@ -586,7 +890,10 @@ fn handle_update(db: &Database, args: &Value) -> Value {
 }
 
 fn handle_delete(db: &Database, args: &Value) -> Value {
-    let id = match args.get("id").and_then(|v| v.as_str()) { Some(i) => i, _ => return tool_error("id required") };
+    let id = match args.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        _ => return tool_error("id required"),
+    };
     match db.delete_memory(id) {
         Ok(true) => tool_result(&format!("Deleted: {}", id)),
         Ok(false) => tool_error(&format!("Not found: {}", id)),
@@ -600,9 +907,12 @@ fn handle_list(db: &Database, args: &Value) -> Value {
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     match db.list_memories(project, kind, None, limit, offset) {
-        Ok((memories, total)) => {
-            tool_result(&serde_json::to_string_pretty(&json!({"total":total,"count":memories.len(),"offset":offset,"memories":memories})).unwrap())
-        }
+        Ok((memories, total)) => tool_result(
+            &serde_json::to_string_pretty(
+                &json!({"total":total,"count":memories.len(),"offset":offset,"memories":memories}),
+            )
+            .unwrap(),
+        ),
         Err(e) => tool_error(&e),
     }
 }
@@ -621,15 +931,28 @@ fn handle_project_context(db: &Database, args: &Value) -> Value {
 }
 
 fn handle_get_project_brain(db: &Database, args: &Value) -> Value {
-    let proj_detect = args.get("working_dir").and_then(|v| v.as_str()).and_then(|wd| db.detect_project(wd).ok().flatten());
+    let proj_detect = args
+        .get("working_dir")
+        .and_then(|v| v.as_str())
+        .and_then(|wd| db.detect_project(wd).ok().flatten());
 
-    let project = match args.get("project").and_then(|v| v.as_str()).or_else(|| proj_detect.as_deref()) {
+    let project = match args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .or_else(|| proj_detect.as_deref())
+    {
         Some(p) => p,
         None => return tool_error("project or working_dir is required, and project must be found"),
     };
 
-    let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as usize);
-    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
+    let max_tokens = args
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let compact = args
+        .get("compact")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     match db.get_project_brain(project, max_tokens, compact) {
         Ok(brain) => tool_result(&serde_json::to_string_pretty(&brain).unwrap()),
@@ -638,8 +961,14 @@ fn handle_get_project_brain(db: &Database, args: &Value) -> Value {
 }
 
 fn handle_register_project(db: &Database, args: &Value) -> Value {
-    let name = match args.get("name").and_then(|v| v.as_str()) { Some(n) => n, _ => return tool_error("name required") };
-    let path = match args.get("path").and_then(|v| v.as_str()) { Some(p) => p, _ => return tool_error("path required") };
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        _ => return tool_error("name required"),
+    };
+    let path = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        _ => return tool_error("path required"),
+    };
     let desc = args.get("description").and_then(|v| v.as_str());
     match db.register_project(name, path, desc) {
         Ok(proj) => tool_result(&serde_json::to_string_pretty(&proj).unwrap()),
@@ -662,7 +991,10 @@ fn handle_stats(db: &Database) -> Value {
 }
 
 fn handle_benchmark_recall(db: &Database, args: &Value) -> Value {
-    let scenario_limit = args.get("scenario_limit").and_then(|v| v.as_u64()).unwrap_or(12) as usize;
+    let scenario_limit = args
+        .get("scenario_limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(12) as usize;
     match db.benchmark_recall(scenario_limit) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(error) => tool_error(&error),
@@ -670,7 +1002,10 @@ fn handle_benchmark_recall(db: &Database, args: &Value) -> Value {
 }
 
 fn handle_benchmark_search(db: &Database, args: &Value) -> Value {
-    let scenario_limit = args.get("scenario_limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let scenario_limit = args
+        .get("scenario_limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as usize;
     match db.benchmark_search(scenario_limit) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(error) => tool_error(&error),
@@ -688,19 +1023,43 @@ fn handle_global_prompt(db: &Database, args: &Value) -> Value {
 
 fn handle_export(db: &Database, args: &Value) -> Value {
     let project = args.get("project").and_then(|v| v.as_str());
-    let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("markdown");
+    let format = args
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("markdown");
     match db.export_memories(project, format) {
         Ok(output) => tool_result(&output),
         Err(e) => tool_error(&e),
     }
 }
 
+fn handle_export_session(db: &Database, args: &Value) -> Value {
+    let session_id = args.get("session_id").and_then(|v| v.as_str());
+    let thread_id = args.get("thread_id").and_then(|v| v.as_str());
+    let window_id = args.get("window_id").and_then(|v| v.as_str());
+    let project = args.get("project").and_then(|v| v.as_str());
+    match db.export_session_markdown(session_id, thread_id, window_id, project) {
+        Ok(output) => tool_result(&output),
+        Err(error) => tool_error(&error),
+    }
+}
+
 fn handle_set_config(db: &Database, args: &Value) -> Value {
     const ALLOWED_KEYS: &[&str] = &["global_prompt_path", "auto_lint", "compact_default"];
-    let key = match args.get("key").and_then(|v| v.as_str()) { Some(k) => k, _ => return tool_error("key required") };
-    let value = match args.get("value").and_then(|v| v.as_str()) { Some(v) => v, _ => return tool_error("value required") };
+    let key = match args.get("key").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        _ => return tool_error("key required"),
+    };
+    let value = match args.get("value").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        _ => return tool_error("value required"),
+    };
     if !ALLOWED_KEYS.contains(&key) {
-        return tool_error(&format!("Unknown config key '{}'. Allowed: {}", key, ALLOWED_KEYS.join(", ")));
+        return tool_error(&format!(
+            "Unknown config key '{}'. Allowed: {}",
+            key,
+            ALLOWED_KEYS.join(", ")
+        ));
     }
     if key == "global_prompt_path" {
         let path = std::path::Path::new(value);
@@ -712,7 +1071,14 @@ fn handle_set_config(db: &Database, args: &Value) -> Value {
             if !canonical.to_string_lossy().ends_with(".md") {
                 return tool_error("global_prompt_path must point to a .md file");
             }
-        } else if !value.starts_with("~/") && !value.starts_with(&dirs::home_dir().unwrap_or_default().to_string_lossy().to_string()) {
+        } else if !value.starts_with("~/")
+            && !value.starts_with(
+                &dirs::home_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        {
             return tool_error("global_prompt_path must be within your home directory");
         }
     }
@@ -738,23 +1104,36 @@ fn handle_cleanup(db: &Database) -> Value {
 
 fn handle_compact(db: &Database, args: &Value) -> Value {
     let age_days = args.get("age_days").and_then(|v| v.as_i64()).unwrap_or(14);
-    let importance_max = args.get("importance_max").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
+    let importance_max = args
+        .get("importance_max")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3) as i32;
     match db.compact_to_capsules(age_days, importance_max) {
-        Ok((capsules, compressed)) => {
-            tool_result(&format!("Compacted {} memories into {} capsules (age >= {} days, importance <= {})",
-                compressed, capsules, age_days, importance_max))
-        }
+        Ok((capsules, compressed)) => tool_result(&format!(
+            "Compacted {} memories into {} capsules (age >= {} days, importance <= {})",
+            compressed, capsules, age_days, importance_max
+        )),
         Err(e) => tool_error(&e),
     }
 }
 
 fn handle_run_gc(db: &Database, args: &Value) -> Value {
     let mut config = crate::gc::GcConfig::default();
-    if let Some(age) = args.get("age_days").and_then(|v| v.as_i64()) { config.age_days = age; }
-    if let Some(imp) = args.get("importance_threshold").and_then(|v| v.as_i64()) { config.importance_threshold = imp as i32; }
-    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false)
-        || args.get("preview").and_then(|v| v.as_bool()).unwrap_or(false);
-    
+    if let Some(age) = args.get("age_days").and_then(|v| v.as_i64()) {
+        config.age_days = age;
+    }
+    if let Some(imp) = args.get("importance_threshold").and_then(|v| v.as_i64()) {
+        config.importance_threshold = imp as i32;
+    }
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || args
+            .get("preview")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
     match db.run_gc(&config, dry_run) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
@@ -766,7 +1145,7 @@ fn handle_toggle_lint(args: &Value) -> Value {
         Some(b) => b,
         None => return tool_error("enabled boolean is required"),
     };
-    
+
     if let Some(watcher) = crate::WATCHER_STATE.get() {
         if let Ok(mut state) = watcher.lock() {
             state.auto_lint = enabled;
@@ -789,23 +1168,23 @@ fn handle_get_file_context(db: &Database, args: &Value) -> Value {
         Some(w) => w,
         None => return tool_error("working_dir required"),
     };
-    
+
     let mut keywords = Vec::new();
     if let Some(watcher) = crate::WATCHER_STATE.get() {
         if let Ok(state) = watcher.lock() {
             keywords = state.get_boost_keywords();
         }
     }
-    
+
     if keywords.is_empty() {
         return tool_result("No recent file changes detected by watcher.");
     }
-    
+
     let query = keywords.join(" ");
     match db.search(&query, 10, None, None, None, Some(&keywords)) {
         Ok(results) => {
-            let output = json!({ 
-                "recent_file_keywords": keywords, 
+            let output = json!({
+                "recent_file_keywords": keywords,
                 "count": results.len(),
                 "results": results.iter().map(|r| json!({
                     "id": r.memory.id, "content": r.memory.content, "kind": r.memory.kind,
@@ -822,19 +1201,24 @@ fn handle_get_file_context(db: &Database, args: &Value) -> Value {
 
 fn handle_kg_add(db: &Database, args: &Value) -> Value {
     let subject = match args.get("subject").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("subject required"),
+        Some(s) => s,
+        None => return tool_error("subject required"),
     };
     let predicate = match args.get("predicate").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("predicate required"),
+        Some(s) => s,
+        None => return tool_error("predicate required"),
     };
     let object = match args.get("object").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("object required"),
+        Some(s) => s,
+        None => return tool_error("object required"),
     };
     let valid_from = args.get("valid_from").and_then(|v| v.as_str());
     let valid_to = args.get("valid_to").and_then(|v| v.as_str());
     let confidence = args.get("confidence").and_then(|v| v.as_f64());
     let source_id = args.get("source_memory_id").and_then(|v| v.as_str());
-    match db.add_triple(subject, predicate, object, valid_from, valid_to, confidence, source_id) {
+    match db.add_triple(
+        subject, predicate, object, valid_from, valid_to, confidence, source_id,
+    ) {
         Ok(result) => tool_result(&serde_json::to_string_pretty(&result).unwrap()),
         Err(e) => tool_error(&e),
     }
@@ -842,13 +1226,16 @@ fn handle_kg_add(db: &Database, args: &Value) -> Value {
 
 fn handle_kg_invalidate(db: &Database, args: &Value) -> Value {
     let subject = match args.get("subject").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("subject required"),
+        Some(s) => s,
+        None => return tool_error("subject required"),
     };
     let predicate = match args.get("predicate").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("predicate required"),
+        Some(s) => s,
+        None => return tool_error("predicate required"),
     };
     let object = match args.get("object").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("object required"),
+        Some(s) => s,
+        None => return tool_error("object required"),
     };
     let ended = args.get("ended").and_then(|v| v.as_str());
     match db.invalidate_triple(subject, predicate, object, ended) {
@@ -859,10 +1246,14 @@ fn handle_kg_invalidate(db: &Database, args: &Value) -> Value {
 
 fn handle_kg_query(db: &Database, args: &Value) -> Value {
     let entity = match args.get("entity").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("entity required"),
+        Some(s) => s,
+        None => return tool_error("entity required"),
     };
     let as_of = args.get("as_of").and_then(|v| v.as_str());
-    let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("both");
+    let direction = args
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("both");
     match db.query_kg_entity(entity, as_of, direction) {
         Ok(result) => tool_result(&serde_json::to_string_pretty(&result).unwrap()),
         Err(e) => tool_error(&e),
@@ -888,19 +1279,34 @@ fn handle_kg_stats(db: &Database) -> Value {
 
 fn handle_pin(db: &Database, args: &Value, pin: bool) -> Value {
     let id = match args.get("id").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("id required"),
+        Some(s) => s,
+        None => return tool_error("id required"),
     };
     match db.get_memory(id) {
         Ok(Some(mem)) => {
             let mut tags = mem.tags.clone();
             if pin {
-                if !tags.contains(&"pinned".to_string()) { tags.push("pinned".to_string()); }
+                if !tags.contains(&"pinned".to_string()) {
+                    tags.push("pinned".to_string());
+                }
             } else {
                 tags.retain(|t| t != "pinned");
             }
-            let new_imp = if pin { Some(mem.importance.max(4)) } else { None };
+            let new_imp = if pin {
+                Some(mem.importance.max(4))
+            } else {
+                None
+            };
             match db.update_memory_full(id, None, None, Some(&tags), new_imp, None, None) {
-                Ok(_) => tool_result(&format!("Memory {} {}", id, if pin { "pinned (protected from GC, always in recall)" } else { "unpinned" })),
+                Ok(_) => tool_result(&format!(
+                    "Memory {} {}",
+                    id,
+                    if pin {
+                        "pinned (protected from GC, always in recall)"
+                    } else {
+                        "unpinned"
+                    }
+                )),
                 Err(e) => tool_error(&e),
             }
         }
@@ -913,9 +1319,14 @@ fn handle_pin(db: &Database, args: &Value, pin: bool) -> Value {
 
 fn handle_find_related(db: &Database, args: &Value) -> Value {
     let id = match args.get("id").and_then(|v| v.as_str()) {
-        Some(s) => s, None => return tool_error("id required"),
+        Some(s) => s,
+        None => return tool_error("id required"),
     };
-    let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2).min(3) as u32;
+    let depth = args
+        .get("depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2)
+        .min(3) as u32;
     match db.find_related(id, depth) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
@@ -929,7 +1340,10 @@ fn handle_bulk_delete(db: &Database, args: &Value) -> Value {
     let project = args.get("project").and_then(|v| v.as_str());
     let tag = args.get("tag").and_then(|v| v.as_str());
     let older_than_days = args.get("older_than_days").and_then(|v| v.as_i64());
-    let importance_max = args.get("importance_max").and_then(|v| v.as_i64()).map(|v| v as i32);
+    let importance_max = args
+        .get("importance_max")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
 
     if kind.is_none() && project.is_none() && tag.is_none() && older_than_days.is_none() {
         return tool_error("At least one filter required (kind, project, tag, or older_than_days)");
@@ -954,9 +1368,22 @@ fn handle_memory_health(db: &Database) -> Value {
 
 fn handle_dedupe_report(db: &Database, args: &Value) -> Value {
     let project = args.get("project").and_then(|v| v.as_str());
-    let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.7);
+    let threshold = args
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.7);
     match db.dedupe_report(project, threshold) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
     }
+}
+
+fn handle_analyze_corpus(args: &Value) -> Value {
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => return tool_error("content required"),
+    };
+    let source = args.get("source").and_then(|v| v.as_str());
+    let analysis = crate::graph::analyze_corpus(content, source);
+    tool_result(&serde_json::to_string_pretty(&analysis).unwrap())
 }
