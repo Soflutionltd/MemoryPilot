@@ -41,18 +41,18 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 |--------|-----------------|----------------|-------|
 | **R@5** | **98.7%** default / **98.9%** adaptive ONNX / **98.9%** max ONNX | 96.6% raw / 98.4% hybrid held-out | +2.3% vs raw / +0.5% vs hybrid |
 | **R@10** | **99.4%** default / **99.4%** adaptive ONNX / **99.4%** max ONNX | ~97%¹ | +2.4% vs raw |
-| **NDCG@10** | **95.0%** default / **95.4%** adaptive ONNX / **96.2%** max ONNX | Not published | MemoryPilot publishes |
-| **MRR** | **93.6%** default / **94.1%** adaptive ONNX / **95.2%** max ONNX | Not published | MemoryPilot publishes |
+| **NDCG@10** | **95.2%** default / **95.4%** adaptive ONNX / **96.2%** max ONNX | Not published | MemoryPilot publishes |
+| **MRR** | **93.8%** default / **94.1%** adaptive ONNX / **95.2%** max ONNX | Not published | MemoryPilot publishes |
 
-> ¹ MemPalace now publishes 96.6% raw R@5 and 98.4% hybrid held-out R@5 in v3.3.3. MemoryPilot v4.1 validates 98.7% R@5 in the default fast local mode, 98.9% R@5 with adaptive FastEmbed ONNX reranking (`MEMORYPILOT_CROSS_RERANK=adaptive`, top_k=6, ~365ms average search latency), and 98.9% R@5 with always-on ONNX reranking (`MEMORYPILOT_CROSS_RERANK=1`, top_k=6, ~744ms average search latency).
+> ¹ MemPalace now publishes 96.6% raw R@5 and 98.4% hybrid held-out R@5 in v3.3.3. MemoryPilot v4.1 validates 98.7% R@5 in the default fast local mode (~20ms average search latency), 98.9% R@5 with adaptive FastEmbed ONNX reranking (`MEMORYPILOT_CROSS_RERANK=adaptive`, top_k=6, ~365ms average search latency), and 98.9% R@5 with always-on ONNX reranking (`MEMORYPILOT_CROSS_RERANK=1`, top_k=6, ~744ms average search latency).
 
 #### By Category (470 questions)
 
 | Category | R@5 | R@10 | NDCG@10 | MRR |
 |----------|-----|------|---------|-----|
-| single-session-user (64) | **100%** | **100%** | 96.9% | 95.8% |
+| single-session-user (64) | **100%** | **100%** | 97.5% | 96.6% |
 | single-session-assistant (56) | **100%** | **100%** | 97.4% | 96.6% |
-| multi-session (121) | 99.2% | **100%** | 96.1% | 94.8% |
+| multi-session (121) | 99.2% | **100%** | 96.4% | 95.2% |
 | knowledge-update (72) | **100%** | **100%** | 98.7% | 98.3% |
 | temporal-reasoning (127) | 96.9% | 98.4% | 93.8% | 92.2% |
 | single-session-preference (30) | 96.7% | 96.7% | 78.6% | 72.6% |
@@ -67,8 +67,8 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | **Cluster Coherence** | **96.7%** | N/A | N/A |
 | **Multilingual** | **100+ languages** | English only | English only |
 | **AAAK Compression** | **5-10x** (no recall loss) | 30x (recall drops to 84.2%) | N/A |
-| **Avg Search Latency** | **~14 ms** | N/A | ~80 ms |
-| **Binary Size** | **22 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
+| **Avg Search Latency** | **~20 ms** | N/A | ~80 ms |
+| **Binary Size** | **28 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
 | **Dependencies** | 0 (single binary) | Python + ChromaDB + SQLite | Python + ONNX |
 
 ---
@@ -109,7 +109,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
 | Language | Rust (single binary, zero deps) | Python (pip install) | SaaS |
 | Startup | 1-2 ms | ~5 ms | N/A (cloud) |
-| Binary | 22 MB single binary | Python + ChromaDB (~500 MB installed) | SaaS |
+| Binary | 28 MB single binary | Python + ChromaDB (~500 MB installed) | SaaS |
 | Storage | SQLite WAL + FTS5 + connection pool | ChromaDB | Cloud DB |
 | Concurrency | Lazy embedding thread + read pool + debounced cleanup | Single-threaded | Single-threaded |
 
@@ -147,7 +147,7 @@ When searching, MemoryPilot traverses the knowledge graph from the top matches t
 
 Save full conversation transcripts without polluting the LLM context window. The `add_transcript` tool automatically chunks large texts into ~2000 character blocks and links them together. Chunks are excluded from `recall` but fully searchable.
 
-For source code, MemoryPilot uses local tree-sitter parsing by default for Rust, Python, TypeScript, TSX, and JavaScript, with Svelte support via `<script>` extraction plus markup chunking. Code is split on semantic boundaries such as functions, classes, impl blocks, interfaces, and exports instead of arbitrary paragraphs. Build with `--no-default-features` to disable code-aware chunking and keep the smallest possible binary.
+For source code, MemoryPilot uses local tree-sitter parsing by default for Rust, Python, TypeScript, TSX, and JavaScript, with Svelte support via `<script>` extraction plus markup chunking. Code is split on semantic boundaries such as functions, classes, impl blocks, interfaces, and exports instead of arbitrary paragraphs.
 
 Auto-distillation extracts structured memories from transcripts: `decision`, `preference`, `todo`, `bug`, `milestone`, `problem`, and `note`. Smart disambiguation: a segment mentioning both a bug and its resolution is classified as `milestone`, not `bug`.
 
@@ -397,7 +397,7 @@ config             — key/value store
 
 | Metric | Value |
 |--------|-------|
-| Binary size | 27 MB default with code-aware chunking / 22 MB with `--no-default-features` |
+| Binary size | 28 MB |
 | Startup | 1-2 ms |
 | Search (hybrid RRF + reranker) | ~10 ms (500 memories) |
 | `add_memory` latency | <1 ms (lazy embed) |
@@ -411,13 +411,19 @@ config             — key/value store
 
 - **Lazy embedding**: `add_memory` inserts with `NULL` embedding, background thread computes and updates asynchronously
 - **Content hashing** (FNV-1a): `--backfill-force` skips memories whose content hasn't changed
-- **LRU embedding cache** (64 entries): repeated search queries reuse cached embeddings
+- **Two-tier embedding cache**: 256-entry in-process LRU on top of a write-through SQLite query cache (`*.query_cache.sqlite`, soft-capped at 8 192 entries with LRU eviction) so repeated queries are instant within a session and across restarts
 - **Read connection pool** (4 connections): concurrent vector searches don't block writes
 - **WAL mode**: SQLite Write-Ahead Logging for concurrent read/write
 - **Batched scoring**: knowledge triple counts and link boosts fetched in single queries, not N+1
 - **Debounced cleanup**: expired memory cleanup runs max once per 60 seconds
 - **Prepared statements**: graph traversal prepares SQL once, not per node
 - **Tuned RRF fusion**: k=40 for sharper top-K discrimination vs standard k=60
+- **FTS5 precision fallbacks**: prefix, exact phrase, and NEAR proximity queries run together for code symbols, errors, and named concepts
+- **Weighted FTS fields**: content, tags, kind, and project use separate BM25 weights to make structured metadata count
+- **ACT-R-style activation**: frequently reused and recently accessed memories get a small cognitive activation boost before final reranking
+- **int8 quantized embeddings**: stored vectors are 4× smaller (388 bytes vs 1536 bytes) with negligible recall loss; fast SIMD-friendly dot product directly on the blob avoids per-search allocations
+- **Local HNSW ANN index** (`usearch`): persistent on-disk approximate nearest neighbor index that warms asynchronously from SQLite in a detached thread (non-blocking startup), updates incrementally on backfill, on the async embed worker, and on delete. Surfaces `vector_ann` candidates so large memory bases stay fast as they grow past tens of thousands of entries.
+- **ANN scan bypass**: when the index reaches 5,000+ entries, the SQL vector scan is restricted to the union of ANN top-K and BM25 hits — turning an O(N) blob load into an O(K) lookup without changing the ranking logic.
 - **Code-aware chunking**: tree-sitter splits Rust/Python/TypeScript/TSX/JavaScript on semantic units, with Svelte `<script>` extraction
 - **Exact term coverage boost**: +10% when 80%+ of query terms appear in memory content
 - **Combinatorial reranker**: greedy subgraph selection, conservative +5% per connection (cap 15%)
