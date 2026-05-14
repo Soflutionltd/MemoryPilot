@@ -1009,6 +1009,7 @@ fn handle_search(db: &Database, args: &Value) -> Value {
                 "results": results.iter().map(|r| json!({
                     "id": r.memory.id, "content": r.memory.content, "kind": r.memory.kind,
                     "project": r.memory.project, "tags": r.memory.tags, "score": r.score, "importance": r.memory.importance,
+                    "sources": r.sources,
                 })).collect::<Vec<_>>()
             });
             tool_result(&serde_json::to_string_pretty(&output).unwrap())

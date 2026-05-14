@@ -431,6 +431,7 @@ mod tests {
                 access_count: 0,
             },
             score,
+            sources: Vec::new(),
         }
     }
 }

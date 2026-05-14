@@ -9,7 +9,6 @@ enum CodeLanguage {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "code-aware-chunking")]
 struct CodeUnit {
     start_byte: usize,
     end_byte: usize,
@@ -23,16 +22,7 @@ pub fn split_code_chunks(content: &str, target_chars: usize) -> Option<Vec<Strin
         return split_svelte_chunks(content, target_chars);
     }
 
-    #[cfg(feature = "code-aware-chunking")]
-    {
-        split_with_tree_sitter(content, target_chars.max(512), language)
-    }
-
-    #[cfg(not(feature = "code-aware-chunking"))]
-    {
-        let _ = (content, target_chars);
-        None
-    }
+    split_with_tree_sitter(content, target_chars.max(512), language)
 }
 
 fn detect_language(content: &str) -> Option<CodeLanguage> {
@@ -103,7 +93,6 @@ fn score_prefixes(sample: &str, prefixes: &[&str]) -> usize {
         .count()
 }
 
-#[cfg(feature = "code-aware-chunking")]
 fn split_with_tree_sitter(
     content: &str,
     target_chars: usize,
@@ -151,7 +140,6 @@ fn split_with_tree_sitter(
     }
 }
 
-#[cfg(feature = "code-aware-chunking")]
 fn tree_sitter_language(language: CodeLanguage) -> tree_sitter::Language {
     match language {
         CodeLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
@@ -163,7 +151,6 @@ fn tree_sitter_language(language: CodeLanguage) -> tree_sitter::Language {
     }
 }
 
-#[cfg(feature = "code-aware-chunking")]
 fn collect_code_units(
     node: tree_sitter::Node,
     content_len: usize,
@@ -188,7 +175,6 @@ fn collect_code_units(
     }
 }
 
-#[cfg(feature = "code-aware-chunking")]
 fn is_boundary_node(kind: &str, language: CodeLanguage) -> bool {
     match language {
         CodeLanguage::Rust => matches!(
@@ -227,7 +213,6 @@ fn is_boundary_node(kind: &str, language: CodeLanguage) -> bool {
     }
 }
 
-#[cfg(feature = "code-aware-chunking")]
 fn merge_small_units(units: Vec<CodeUnit>, target_chars: usize) -> Vec<CodeUnit> {
     let mut merged = Vec::new();
     let mut current: Option<CodeUnit> = None;
@@ -257,7 +242,6 @@ fn merge_small_units(units: Vec<CodeUnit>, target_chars: usize) -> Vec<CodeUnit>
     merged
 }
 
-#[cfg(feature = "code-aware-chunking")]
 fn line_start_offsets(content: &str) -> Vec<usize> {
     let mut starts = vec![0usize];
     for (index, character) in content.char_indices() {

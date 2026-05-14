@@ -474,7 +474,11 @@ impl Database {
         let _ = rc.execute_batch("PRAGMA cache_size = -2000;");
         read_pool.push(Mutex::new(rc));
 
-        let db = Self { conn, read_pool };
+        let db = Self {
+            conn,
+            read_pool,
+            ann: None,
+        };
         db.init_schema()?;
         Ok(db)
     }
@@ -503,7 +507,11 @@ impl Database {
         let _ = rc.execute_batch("PRAGMA cache_size = -2000;");
         read_pool.push(Mutex::new(rc));
 
-        let db = Self { conn, read_pool };
+        let db = Self {
+            conn,
+            read_pool,
+            ann: None,
+        };
         db.init_schema()?;
         Ok(db)
     }

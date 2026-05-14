@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// MemoryPilot v4.0 Database Engine — SQLite + FTS5.
 /// Features: dedup, importance, TTL, bulk ops, export, auto-prompt, lazy embedding, content hash.
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
 #[path = "db/benchmark.rs"]
@@ -22,7 +22,9 @@ mod schema;
 #[path = "db/transcript.rs"]
 mod transcript;
 
-use embed_worker::{cached_embed_text, queue_embedding_job, set_embed_db_path};
+use embed_worker::{
+    cached_embed_text, queue_embedding_job, set_embed_ann_index, set_embed_db_path,
+};
 
 const DB_DIR: &str = ".MemoryPilot";
 const DB_FILE: &str = "memory.db";
@@ -71,6 +73,8 @@ pub struct Memory {
 pub struct SearchResult {
     pub memory: Memory,
     pub score: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +141,7 @@ const READ_POOL_SIZE: usize = 4;
 pub struct Database {
     conn: Connection,
     read_pool: Vec<Mutex<Connection>>,
+    ann: Option<Arc<crate::ann::AnnIndex>>,
 }
 
 impl Database {
@@ -155,12 +160,129 @@ impl Database {
 
         let read_pool = schema::open_read_pool(path, READ_POOL_SIZE)?;
 
-        let db = Self { conn, read_pool };
+        let ann = Self::open_ann_index(path);
+        set_embed_ann_index(ann.clone());
+
+        let db = Self {
+            conn,
+            read_pool,
+            ann: ann.clone(),
+        };
         db.init_schema()?;
         db.upgrade_schema()?;
         db.normalize_project_identities()?;
         let _ = db.backfill_embeddings();
+        Self::spawn_ann_warmup(ann, path.to_path_buf());
         Ok(db)
+    }
+
+    /// Hydrate the ANN index in a detached worker so `open_at` does not pay the
+    /// upfront I/O cost. Until warm-up finishes, searches transparently fall
+    /// back to the deterministic SQL scan path.
+    fn spawn_ann_warmup(ann: Option<Arc<crate::ann::AnnIndex>>, db_path: PathBuf) {
+        let Some(index) = ann else {
+            return;
+        };
+        if !index.is_empty() {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("memorypilot-ann-warmup".into())
+            .spawn(move || {
+                let conn = match Connection::open(&db_path) {
+                    Ok(conn) => conn,
+                    Err(_) => return,
+                };
+                let _ = conn
+                    .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+                let mut stmt = match conn
+                    .prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")
+                {
+                    Ok(stmt) => stmt,
+                    Err(_) => return,
+                };
+                let rows = match stmt.query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    Ok((id, blob))
+                }) {
+                    Ok(rows) => rows,
+                    Err(_) => return,
+                };
+                let mut added = 0usize;
+                for row in rows.flatten() {
+                    let (id, blob) = row;
+                    let vector = crate::embedding::blob_to_vec(&blob);
+                    if vector.is_empty() {
+                        continue;
+                    }
+                    if index.add(&id, &vector).is_ok() {
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    let _ = index.persist();
+                }
+            })
+            .ok();
+    }
+
+    fn open_ann_index(path: &Path) -> Option<Arc<crate::ann::AnnIndex>> {
+        let mut ann_path = path.to_path_buf();
+        let file_name = ann_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{}.ann.usearch", name))
+            .unwrap_or_else(|| "memorypilot.ann.usearch".to_string());
+        ann_path.set_file_name(file_name);
+        match crate::ann::AnnIndex::open(Some(ann_path)) {
+            Ok(index) => Some(Arc::new(index)),
+            Err(error) => {
+                eprintln!("[MemoryPilot] ANN index disabled: {}", error);
+                None
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn warm_ann_index(&self) -> Result<(), String> {
+        let Some(ann) = self.ann.clone() else {
+            return Ok(());
+        };
+        if !ann.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")
+            .map_err(|error| format!("ANN warm prepare: {}", error))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((id, blob))
+            })
+            .map_err(|error| format!("ANN warm query: {}", error))?;
+        let mut added = 0usize;
+        for row in rows.flatten() {
+            let (id, blob) = row;
+            let vector = crate::embedding::blob_to_vec(&blob);
+            if vector.is_empty() {
+                continue;
+            }
+            if ann.add(&id, &vector).is_ok() {
+                added += 1;
+            }
+        }
+        if added > 0 {
+            let _ = ann.persist();
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn ann_index(&self) -> Option<Arc<crate::ann::AnnIndex>> {
+        self.ann.clone()
     }
 
     fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1846,6 +1968,9 @@ impl Database {
             .conn
             .execute("DELETE FROM memories WHERE id=?1", params![id])
             .map_err(|e| format!("Delete: {}", e))?;
+        if let Some(ann) = self.ann.as_ref() {
+            let _ = ann.remove(id);
+        }
         Ok(affected > 0)
     }
 
@@ -2078,6 +2203,23 @@ impl Database {
         factor.min(1.35)
     }
 
+    fn cognitive_activation_factor(memory: &Memory, now_ts: f64) -> f64 {
+        let frequency = ((memory.access_count.max(0) as f64 + 1.0).ln() / 21.0_f64.ln()).min(1.0);
+        let last_touch = memory
+            .last_accessed_at
+            .as_deref()
+            .unwrap_or(memory.updated_at.as_str());
+        let recency = chrono::DateTime::parse_from_rfc3339(last_touch)
+            .ok()
+            .map(|timestamp| {
+                let age_days = ((now_ts - timestamp.timestamp() as f64) / 86400.0).max(0.0);
+                (1.0 / (1.0 + age_days / 14.0)).min(1.0)
+            })
+            .unwrap_or(0.0);
+
+        1.0 + ((frequency * 0.07) + (recency * 0.05)).min(0.12)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -2089,9 +2231,10 @@ impl Database {
     ) -> Result<Vec<SearchResult>, String> {
         let canonical_project = Self::canonical_project(project);
 
-        let Some(fts_terms) = crate::fts::sanitize_fts5_query(query) else {
+        let fts_variants = crate::fts::fts5_query_variants(query);
+        if fts_variants.is_empty() {
             return Ok(Vec::new());
-        };
+        }
 
         let _ = self.cleanup_expired();
 
@@ -2100,55 +2243,107 @@ impl Database {
         // Pre-compute KG expansion terms for post-retrieval scoring boost
         let kg_expansion = self.get_kg_expansion_terms(query);
 
-        // 1. BM25 Search
-        let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(fts_terms.clone())];
-
-        if let Some(p) = canonical_project.as_deref() {
-            conditions.push(format!("m.project = ?{}", param_values.len() + 1));
-            param_values.push(Box::new(p.to_string()));
-        }
-        if let Some(k) = kind {
-            conditions.push(format!("m.kind = ?{}", param_values.len() + 1));
-            param_values.push(Box::new(k.to_string()));
-        }
-
-        let where_clause = conditions.join(" AND ");
-        let sql = format!(
-            "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,m.last_accessed_at,m.access_count,
-                    bm25(memories_fts, 10.0, 3.0, 1.0, 2.0) AS bm25_score
-             FROM memories_fts f
-             JOIN memories m ON m.rowid = f.rowid
-             WHERE {}
-             ORDER BY bm25_score ASC
-             LIMIT 150", where_clause);
-
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| format!("Search prepare: {}", e))?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
         let mut bm25_results = std::collections::HashMap::new();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+        let mut all_memories = std::collections::HashMap::new();
+        let mut candidate_sources: std::collections::HashMap<
+            String,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
+
+        // 1. FTS5 search. Run the normal prefix query plus exact phrase/proximity variants.
+        for (variant_index, (fts_query, source)) in fts_variants.iter().enumerate() {
+            let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(fts_query.clone())];
+
+            if let Some(p) = canonical_project.as_deref() {
+                conditions.push(format!("m.project = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(p.to_string()));
+            }
+            if let Some(k) = kind {
+                conditions.push(format!("m.kind = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(k.to_string()));
+            }
+
+            let where_clause = conditions.join(" AND ");
+            let limit_rows = if variant_index == 0 { 150 } else { 75 };
+            let sql = format!(
+                "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,m.last_accessed_at,m.access_count,
+                        bm25(memories_fts, 8.0, 5.0, 2.0, 4.0) AS bm25_score
+                 FROM memories_fts f
+                 JOIN memories m ON m.rowid = f.rowid
+                 WHERE {}
+                 ORDER BY bm25_score ASC
+                 LIMIT {}", where_clause, limit_rows);
+
+            let mut stmt = match self.conn.prepare(&sql) {
+                Ok(stmt) => stmt,
+                Err(error) if variant_index == 0 => {
+                    return Err(format!("Search prepare: {}", error));
+                }
+                Err(_) => continue,
+            };
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(|p| p.as_ref()).collect();
+            let rows = match stmt.query_map(param_refs.as_slice(), |row| {
                 let mem = row_to_memory(row);
                 let bm25: f64 = row.get(13)?;
                 Ok((mem, bm25))
-            })
-            .map_err(|e| format!("Search: {}", e))?;
+            }) {
+                Ok(rows) => rows,
+                Err(error) if variant_index == 0 => return Err(format!("Search: {}", error)),
+                Err(_) => continue,
+            };
 
-        let mut rank = 1;
-        let mut all_memories = std::collections::HashMap::new();
-        for r in rows.flatten() {
-            let (mem, _) = r;
-            bm25_results.insert(mem.id.clone(), rank);
-            all_memories.insert(mem.id.clone(), mem);
-            rank += 1;
+            for (rank_index, row) in rows.flatten().enumerate() {
+                let (mem, _) = row;
+                let rank = rank_index + 1;
+                let entry = bm25_results.entry(mem.id.clone()).or_insert(rank);
+                *entry = (*entry).min(rank);
+                candidate_sources
+                    .entry(mem.id.clone())
+                    .or_default()
+                    .insert((*source).to_string());
+                all_memories.entry(mem.id.clone()).or_insert(mem);
+            }
         }
 
-        // 2. Vector Search (read pool connection, scoped)
+        // 2a. Optional ANN pre-filter. Marks candidates with `vector_ann` so the
+        // explain output exposes which retrieval stage surfaced them. The full
+        // scan below stays authoritative for ranking — ANN only annotates here.
+        let ann_hits: Vec<(String, f32)> = self
+            .ann
+            .as_ref()
+            .map(|index| index.search(&query_emb, 200))
+            .unwrap_or_default();
+        for (id, _) in &ann_hits {
+            candidate_sources
+                .entry(id.clone())
+                .or_default()
+                .insert("vector_ann".to_string());
+        }
+
+        // 2b. Vector Search (read pool connection, scoped). When the ANN index is
+        // populated past `ANN_BYPASS_THRESHOLD`, restrict the SQL scan to the union
+        // of ANN top-K and BM25 hits — avoids loading every embedding blob just to
+        // score it. Below the threshold the full scan is kept (provably no recall
+        // regression).
+        const ANN_BYPASS_THRESHOLD: usize = 5_000;
+        let ann_active_for_bypass = self
+            .ann
+            .as_ref()
+            .map(|index| index.len() >= ANN_BYPASS_THRESHOLD && !ann_hits.is_empty())
+            .unwrap_or(false);
+        let restricted_ids: Option<Vec<String>> = if ann_active_for_bypass {
+            let mut ids: std::collections::HashSet<String> = bm25_results.keys().cloned().collect();
+            for (id, _) in &ann_hits {
+                ids.insert(id.clone());
+            }
+            Some(ids.into_iter().collect())
+        } else {
+            None
+        };
+
         let vector_results = {
             let mut vec_conditions = Vec::new();
             let mut vec_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2159,6 +2354,16 @@ impl Database {
             if let Some(k) = kind {
                 vec_conditions.push(format!("kind = ?{}", vec_params.len() + 1));
                 vec_params.push(Box::new(k.to_string()));
+            }
+            if let Some(ids) = restricted_ids.as_ref() {
+                let placeholders = (1..=ids.len())
+                    .map(|i| format!("?{}", vec_params.len() + i))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec_conditions.push(format!("id IN ({})", placeholders));
+                for id in ids {
+                    vec_params.push(Box::new(id.clone()));
+                }
             }
             let vec_where = if vec_conditions.is_empty() {
                 String::new()
@@ -2188,10 +2393,17 @@ impl Database {
                     .entry(mem.id.clone())
                     .or_insert_with(|| mem.clone());
                 if let Some(b) = blob {
-                    let emb = crate::embedding::blob_to_vec(&b);
-                    let score = crate::embedding::cosine_similarity(&query_emb, &emb);
+                    candidate_sources
+                        .entry(mem.id.clone())
+                        .or_default()
+                        .insert("vector".to_string());
+                    let score = crate::embedding::similarity_with_blob(&query_emb, &b);
                     vector_scores.push((mem.id, score));
                 } else {
+                    candidate_sources
+                        .entry(mem.id.clone())
+                        .or_default()
+                        .insert("vector_pending".to_string());
                     vector_scores.push((mem.id, 0.0));
                 }
             }
@@ -2243,6 +2455,7 @@ impl Database {
             }
 
             score *= Self::query_intent_factor(&query_intent, mem);
+            score *= Self::cognitive_activation_factor(mem, now_ts);
 
             // Importance tiebreaker: subtle nudge, never overrides relevance
             // imp 5 → 1.06x, imp 4 → 1.03x, imp 3 → 1.0x, imp 2 → 0.98x, imp 1 → 0.96x
@@ -2335,9 +2548,15 @@ impl Database {
         };
         for (id, score) in rrf_scores.into_iter().take(session_candidate_limit) {
             if let Some(mem) = all_memories.remove(&id) {
+                let mut sources = candidate_sources
+                    .remove(&id)
+                    .map(|items| items.into_iter().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                sources.sort();
                 results.push(SearchResult {
                     memory: mem,
                     score: (score * 10000.0).round() / 10000.0,
+                    sources,
                 });
             }
         }
@@ -2357,6 +2576,7 @@ impl Database {
                             memory: mem,
                             // Give it a slightly lower score than the original match that pulled it
                             score: 0.1,
+                            sources: vec!["graph".to_string()],
                         });
                     }
                 }
@@ -2427,6 +2647,7 @@ impl Database {
                                 access_count: 0,
                             },
                             score: 0.0,
+                            sources: Vec::new(),
                         },
                     )
                 })
@@ -3539,7 +3760,15 @@ impl Database {
                 "UPDATE memories SET embedding = ?1, content_hash = ?2 WHERE id = ?3",
                 params![blob, &hash, id],
             );
+            if let Some(ann) = self.ann.as_ref() {
+                let _ = ann.add(id, emb);
+            }
             count += 1;
+        }
+        if count > 0 {
+            if let Some(ann) = self.ann.as_ref() {
+                let _ = ann.persist();
+            }
         }
         Ok(count)
     }
@@ -4073,14 +4302,21 @@ impl Database {
 
         if explain {
             for result in &hint_results {
-                selected_memories_for_explain.push(self.recall_explanation(
+                let mut explanation = self.recall_explanation(
                     &result.memory,
                     "hint",
                     proj_ref,
                     mode,
                     Some(result.score),
                     &link_boosts,
-                ));
+                );
+                if let Some(object) = explanation.as_object_mut() {
+                    object.insert(
+                        "retrieval_sources".into(),
+                        serde_json::json!(result.sources),
+                    );
+                }
+                selected_memories_for_explain.push(explanation);
             }
             for memory in &scope_memories {
                 selected_memories_for_explain.push(self.recall_explanation(
@@ -5158,6 +5394,46 @@ USER: There is a bug in src/tools.rs where duplicate MCP servers would confuse s
                 memory.content.contains("only MCP server")
                     || memory.content.contains("duplicate MCP servers")
             }));
+        }
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn search_reports_lexical_candidate_sources() {
+        let path = temp_db_path("search-sources");
+        {
+            let db = Database::open_at(&path).expect("db");
+            let tags = vec!["SettingsPanel".to_string(), "render".to_string()];
+            let _ = db
+                .add_memory(
+                    "SettingsPanel render bug happens in src/routes/settings.ts when the modal opens.",
+                    "bug",
+                    Some("MemoryPilot"),
+                    &tags,
+                    "test",
+                    4,
+                    None,
+                    None,
+                    &MemoryScope::default(),
+                )
+                .expect("add memory");
+
+            let results = db
+                .search(
+                    "SettingsPanel render bug",
+                    5,
+                    Some("memorypilot"),
+                    Some("bug"),
+                    None,
+                    None,
+                )
+                .expect("search");
+
+            assert!(!results.is_empty());
+            assert!(results[0]
+                .sources
+                .iter()
+                .any(|source| source.starts_with("fts_")));
         }
         cleanup_db_files(&path);
     }
