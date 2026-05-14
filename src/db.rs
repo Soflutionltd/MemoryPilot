@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 #[path = "db/benchmark.rs"]
 mod benchmark;
+#[path = "db/benchmark_fr.rs"]
+mod benchmark_fr;
 #[path = "db/benchmark_longmemeval.rs"]
 mod benchmark_longmemeval;
 #[path = "db/compaction.rs"]

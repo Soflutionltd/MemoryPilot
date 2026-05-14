@@ -70,6 +70,10 @@ fn main() {
         run_benchmark_longmemeval(&args);
         return;
     }
+    if args.iter().any(|a| a == "--benchmark-fr") {
+        run_benchmark_fr(&args);
+        return;
+    }
     if args.iter().any(|a| a == "--benchmark-latency") {
         run_benchmark_latency(&args);
         return;
@@ -339,6 +343,50 @@ fn parse_percent(value: &str) -> Option<f64> {
     value.trim().trim_end_matches('%').parse::<f64>().ok()
 }
 
+fn run_benchmark_fr(args: &[String]) {
+    eprintln!("[BenchFR] Starting French retrieval benchmark...");
+    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
+    let min_r5 = args
+        .windows(2)
+        .find(|w| w[0] == "--min-r5")
+        .and_then(|w| parse_percent(&w[1]));
+    match db::Database::benchmark_fr() {
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+            );
+            if let Some(minimum) = min_r5 {
+                let actual = report
+                    .get("metrics")
+                    .and_then(|metrics| metrics.get("recall_at_5"))
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_percent);
+                match actual {
+                    Some(value) if value + f64::EPSILON >= minimum => {
+                        eprintln!("[BenchFR] Guard passed: R@5 {:.1}% >= {:.1}%", value, minimum);
+                    }
+                    Some(value) => {
+                        eprintln!(
+                            "✗ BenchFR guard failed: R@5 {:.1}% < {:.1}%",
+                            value, minimum
+                        );
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!("✗ BenchFR guard failed: missing R@5 metric");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("✗ BenchFR failed: {}", error);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_benchmark_latency(args: &[String]) {
     use std::time::Instant;
 
@@ -559,6 +607,7 @@ fn print_help() {
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");
+    println!("  MemoryPilot --benchmark-fr [--min-r5 PCT]  French retrieval benchmark (30 in-memory scenarios)");
     println!("  MemoryPilot --benchmark-latency [--queries N] [--seed-memories N] [--db PATH]  Cold/warm search latency");
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot --help           Show this help");
