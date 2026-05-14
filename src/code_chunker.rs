@@ -6,6 +6,10 @@ enum CodeLanguage {
     Tsx,
     JavaScript,
     Svelte,
+    Go,
+    Java,
+    Kotlin,
+    Swift,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +45,109 @@ fn detect_language(content: &str) -> Option<CodeLanguage> {
     );
     if rust_score >= 2 || (sample.contains("->") && sample.contains("::")) {
         return Some(CodeLanguage::Rust);
+    }
+
+    // Kotlin must be checked before Python because both have "class" and
+    // "import", and before Java because both share "package" / "class".
+    let kotlin_score = score_prefixes(
+        &sample,
+        &[
+            "fun ",
+            "object ",
+            "data class ",
+            "sealed class ",
+            "@Composable",
+            "suspend fun ",
+            "companion object",
+        ],
+    );
+    if kotlin_score >= 2
+        || (sample.contains("fun ")
+            && (sample.contains("val ") || sample.contains("var "))
+            && (sample.contains("data class ")
+                || sample.contains("suspend fun")
+                || sample.contains("@Composable")
+                || sample.contains("override fun")))
+    {
+        return Some(CodeLanguage::Kotlin);
+    }
+
+    // Swift before Python (shares "class") and before Java (shares "class").
+    let swift_score = score_prefixes(
+        &sample,
+        &[
+            "import Foundation",
+            "import SwiftUI",
+            "import UIKit",
+            "import Combine",
+            "func ",
+            "@State",
+            "@Binding",
+            "@MainActor",
+            "@objc",
+        ],
+    );
+    if swift_score >= 2
+        && (sample.contains("func ")
+            || sample.contains("@State")
+            || sample.contains("@Binding"))
+        && (sample.contains("import SwiftUI")
+            || sample.contains("import Foundation")
+            || sample.contains("import UIKit")
+            || sample.contains("import Combine")
+            || sample.contains("@State")
+            || sample.contains("@Binding")
+            || sample.contains("@MainActor"))
+    {
+        return Some(CodeLanguage::Swift);
+    }
+
+    // Go before Python: "package" and "func " uniquely identify Go.
+    let go_score = score_prefixes(
+        &sample,
+        &[
+            "package ",
+            "func ",
+            "import (",
+            "type ",
+            "var ",
+            "const ",
+        ],
+    );
+    if (sample.contains("package main") || sample.contains("package "))
+        && go_score >= 2
+        && (sample.contains("func ") || sample.contains("import ("))
+    {
+        return Some(CodeLanguage::Go);
+    }
+
+    // Java before Python (shares "class" and "import").
+    let java_score = score_prefixes(
+        &sample,
+        &[
+            "package ",
+            "import ",
+            "public class ",
+            "public interface ",
+            "public enum ",
+            "private ",
+            "protected ",
+            "@Override",
+            "@Service",
+            "@Component",
+        ],
+    );
+    if java_score >= 2
+        && (sample.contains("public ") || sample.contains("private ") || sample.contains("class "))
+        && (sample.contains("public static")
+            || sample.contains("@Override")
+            || sample.contains("System.out")
+            || sample.contains("extends ")
+            || sample.contains("implements ")
+            || sample.contains("public class")
+            || sample.contains("public interface"))
+    {
+        return Some(CodeLanguage::Java);
     }
 
     let python_score = score_prefixes(
@@ -147,6 +254,10 @@ fn tree_sitter_language(language: CodeLanguage) -> tree_sitter::Language {
         CodeLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         CodeLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         CodeLanguage::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        CodeLanguage::Go => tree_sitter_go::LANGUAGE.into(),
+        CodeLanguage::Java => tree_sitter_java::LANGUAGE.into(),
+        CodeLanguage::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        CodeLanguage::Swift => tree_sitter_swift::LANGUAGE.into(),
         CodeLanguage::Svelte => unreachable!("svelte is handled before tree-sitter parsing"),
     }
 }
@@ -208,6 +319,43 @@ fn is_boundary_node(kind: &str, language: CodeLanguage) -> bool {
                 | "class_declaration"
                 | "lexical_declaration"
                 | "export_statement"
+        ),
+        CodeLanguage::Go => matches!(
+            kind,
+            "function_declaration"
+                | "method_declaration"
+                | "type_declaration"
+                | "var_declaration"
+                | "const_declaration"
+        ),
+        CodeLanguage::Java => matches!(
+            kind,
+            "method_declaration"
+                | "constructor_declaration"
+                | "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "annotation_type_declaration"
+        ),
+        CodeLanguage::Kotlin => matches!(
+            kind,
+            "function_declaration"
+                | "class_declaration"
+                | "object_declaration"
+                | "property_declaration"
+                | "secondary_constructor"
+                | "anonymous_initializer"
+        ),
+        CodeLanguage::Swift => matches!(
+            kind,
+            "function_declaration"
+                | "class_declaration"
+                | "protocol_declaration"
+                | "init_declaration"
+                | "deinit_declaration"
+                | "subscript_declaration"
+                | "property_declaration"
+                | "extension_declaration"
         ),
         CodeLanguage::Svelte => false,
     }
@@ -375,6 +523,120 @@ export function createSession(user: User): Session {
             .iter()
             .any(|chunk| chunk.contains("export interface Session")));
         assert!(chunks.iter().any(|chunk| chunk.contains("createSession")));
+    }
+
+    #[test]
+    fn chunks_go_on_function_boundaries() {
+        let source = r#"
+package main
+
+import "fmt"
+
+type User struct {
+    Name string
+}
+
+func (u *User) Greet() string {
+    return fmt.Sprintf("hello %s", u.Name)
+}
+
+func NewUser(name string) *User {
+    return &User{Name: name}
+}
+"#;
+        let chunks = split_code_chunks(source, 200).expect("go chunks");
+        assert!(chunks.iter().any(|chunk| chunk.contains("type User struct")));
+        assert!(chunks.iter().any(|chunk| chunk.contains("func NewUser")));
+    }
+
+    #[test]
+    fn chunks_java_on_class_boundaries() {
+        let source = r#"
+package com.example.bench;
+
+import java.util.List;
+
+public class UserService {
+    public User findById(String id) {
+        return new User(id, "anon");
+    }
+
+    @Override
+    public String toString() {
+        return "UserService";
+    }
+}
+
+public interface UserRepository {
+    User load(String id);
+}
+"#;
+        let chunks = split_code_chunks(source, 220).expect("java chunks");
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.contains("public class UserService")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.contains("public interface UserRepository")));
+    }
+
+    #[test]
+    fn chunks_kotlin_on_function_boundaries() {
+        let source = r#"
+package com.example.bench
+
+import kotlinx.coroutines.flow.Flow
+
+data class User(val id: String, val name: String)
+
+class UserRepository {
+    suspend fun loadUser(id: String): User {
+        return User(id, "anon")
+    }
+
+    @Composable
+    fun renderHeader(name: String) {
+        println("hello $name")
+    }
+}
+"#;
+        let chunks = split_code_chunks(source, 220).expect("kotlin chunks");
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.contains("class UserRepository")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.contains("data class User")));
+    }
+
+    #[test]
+    fn chunks_swift_on_function_boundaries() {
+        let source = r#"
+import Foundation
+import SwiftUI
+
+struct User: Identifiable {
+    let id: String
+    var name: String
+}
+
+class UserStore {
+    @State private var users: [User] = []
+
+    func loadUser(id: String) -> User {
+        return User(id: id, name: "anon")
+    }
+}
+
+extension UserStore {
+    func count() -> Int {
+        return users.count
+    }
+}
+"#;
+        let chunks = split_code_chunks(source, 220).expect("swift chunks");
+        assert!(chunks.iter().any(|chunk| chunk.contains("struct User")));
+        assert!(chunks.iter().any(|chunk| chunk.contains("class UserStore")));
     }
 
     #[test]
