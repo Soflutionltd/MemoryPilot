@@ -2238,14 +2238,36 @@ impl Database {
     ) -> Result<Vec<SearchResult>, String> {
         let canonical_project = Self::canonical_project(project);
 
+        let telemetry_enabled = crate::telemetry::is_enabled();
+        let search_start = std::time::Instant::now();
+        let mut trace = if telemetry_enabled {
+            let mut t = crate::telemetry::RetrievalTrace::default();
+            t.query_truncated = crate::telemetry::truncate_query(query);
+            t.query_chars = query.chars().count();
+            t.project = canonical_project.clone();
+            t.kind = kind.map(|k| k.to_string());
+            t.tags_count = tags.map(|t| t.len()).unwrap_or(0);
+            t.limit = limit;
+            Some(t)
+        } else {
+            None
+        };
+
         let fts_variants = crate::fts::fts5_query_variants(query);
         if fts_variants.is_empty() {
             return Ok(Vec::new());
         }
+        if let Some(t) = trace.as_mut() {
+            t.fts_variants = fts_variants.len();
+        }
 
         let _ = self.cleanup_expired();
 
+        let embed_start = std::time::Instant::now();
         let query_emb = cached_embed_text(query);
+        if let Some(t) = trace.as_mut() {
+            t.timing_ms_embed_query = embed_start.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // Pre-compute KG expansion terms for post-retrieval scoring boost
         let kg_expansion = self.get_kg_expansion_terms(query);
@@ -2257,6 +2279,7 @@ impl Database {
             std::collections::HashSet<String>,
         > = std::collections::HashMap::new();
 
+        let bm25_start = std::time::Instant::now();
         // 1. FTS5 search. Run the normal prefix query plus exact phrase/proximity variants.
         for (variant_index, (fts_query, source)) in fts_variants.iter().enumerate() {
             let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
@@ -2351,6 +2374,12 @@ impl Database {
             None
         };
 
+        if let Some(t) = trace.as_mut() {
+            t.timing_ms_bm25 = bm25_start.elapsed().as_secs_f64() * 1000.0;
+            t.candidates_bm25 = bm25_results.len();
+        }
+
+        let vector_start = std::time::Instant::now();
         let vector_results = {
             let mut vec_conditions = Vec::new();
             let mut vec_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2423,6 +2452,18 @@ impl Database {
             }
             vr
         };
+
+        if let Some(t) = trace.as_mut() {
+            t.timing_ms_vector = vector_start.elapsed().as_secs_f64() * 1000.0;
+            t.candidates_vector = vector_results.len();
+            t.candidates_total_unique = all_memories.len();
+            t.candidates_ann = candidate_sources
+                .values()
+                .filter(|set| set.iter().any(|src| src == "ann"))
+                .count();
+            t.kg_expansion_terms = kg_expansion.len();
+        }
+        let fusion_start = std::time::Instant::now();
 
         // 3. RRF Fusion
         let mut rrf_scores: Vec<(String, f64)> = Vec::new();
@@ -2675,10 +2716,40 @@ impl Database {
         crate::reranking::rerank_cross_encoder_if_enabled(query, &mut results);
         results = crate::session_fusion::fuse_sessions(query, results, limit);
 
-        // Update access count and timestamp for returned results
-        for res in &results {
-            let _ = self.conn.execute("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2", 
-                params![chrono::Utc::now().to_rfc3339(), res.memory.id]);
+        if let Some(mut t) = trace.take() {
+            t.timing_ms_fusion = fusion_start.elapsed().as_secs_f64() * 1000.0;
+            t.timing_ms_total = search_start.elapsed().as_secs_f64() * 1000.0;
+            t.results_returned = results.len();
+            if let Some(top) = results.first() {
+                t.top_score = top.score;
+                t.top_sources = top.sources.clone();
+            }
+            crate::telemetry::emit(&t);
+        }
+
+        // Update access count and timestamp for returned results in a
+        // single batched UPDATE so that we do not pay N writer-lock
+        // round trips per search (the previous loop was the dominant
+        // contention point under concurrent load).
+        if !results.is_empty() {
+            let placeholders: Vec<String> = (1..=results.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect();
+            let sql = format!(
+                "UPDATE memories \
+                 SET access_count = access_count + 1, last_accessed_at = ?1 \
+                 WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+                Vec::with_capacity(results.len() + 1);
+            params_vec.push(Box::new(chrono::Utc::now().to_rfc3339()));
+            for res in &results {
+                params_vec.push(Box::new(res.memory.id.clone()));
+            }
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|b| &**b).collect();
+            let _ = self.conn.execute(&sql, refs.as_slice());
         }
 
         Ok(results)
