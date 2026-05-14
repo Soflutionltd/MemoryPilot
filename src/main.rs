@@ -13,6 +13,7 @@ mod graph;
 #[cfg(feature = "http")]
 mod http;
 mod protocol;
+mod query_expansion;
 mod reranking;
 mod session_capsule;
 mod session_export;

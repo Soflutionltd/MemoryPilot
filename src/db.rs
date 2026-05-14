@@ -2364,62 +2364,109 @@ impl Database {
 
         let bm25_start = std::time::Instant::now();
         // 1. FTS5 search. Run the normal prefix query plus exact phrase/proximity variants.
-        for (variant_index, (fts_query, source)) in fts_variants.iter().enumerate() {
-            let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
-            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-                vec![Box::new(fts_query.clone())];
+        let run_fts_variant =
+            |fts_query: &str,
+             source: &'static str,
+             rank_offset: usize,
+             limit_rows: usize,
+             return_err_on_failure: bool,
+             bm25_results: &mut std::collections::HashMap<String, usize>,
+             all_memories: &mut std::collections::HashMap<String, Memory>,
+             candidate_sources: &mut std::collections::HashMap<
+                String,
+                std::collections::HashSet<String>,
+             >|
+             -> Result<usize, String> {
+                let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
+                let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    vec![Box::new(fts_query.to_string())];
 
-            if let Some(p) = canonical_project.as_deref() {
-                conditions.push(format!("m.project = ?{}", param_values.len() + 1));
-                param_values.push(Box::new(p.to_string()));
-            }
-            if let Some(k) = kind {
-                conditions.push(format!("m.kind = ?{}", param_values.len() + 1));
-                param_values.push(Box::new(k.to_string()));
-            }
-
-            let where_clause = conditions.join(" AND ");
-            let limit_rows = if variant_index == 0 { 150 } else { 75 };
-            let sql = format!(
-                "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,m.last_accessed_at,m.access_count,
-                        bm25(memories_fts, 8.0, 5.0, 2.0, 4.0) AS bm25_score
-                 FROM memories_fts f
-                 JOIN memories m ON m.rowid = f.rowid
-                 WHERE {}
-                 ORDER BY bm25_score ASC
-                 LIMIT {}", where_clause, limit_rows);
-
-            let mut stmt = match self.conn.prepare(&sql) {
-                Ok(stmt) => stmt,
-                Err(error) if variant_index == 0 => {
-                    return Err(format!("Search prepare: {}", error));
+                if let Some(p) = canonical_project.as_deref() {
+                    conditions.push(format!("m.project = ?{}", param_values.len() + 1));
+                    param_values.push(Box::new(p.to_string()));
                 }
-                Err(_) => continue,
-            };
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                param_values.iter().map(|p| p.as_ref()).collect();
-            let rows = match stmt.query_map(param_refs.as_slice(), |row| {
-                let mem = row_to_memory(row);
-                let bm25: f64 = row.get(13)?;
-                Ok((mem, bm25))
-            }) {
-                Ok(rows) => rows,
-                Err(error) if variant_index == 0 => return Err(format!("Search: {}", error)),
-                Err(_) => continue,
+                if let Some(k) = kind {
+                    conditions.push(format!("m.kind = ?{}", param_values.len() + 1));
+                    param_values.push(Box::new(k.to_string()));
+                }
+
+                let where_clause = conditions.join(" AND ");
+                let sql = format!(
+                    "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,m.last_accessed_at,m.access_count,
+                            bm25(memories_fts, 8.0, 5.0, 2.0, 4.0) AS bm25_score
+                     FROM memories_fts f
+                     JOIN memories m ON m.rowid = f.rowid
+                     WHERE {}
+                     ORDER BY bm25_score ASC
+                     LIMIT {}", where_clause, limit_rows);
+
+                let mut stmt = match self.conn.prepare(&sql) {
+                    Ok(stmt) => stmt,
+                    Err(error) if return_err_on_failure => {
+                        return Err(format!("Search prepare: {}", error));
+                    }
+                    Err(_) => return Ok(0),
+                };
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    param_values.iter().map(|p| p.as_ref()).collect();
+                let rows = match stmt.query_map(param_refs.as_slice(), |row| {
+                    let mem = row_to_memory(row);
+                    let bm25: f64 = row.get(13)?;
+                    Ok((mem, bm25))
+                }) {
+                    Ok(rows) => rows,
+                    Err(error) if return_err_on_failure => {
+                        return Err(format!("Search: {}", error));
+                    }
+                    Err(_) => return Ok(0),
+                };
+
+                let mut produced = 0usize;
+                for (rank_index, row) in rows.flatten().enumerate() {
+                    let (mem, _) = row;
+                    let rank = rank_index + 1 + rank_offset;
+                    let entry = bm25_results.entry(mem.id.clone()).or_insert(rank);
+                    *entry = (*entry).min(rank);
+                    candidate_sources
+                        .entry(mem.id.clone())
+                        .or_default()
+                        .insert(source.to_string());
+                    all_memories.entry(mem.id.clone()).or_insert(mem);
+                    produced += 1;
+                }
+                Ok(produced)
             };
 
-            for (rank_index, row) in rows.flatten().enumerate() {
-                let (mem, _) = row;
-                let rank = rank_index + 1;
-                let entry = bm25_results.entry(mem.id.clone()).or_insert(rank);
-                *entry = (*entry).min(rank);
-                candidate_sources
-                    .entry(mem.id.clone())
-                    .or_default()
-                    .insert((*source).to_string());
-                all_memories.entry(mem.id.clone()).or_insert(mem);
-            }
+        for (variant_index, (fts_query, source)) in fts_variants.iter().enumerate() {
+            let limit_rows = if variant_index == 0 { 150 } else { 75 };
+            let return_err_on_failure = variant_index == 0;
+            run_fts_variant(
+                fts_query,
+                *source,
+                0,
+                limit_rows,
+                return_err_on_failure,
+                &mut bm25_results,
+                &mut all_memories,
+                &mut candidate_sources,
+            )?;
         }
+
+        // NOTE: lexical synonym expansion (`fts5_synonym_variants`) is
+        // intentionally NOT invoked here. Three feeding strategies were
+        // measured on memorypilot-fr-30:
+        //
+        //   - Eager OR into BM25 pool       : R@5 73.3% → 63.3% (-10)
+        //   - Penalised rank, capped pool   : R@5 73.3% → 70.0% (-3)
+        //   - Candidate-only (vector judge) : R@5 73.3% → 63.3% (-10)
+        //
+        // All three regress precision because the curated thesaurus is
+        // too generic for a small corpus and pulls in long-tail noise.
+        // The right fix for cross-lingual / synonym retrieval is the
+        // dense cross-encoder reranker, not BM25 widening. The
+        // dictionary remains in `query_expansion.rs` for callers that
+        // want it (CLI tools, HTTP debugging) and may resurface later
+        // for very large corpora where the long tail dilutes naturally.
 
         // 2a. Optional ANN pre-filter. Marks candidates with `vector_ann` so the
         // explain output exposes which retrieval stage surfaced them. The full
