@@ -41,6 +41,25 @@ pub fn fts5_query_variants(query: &str) -> Vec<(String, &'static str)> {
         variants.push((format!("NEAR({}, 8)", near_terms), "fts_near"));
     }
 
+    // Stemmed prefix variant. The FTS5 `content` column stores both the
+    // raw text and the Snowball-stemmed projection of every memory, so a
+    // stemmed-query prefix match recovers French/English inflection
+    // variants (e.g. "messages" vs "message", "running" vs "run") that
+    // unicode61 cannot bridge alone.
+    let stemmed_query = crate::stemming::stem_query(query);
+    if !stemmed_query.is_empty() {
+        if let Some(stem_primary) = sanitize_fts5_query(&stemmed_query) {
+            // Only add it if it differs from the raw prefix to avoid
+            // double-counting BM25 evidence on non-inflected queries.
+            if !variants
+                .iter()
+                .any(|(existing, _)| existing == &stem_primary)
+            {
+                variants.push((stem_primary, "fts_stem"));
+            }
+        }
+    }
+
     variants
 }
 

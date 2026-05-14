@@ -179,8 +179,70 @@ impl Database {
         db.upgrade_schema()?;
         db.normalize_project_identities()?;
         let _ = db.backfill_embeddings();
+        let _ = db.migrate_fts_to_stemmed();
         Self::spawn_ann_warmup(ann, path.to_path_buf());
         Ok(db)
+    }
+
+    /// One-shot migration that rewrites every memory's FTS5 entry to
+    /// include the Snowball-stemmed projection of its content. Idempotent:
+    /// guarded by a `fts_stem_version=1` row in the `config` table.
+    fn migrate_fts_to_stemmed(&self) -> Result<(), String> {
+        let current: String = self
+            .conn
+            .query_row(
+                "SELECT value FROM config WHERE key='fts_stem_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        if current == "1" {
+            return Ok(());
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT m.rowid, m.content, m.tags, m.kind, COALESCE(m.project, '') FROM memories m")
+            .map_err(|error| format!("FTS stem migration prepare: {}", error))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| format!("FTS stem migration query: {}", error))?;
+
+        let entries: Vec<(i64, String, String, String, String)> = rows
+            .filter_map(|row| row.ok())
+            .collect();
+        drop(stmt);
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("FTS stem migration tx: {}", error))?;
+        for (rowid, content, tags_json, kind, project) in entries {
+            let fts_content = Self::fts_index_content(&content);
+            tx.execute("DELETE FROM memories_fts WHERE rowid=?1", params![rowid])
+                .ok();
+            tx.execute(
+                "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
+                params![rowid, fts_content, tags_json, kind, project],
+            )
+            .ok();
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO config (key,value) VALUES ('fts_stem_version','1')",
+            [],
+        )
+        .map_err(|error| format!("FTS stem migration version: {}", error))?;
+        tx.commit()
+            .map_err(|error| format!("FTS stem migration commit: {}", error))?;
+        Ok(())
     }
 
     /// Hydrate the ANN index in a detached worker so `open_at` does not pay the
@@ -290,6 +352,24 @@ impl Database {
     #[allow(dead_code)]
     pub fn ann_index(&self) -> Option<Arc<crate::ann::AnnIndex>> {
         self.ann.clone()
+    }
+
+    /// Build the text we feed into the FTS5 `content` column.
+    ///
+    /// We append a Snowball-stemmed projection of the raw content so that
+    /// inflected matches survive BM25 (e.g. French "messages" vs query
+    /// "message", or English "running" vs query "run"). The raw content
+    /// is preserved verbatim, so exact-phrase, NEAR, and BM25 statistics
+    /// on the original text continue to work unchanged. The stemmed
+    /// fragment is delimited by an ASCII NUL so it is unlikely to be
+    /// matched by any user query phrase.
+    fn fts_index_content(content: &str) -> String {
+        let stem = crate::stemming::stem_text(content);
+        if stem.is_empty() {
+            content.to_string()
+        } else {
+            format!("{} {}", content, stem)
+        }
     }
 
     fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1840,11 +1920,12 @@ impl Database {
         // Queue embedding for background computation
         queue_embedding_job(&id, content);
 
-        // FTS index
+        // FTS index (raw content + stemmed projection for FR/EN recall)
         let rowid = self.conn.last_insert_rowid();
+        let fts_content = Self::fts_index_content(content);
         self.conn.execute(
             "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
-            params![rowid, content, tags_json, kind, canonical_project.as_deref().unwrap_or("")],
+            params![rowid, fts_content, tags_json, kind, canonical_project.as_deref().unwrap_or("")],
         ).map_err(|e| format!("FTS insert: {}", e))?;
 
         if let Some(proj) = canonical_project.as_deref() {
@@ -1937,9 +2018,10 @@ impl Database {
                 .conn
                 .execute("DELETE FROM memories_fts WHERE rowid=?1", params![rowid]);
             let proj = existing.project.as_deref().unwrap_or("");
+            let fts_content = Self::fts_index_content(new_content);
             let _ = self.conn.execute(
                 "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
-                params![rowid, new_content, tags_json, new_kind, proj]);
+                params![rowid, fts_content, tags_json, new_kind, proj]);
         }
 
         let mem = Memory {
@@ -4615,9 +4697,10 @@ impl Database {
                 params![id, content, kind, canonical_project.as_deref(), tags_json, source, emb_blob, now, now],
             ).map_err(|e| format!("Import: {}", e))?;
             let rowid = tx.last_insert_rowid();
+            let fts_content = Self::fts_index_content(content);
             tx.execute(
                 "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
-                params![rowid, content, tags_json, kind, canonical_project.as_deref().unwrap_or("")],
+                params![rowid, fts_content, tags_json, kind, canonical_project.as_deref().unwrap_or("")],
             ).map_err(|e| format!("FTS: {}", e))?;
             if let Some(p) = canonical_project.as_deref() {
                 let _ = tx.execute(

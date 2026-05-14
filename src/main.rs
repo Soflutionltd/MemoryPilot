@@ -18,6 +18,7 @@ mod session_capsule;
 mod session_export;
 mod session_fusion;
 mod splitter;
+mod stemming;
 mod telemetry;
 mod tools;
 mod watcher;
