@@ -25,7 +25,8 @@ mod schema;
 mod transcript;
 
 use embed_worker::{
-    cached_embed_text, queue_embedding_job, set_embed_ann_index, set_embed_db_path,
+    cached_embed_text, queue_access_update, queue_embedding_job, set_embed_ann_index,
+    set_embed_db_path,
 };
 
 const DB_DIR: &str = ".MemoryPilot";
@@ -2809,29 +2810,11 @@ impl Database {
             crate::telemetry::emit(&t);
         }
 
-        // Update access count and timestamp for returned results in a
-        // single batched UPDATE so that we do not pay N writer-lock
-        // round trips per search (the previous loop was the dominant
-        // contention point under concurrent load).
-        if !results.is_empty() {
-            let placeholders: Vec<String> = (1..=results.len())
-                .map(|i| format!("?{}", i + 1))
-                .collect();
-            let sql = format!(
-                "UPDATE memories \
-                 SET access_count = access_count + 1, last_accessed_at = ?1 \
-                 WHERE id IN ({})",
-                placeholders.join(", ")
-            );
-            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
-                Vec::with_capacity(results.len() + 1);
-            params_vec.push(Box::new(chrono::Utc::now().to_rfc3339()));
-            for res in &results {
-                params_vec.push(Box::new(res.memory.id.clone()));
-            }
-            let refs: Vec<&dyn rusqlite::types::ToSql> =
-                params_vec.iter().map(|b| &**b).collect();
-            let _ = self.conn.execute(&sql, refs.as_slice());
+        // Defer access-count + last_accessed updates to the embed worker
+        // so the hot search path never holds the WAL writer lock. The
+        // worker drains the queue every ~2 s in a single batch UPDATE.
+        for res in &results {
+            queue_access_update(res.memory.id.clone());
         }
 
         Ok(results)

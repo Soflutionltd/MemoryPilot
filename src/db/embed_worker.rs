@@ -24,6 +24,82 @@ struct EmbedCache {
 
 static EMBED_CACHE: OnceLock<Mutex<EmbedCache>> = OnceLock::new();
 
+/// Async access-count queue.
+///
+/// Hot-path searches push memory ids here instead of issuing an
+/// `UPDATE memories SET access_count = ...` directly. Flushing is
+/// done in batch by the embed worker thread, which removes WAL writer
+/// contention from the search path. Precision trade-off: many accesses
+/// to the same id within the flush window count as a single increment.
+static ACCESS_QUEUE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+const ACCESS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn access_queue() -> &'static Mutex<Vec<String>> {
+    ACCESS_QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(super) fn queue_access_update(memory_id: String) {
+    if let Ok(mut q) = access_queue().lock() {
+        q.push(memory_id);
+    }
+}
+
+fn last_access_flush() -> &'static Mutex<std::time::Instant> {
+    static LAST: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(std::time::Instant::now() - ACCESS_FLUSH_INTERVAL))
+}
+
+fn flush_access_queue(conn: &Connection) {
+    let due = {
+        let mut last = match last_access_flush().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if last.elapsed() < ACCESS_FLUSH_INTERVAL {
+            return;
+        }
+        *last = std::time::Instant::now();
+        true
+    };
+    if !due {
+        return;
+    }
+
+    let drained: Vec<String> = match access_queue().lock() {
+        Ok(mut q) => q.drain(..).collect(),
+        Err(_) => return,
+    };
+    if drained.is_empty() {
+        return;
+    }
+
+    // Deduplicate while preserving uniqueness; we trade a small amount of
+    // counter precision for one round-trip instead of N.
+    let mut unique: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(drained.len());
+    unique.extend(drained);
+    let ids: Vec<String> = unique.into_iter().collect();
+    if ids.is_empty() {
+        return;
+    }
+
+    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i + 1)).collect();
+    let sql = format!(
+        "UPDATE memories \
+         SET access_count = access_count + 1, last_accessed_at = ?1 \
+         WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(ids.len() + 1);
+    params_vec.push(Box::new(now));
+    for id in &ids {
+        params_vec.push(Box::new(id.clone()));
+    }
+    let refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|b| &**b).collect();
+    let _ = conn.execute(&sql, refs.as_slice());
+}
+
 pub(super) fn set_embed_db_path(path: &Path) {
     let _ = EMBED_DB_PATH.set(path.to_path_buf());
 }
@@ -175,21 +251,31 @@ fn embed_worker_loop() {
             queue.drain(..).collect()
         };
 
-        if jobs.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            continue;
-        }
-
+        // Even with no embed jobs we still want to drain the access
+        // queue periodically so search counters do not grow stale.
         let db_path = match EMBED_DB_PATH.get() {
             Some(path) => path.clone(),
-            None => continue,
+            None => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
         };
 
         let conn = match Connection::open(&db_path) {
             Ok(conn) => conn,
-            Err(_) => continue,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
         };
         let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+
+        flush_access_queue(&conn);
+
+        if jobs.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
 
         let texts: Vec<&str> = jobs.iter().map(|job| job.content.as_str()).collect();
         let embeddings = crate::embedding::embed_batch(&texts);
@@ -211,10 +297,34 @@ fn embed_worker_loop() {
         }
         if ann_pushed > 0 {
             if let Some(index) = ann.as_ref() {
-                let _ = index.persist();
+                // Debounce ANN persistence so the embed worker does not
+                // serialize every batch onto disk, which used to block
+                // concurrent searches on the WAL writer lock. We persist
+                // at most once every 5 seconds; the in-memory index is
+                // always up to date for searches.
+                let should_persist = {
+                    let mut last = last_ann_persist().lock().expect("ann persist lock");
+                    if last.elapsed() >= std::time::Duration::from_secs(5) {
+                        *last = std::time::Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_persist {
+                    let _ = index.persist();
+                }
             }
         }
     }
+}
+
+fn last_ann_persist() -> &'static std::sync::Mutex<std::time::Instant> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+        std::sync::OnceLock::new();
+    LAST.get_or_init(|| {
+        std::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60))
+    })
 }
 
 impl EmbedCache {
