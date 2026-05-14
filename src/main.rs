@@ -78,6 +78,10 @@ fn main() {
         run_benchmark_latency(&args);
         return;
     }
+    if args.iter().any(|a| a == "--benchmark-concurrency") {
+        run_benchmark_concurrency(&args);
+        return;
+    }
     #[cfg(feature = "http")]
     {
         if let Some(pos) = args.iter().position(|a| a == "--http") {
@@ -570,6 +574,207 @@ fn run_benchmark_latency(args: &[String]) {
     }
 }
 
+fn run_benchmark_concurrency(args: &[String]) {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let client_count = args
+        .windows(2)
+        .find(|w| w[0] == "--clients")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(8);
+    let queries_per_client = args
+        .windows(2)
+        .find(|w| w[0] == "--queries-per-client")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(50);
+    let seed_memories = args
+        .windows(2)
+        .find(|w| w[0] == "--seed-memories")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(2_000);
+
+    eprintln!(
+        "[Concurrency] Starting bench (clients={}, queries_per_client={}, seed={})",
+        client_count, queries_per_client, seed_memories
+    );
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "memorypilot-concurrency-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let db_path = tmp_dir.join("bench.db");
+
+    eprintln!("[Concurrency] Seeding {} synthetic memories...", seed_memories);
+    let seed_start = Instant::now();
+    {
+        let db = match db::Database::open_at(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("✗ open_at failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let topics = [
+            "rust async runtime", "tokio mutex deadlock", "sqlite wal checkpoint",
+            "fastembed onnx model", "knowledge graph entity", "stripe webhook",
+            "supabase rls policy", "svelte runes", "tailwind grid",
+            "cloudflare wrangler", "embedding cosine", "bm25 ranking",
+            "hnsw ann index", "tree sitter parser", "ttl garbage collection",
+        ];
+        let scope = db::MemoryScope::default();
+        for i in 0..seed_memories {
+            let topic = &topics[i % topics.len()];
+            let nonce: u64 = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1);
+            let content = format!(
+                "Memory #{} about {} (uniq {:016x}): detailed scenario {} variant {}.",
+                i, topic, nonce, i % 257, i.wrapping_mul(31)
+            );
+            let _ = db.add_memory(&content, "note", Some("bench"), &[topic.to_string()],
+                "bench-concurrency", 3, None, None, &scope);
+        }
+        eprintln!("[Concurrency] Seed done in {:.1}s", seed_start.elapsed().as_secs_f64());
+        eprintln!("[Concurrency] Waiting for embed worker to fully drain...");
+        let wait_start = Instant::now();
+        loop {
+            let probe = match rusqlite::Connection::open(&db_path) {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let _ = probe.busy_timeout(std::time::Duration::from_secs(2));
+            let pending: i64 = probe
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE embedding IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(-1);
+            if pending == 0 {
+                break;
+            }
+            if wait_start.elapsed().as_secs() > 600 {
+                eprintln!("[Concurrency] Timeout: {} embeddings still pending", pending);
+                break;
+            }
+            if wait_start.elapsed().as_millis() % 5000 < 250 && pending > 0 {
+                eprintln!("  ... {} pending after {:.0}s", pending, wait_start.elapsed().as_secs_f64());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        eprintln!(
+            "[Concurrency] Embed worker drained in {:.1}s.",
+            wait_start.elapsed().as_secs_f64()
+        );
+    }
+
+    let queries: Arc<Vec<String>> = Arc::new(
+        (0..queries_per_client * 4)
+            .map(|i| {
+                let topics = [
+                    "rust async tokio", "sqlite wal performance",
+                    "fastembed multilingual", "knowledge graph",
+                    "stripe webhook validation", "supabase row level security",
+                    "svelte 5 runes pattern", "tailwind responsive",
+                    "hnsw approximate nearest neighbor", "bm25 fts5",
+                    "embedding cosine search", "tree sitter parser",
+                ];
+                format!("{} variant {}", topics[i % topics.len()], i)
+            })
+            .collect(),
+    );
+
+    // Warm up the lazy fastembed ONNX model and the in-process ANN index on
+    // the main thread so the first search of every worker does not eat the
+    // one-time init/warm costs.
+    eprintln!("[Concurrency] Warming up embedding model and ANN...");
+    {
+        let warm_db = match db::Database::open_at(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("✗ warm open_at failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        for q in queries.iter().take(10) {
+            let _ = warm_db.search(q, 10, None, None, None, None);
+        }
+        // Give the detached ANN warm-up thread time to persist its index
+        // before workers open their own handles.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+
+    eprintln!(
+        "[Concurrency] Launching {} clients × {} queries in parallel (each opens its own DB handle)...",
+        client_count, queries_per_client
+    );
+    let bench_start = Instant::now();
+    let mut handles = Vec::with_capacity(client_count);
+    for client_id in 0..client_count {
+        let queries_handle = Arc::clone(&queries);
+        let qpc = queries_per_client;
+        let db_path_clone = db_path.clone();
+        handles.push(std::thread::spawn(move || {
+            // Each worker opens its own Database handle (mirrors a multi-worker
+            // HTTP server where every request handler holds a connection).
+            let db = match db::Database::open_at(&db_path_clone) {
+                Ok(d) => d,
+                Err(_) => return (Vec::new(), qpc),
+            };
+            let mut latencies = Vec::with_capacity(qpc);
+            let mut errors = 0usize;
+            for i in 0..qpc {
+                let q_index = (client_id * qpc + i) % queries_handle.len();
+                let q = &queries_handle[q_index];
+                let t = Instant::now();
+                match db.search(q, 10, None, None, None, None) {
+                    Ok(_) => latencies.push(t.elapsed().as_secs_f64() * 1000.0),
+                    Err(_) => errors += 1,
+                }
+            }
+            (latencies, errors)
+        }));
+    }
+
+    let mut all_latencies: Vec<f64> = Vec::with_capacity(client_count * queries_per_client);
+    let mut total_errors = 0usize;
+    for handle in handles {
+        let (latencies, errors) = handle.join().unwrap_or((Vec::new(), 0));
+        all_latencies.extend(latencies);
+        total_errors += errors;
+    }
+    let bench_ms = bench_start.elapsed().as_secs_f64() * 1000.0;
+
+    let stats = percentiles(&mut all_latencies);
+    let total_queries = client_count * queries_per_client;
+    let throughput = total_queries as f64 / (bench_ms / 1000.0);
+
+    let report = serde_json::json!({
+        "config": {
+            "clients": client_count,
+            "queries_per_client": queries_per_client,
+            "total_queries": total_queries,
+            "seed_memories": seed_memories,
+            "db_path": db_path.display().to_string(),
+        },
+        "results": {
+            "wall_clock_ms": format!("{:.2}", bench_ms),
+            "throughput_qps": format!("{:.1}", throughput),
+            "errors": total_errors,
+            "search_latency_ms": {
+                "p50": format!("{:.2}", stats.p50),
+                "p95": format!("{:.2}", stats.p95),
+                "p99": format!("{:.2}", stats.p99),
+                "avg": format!("{:.2}", stats.avg),
+            },
+        },
+    });
+
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
 struct Percentiles {
     p50: f64,
     p95: f64,
@@ -608,6 +813,7 @@ fn print_help() {
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");
     println!("  MemoryPilot --benchmark-fr [--min-r5 PCT]  French retrieval benchmark (30 in-memory scenarios)");
+    println!("  MemoryPilot --benchmark-concurrency [--clients N] [--queries-per-client N] [--seed-memories N]  Multi-client concurrent search throughput");
     println!("  MemoryPilot --benchmark-latency [--queries N] [--seed-memories N] [--db PATH]  Cold/warm search latency");
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot --help           Show this help");
