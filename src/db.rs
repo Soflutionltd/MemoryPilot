@@ -138,7 +138,12 @@ impl MemoryScope {
     }
 }
 
-const READ_POOL_SIZE: usize = 4;
+/// Number of read-only SQLite connections per Database handle. Each handle
+/// (one per HTTP worker / MCP client) keeps this many readers warm so that
+/// concurrent searches no longer serialize on a single Mutex<Connection>.
+/// SQLite WAL allows N readers + 1 writer concurrently, so a larger pool
+/// only costs file descriptors and ~80 KB of cache per connection.
+const READ_POOL_SIZE: usize = 16;
 
 pub struct Database {
     conn: Connection,

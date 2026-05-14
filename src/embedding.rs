@@ -4,37 +4,104 @@
 ///
 /// Stored embeddings are int8-quantized (4-byte scale + 384 i8 = 388 bytes,
 /// 4× smaller than f32). Legacy f32 blobs (1536 bytes) remain readable.
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 const VECTOR_DIM: usize = 384;
 const QUANTIZED_BLOB_LEN: usize = 4 + VECTOR_DIM;
 const F32_BLOB_LEN: usize = VECTOR_DIM * 4;
 
-static FASTEMBED_MODEL: OnceLock<Mutex<fastembed::TextEmbedding>> = OnceLock::new();
+/// Pool of fastembed model instances.
+///
+/// fastembed wraps an ONNX runtime session that is not safe to call from
+/// multiple threads at once, so a single global Mutex serializes every
+/// embed() call. That is a hard ceiling on concurrent throughput in MCP
+/// servers that handle several clients in parallel.
+///
+/// `EmbedPool` keeps `MEMPILOT_EMBED_POOL_SIZE` (default: number of CPUs
+/// capped at 4) independent ONNX sessions and hands them out one at a
+/// time. A lightweight Condvar wakeup avoids busy spinning. Each session
+/// is ~95 MB of resident memory, so the pool is small by default; users
+/// who care about throughput more than RAM can opt into a bigger pool.
+struct EmbedPool {
+    available: Mutex<Vec<fastembed::TextEmbedding>>,
+    notify: Condvar,
+}
 
-fn get_model() -> &'static Mutex<fastembed::TextEmbedding> {
-    FASTEMBED_MODEL.get_or_init(|| {
-        // Use a stable, writable cache dir so fastembed finds the ONNX model
-        // even when launched from sandboxed environments (Claude Desktop, etc.)
-        let cache_dir = std::env::var("FASTEMBED_CACHE_PATH").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{}/.cache/fastembed", home)
-        });
-        let cache_path = std::path::PathBuf::from(&cache_dir);
-        std::fs::create_dir_all(&cache_path).ok();
+static EMBED_POOL: OnceLock<EmbedPool> = OnceLock::new();
 
-        let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
-            .with_show_download_progress(false)
-            .with_cache_dir(cache_path);
-        let model = fastembed::TextEmbedding::try_new(opts)
-            .expect("[MemoryPilot] fastembed init failed — cannot start without embedding engine");
-        Mutex::new(model)
+fn fastembed_cache_dir() -> std::path::PathBuf {
+    let cache_dir = std::env::var("FASTEMBED_CACHE_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.cache/fastembed", home)
+    });
+    let path = std::path::PathBuf::from(&cache_dir);
+    std::fs::create_dir_all(&path).ok();
+    path
+}
+
+fn build_model() -> fastembed::TextEmbedding {
+    let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
+        .with_show_download_progress(false)
+        .with_cache_dir(fastembed_cache_dir());
+    fastembed::TextEmbedding::try_new(opts)
+        .expect("[MemoryPilot] fastembed init failed — cannot start without embedding engine")
+}
+
+fn embed_pool() -> &'static EmbedPool {
+    EMBED_POOL.get_or_init(|| {
+        let pool_size = std::env::var("MEMORYPILOT_EMBED_POOL_SIZE")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+            .clamp(1, 8);
+
+        let mut models = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            models.push(build_model());
+        }
+        EmbedPool {
+            available: Mutex::new(models),
+            notify: Condvar::new(),
+        }
     })
 }
 
+struct PooledModel {
+    inner: Option<fastembed::TextEmbedding>,
+}
+
+impl PooledModel {
+    fn new() -> Self {
+        let pool = embed_pool();
+        let mut guard = pool.available.lock().expect("embed pool poisoned");
+        while guard.is_empty() {
+            guard = pool.notify.wait(guard).expect("embed pool wait poisoned");
+        }
+        let model = guard.pop().expect("pool was non-empty under guard");
+        PooledModel { inner: Some(model) }
+    }
+
+    fn model(&mut self) -> &mut fastembed::TextEmbedding {
+        self.inner.as_mut().expect("pooled model dropped")
+    }
+}
+
+impl Drop for PooledModel {
+    fn drop(&mut self) {
+        if let Some(model) = self.inner.take() {
+            let pool = embed_pool();
+            if let Ok(mut guard) = pool.available.lock() {
+                guard.push(model);
+                pool.notify.notify_one();
+            }
+        }
+    }
+}
+
 pub fn embed_text(text: &str) -> Vec<f32> {
-    let mut model = get_model().lock().expect("fastembed lock poisoned");
-    let mut embeddings = model
+    let mut pooled = PooledModel::new();
+    let mut embeddings = pooled
+        .model()
         .embed(vec![text], None)
         .expect("fastembed embed failed");
     embeddings.pop().unwrap_or_else(|| vec![0.0; VECTOR_DIM])
@@ -44,8 +111,9 @@ pub fn embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
     if texts.is_empty() {
         return vec![];
     }
-    let mut model = get_model().lock().expect("fastembed lock poisoned");
-    model
+    let mut pooled = PooledModel::new();
+    pooled
+        .model()
         .embed(texts.to_vec(), None)
         .expect("fastembed batch embed failed")
 }

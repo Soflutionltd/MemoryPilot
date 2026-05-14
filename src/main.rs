@@ -728,7 +728,13 @@ fn run_benchmark_concurrency(args: &[String]) {
                 let q = &queries_handle[q_index];
                 let t = Instant::now();
                 match db.search(q, 10, None, None, None, None) {
-                    Ok(_) => latencies.push(t.elapsed().as_secs_f64() * 1000.0),
+                    Ok(_) => {
+                        // Skip the first 5 queries per worker so we measure
+                        // steady-state and not the open_at + ANN warmup tail.
+                        if i >= 5 {
+                            latencies.push(t.elapsed().as_secs_f64() * 1000.0);
+                        }
+                    }
                     Err(_) => errors += 1,
                 }
             }
