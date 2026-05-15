@@ -203,10 +203,41 @@ impl Database {
         db.init_schema()?;
         db.upgrade_schema()?;
         db.normalize_project_identities()?;
+        // If the user just swapped the embedding model (or upgraded
+        // from v4.1 small-model blobs to a v4.2 default), the on-disk
+        // blob length no longer matches the active model. Wipe those
+        // stale blobs so the regular backfill pass below re-embeds
+        // them with the new model. Cheap one-shot SQL — no scan
+        // happens once everything is up to date.
+        let _ = db.invalidate_stale_embeddings();
         let _ = db.backfill_embeddings();
         let _ = db.migrate_fts_to_stemmed();
         Self::spawn_ann_warmup(ann, path.to_path_buf(), ann_warm_complete);
         Ok(db)
+    }
+
+    /// Set `embedding = NULL` on every row whose blob length doesn't
+    /// match the active model's expected length. Keeps the row, just
+    /// queues a re-embed.
+    fn invalidate_stale_embeddings(&self) -> Result<usize, String> {
+        let expected = crate::embedding::quantized_blob_len() as i64;
+        let invalidated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                    SET embedding = NULL
+                  WHERE embedding IS NOT NULL
+                    AND length(embedding) <> ?1",
+                params![expected],
+            )
+            .map_err(|error| format!("Stale embedding invalidate: {}", error))?;
+        if invalidated > 0 {
+            eprintln!(
+                "[MemoryPilot] Invalidated {} embeddings produced by a different model — they will be re-embedded with the active model.",
+                invalidated
+            );
+        }
+        Ok(invalidated)
     }
 
     /// Open the database **and block until the ANN index is fully

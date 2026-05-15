@@ -376,6 +376,7 @@ MemoryPilot --help                   # Show help
 | `MEMORYPILOT_RERANK_POOL_SIZE` | `1` | Number of cross-encoder ONNX sessions kept hot. `2` cuts force-rerank p50 by 21% and p95 by 38% under 4-client load, at the cost of ~1.1 GB extra RAM. |
 | `MEMORYPILOT_EMBED_POOL_SIZE` | `4` | Number of fastembed ONNX sessions in the pool. Steady-state RAM scales roughly linearly. |
 | `MEMORYPILOT_RERANKER_MODEL` | `jina-v2-multilingual` | Override with `bge-v2-m3`, `bge-base`, or `jina-v1`. |
+| `MEMORYPILOT_EMBED_MODEL` | `e5-small` | Embedding model. Override with `e5-large` (1024-dim, +3-6 pp R@5 on FR, +1.4 GB RAM, ~3× slower per embedding) or `bge-m3` (1024-dim, 8192 context). The on-disk blob format adapts automatically and stale embeddings are re-computed at next start. |
 
 ## HTTP API
 

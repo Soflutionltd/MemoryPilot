@@ -102,7 +102,14 @@ impl Database {
                         )
                     });
                 if let Ok(blob) = cached_blob {
-                    embedding_cache.insert(key.clone(), crate::embedding::blob_to_vec(&blob));
+                    let vec = crate::embedding::blob_to_vec(&blob);
+                    // Defence in depth: skip cached vectors whose dim
+                    // doesn't match the active model. The cache key
+                    // already includes the dim, but this guard means
+                    // a half-migrated cache file never poisons a run.
+                    if vec.len() == crate::embedding::vector_dim() {
+                        embedding_cache.insert(key.clone(), vec);
+                    }
                 }
             }
         }
@@ -527,7 +534,20 @@ impl Database {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
-        let cache_key = content_hash(&format!("{}:{}:{}", dataset_path, metadata.len(), modified));
+        // Include the active embedding dim in the cache key so a model
+        // swap (e.g. small → large) automatically picks up a fresh
+        // cache file. Without this guard the bench loads 384-dim blobs
+        // produced by a previous run and feeds them to a 1024-dim
+        // query — every cosine similarity collapses to 0 and recall
+        // drops to single-digits. Cheap to do, catches the foot-gun.
+        let model_dim = crate::embedding::vector_dim();
+        let cache_key = content_hash(&format!(
+            "{}:{}:{}:dim{}",
+            dataset_path,
+            metadata.len(),
+            modified,
+            model_dim
+        ));
         let cache_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("target")

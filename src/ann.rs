@@ -18,7 +18,6 @@ use std::sync::{Mutex, RwLock};
 
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-const DEFAULT_DIM: usize = 384;
 const DEFAULT_CAPACITY: usize = 4_096;
 const DEFAULT_RESERVE_THREADS: usize = 1;
 
@@ -31,8 +30,12 @@ pub struct AnnIndex {
 
 impl AnnIndex {
     pub fn open(storage_path: Option<PathBuf>) -> Result<Self, String> {
+        Self::open_with_dim(storage_path, crate::embedding::vector_dim())
+    }
+
+    pub fn open_with_dim(storage_path: Option<PathBuf>, dim: usize) -> Result<Self, String> {
         let options = IndexOptions {
-            dimensions: DEFAULT_DIM,
+            dimensions: dim,
             metric: MetricKind::Cos,
             quantization: ScalarKind::I8,
             ..Default::default()
@@ -46,12 +49,42 @@ impl AnnIndex {
             inner: Mutex::new(index),
             key_map: RwLock::new(HashMap::new()),
             storage_path,
-            dim: DEFAULT_DIM,
+            dim,
         };
 
         if let Some(path) = ann.storage_path.clone() {
             if path.exists() {
-                let _ = ann.load_from_disk(&path);
+                if let Err(error) = ann.load_from_disk(&path) {
+                    // The on-disk index was almost certainly produced
+                    // by a different model dimension. Drop the stale
+                    // file (and its sidecar), rebuild a fresh
+                    // in-memory index at the active dim, and let the
+                    // warm-up thread hydrate it from the freshly
+                    // re-embedded SQLite blobs.
+                    eprintln!(
+                        "[MemoryPilot] ANN index reset (incompatible on-disk format: {})",
+                        error
+                    );
+                    let _ = std::fs::remove_file(path.as_path());
+                    let _ = std::fs::remove_file(sidecar_path(path.as_path()));
+                    let fresh_options = IndexOptions {
+                        dimensions: dim,
+                        metric: MetricKind::Cos,
+                        quantization: ScalarKind::I8,
+                        ..Default::default()
+                    };
+                    let fresh = Index::new(&fresh_options)
+                        .map_err(|error| format!("ANN reset init: {}", error))?;
+                    fresh
+                        .reserve_capacity_and_threads(DEFAULT_CAPACITY, DEFAULT_RESERVE_THREADS)
+                        .map_err(|error| format!("ANN reset reserve: {}", error))?;
+                    if let Ok(mut guard) = ann.inner.lock() {
+                        *guard = fresh;
+                    }
+                    if let Ok(mut map) = ann.key_map.write() {
+                        map.clear();
+                    }
+                }
             }
         }
 
@@ -177,6 +210,17 @@ impl AnnIndex {
             index
                 .load(&path_str)
                 .map_err(|error| format!("ANN load: {}", error))?;
+            let on_disk_dim = index.dimensions();
+            if on_disk_dim != self.dim {
+                // Drop the just-loaded data so the caller's recovery
+                // path can wipe the file and start over with the
+                // correct dim. Returning Err triggers exactly that.
+                let _ = index.reset();
+                return Err(format!(
+                    "on-disk dim {} ≠ active dim {}",
+                    on_disk_dim, self.dim
+                ));
+            }
         }
         let sidecar = sidecar_path(path);
         if sidecar.exists() {
@@ -237,13 +281,14 @@ mod tests {
         v
     }
 
+    const TEST_DIM: usize = 384;
+
     #[test]
     fn ann_returns_self_as_top_match() {
-        let ann = AnnIndex::open(None).expect("open");
-        let v = unit_vec(7, DEFAULT_DIM);
+        let ann = AnnIndex::open_with_dim(None, TEST_DIM).expect("open");
+        let v = unit_vec(7, TEST_DIM);
         ann.add("memory-a", &v).expect("add");
-        ann.add("memory-b", &unit_vec(42, DEFAULT_DIM))
-            .expect("add");
+        ann.add("memory-b", &unit_vec(42, TEST_DIM)).expect("add");
         let results = ann.search(&v, 2);
         assert!(!results.is_empty());
         assert_eq!(results[0].0, "memory-a");
@@ -251,11 +296,10 @@ mod tests {
 
     #[test]
     fn ann_remove_drops_candidate() {
-        let ann = AnnIndex::open(None).expect("open");
-        let v = unit_vec(7, DEFAULT_DIM);
+        let ann = AnnIndex::open_with_dim(None, TEST_DIM).expect("open");
+        let v = unit_vec(7, TEST_DIM);
         ann.add("memory-a", &v).expect("add");
-        ann.add("memory-b", &unit_vec(99, DEFAULT_DIM))
-            .expect("add");
+        ann.add("memory-b", &unit_vec(99, TEST_DIM)).expect("add");
         ann.remove("memory-a").expect("remove");
         let results = ann.search(&v, 2);
         assert!(!results.iter().any(|(id, _)| id == "memory-a"));
@@ -267,15 +311,14 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.usearch");
         {
-            let ann = AnnIndex::open(Some(path.clone())).expect("open");
-            ann.add("memory-a", &unit_vec(7, DEFAULT_DIM)).expect("add");
-            ann.add("memory-b", &unit_vec(42, DEFAULT_DIM))
-                .expect("add");
+            let ann = AnnIndex::open_with_dim(Some(path.clone()), TEST_DIM).expect("open");
+            ann.add("memory-a", &unit_vec(7, TEST_DIM)).expect("add");
+            ann.add("memory-b", &unit_vec(42, TEST_DIM)).expect("add");
             ann.persist().expect("persist");
         }
-        let reopened = AnnIndex::open(Some(path.clone())).expect("reopen");
+        let reopened = AnnIndex::open_with_dim(Some(path.clone()), TEST_DIM).expect("reopen");
         assert!(reopened.len() >= 2);
-        let results = reopened.search(&unit_vec(7, DEFAULT_DIM), 2);
+        let results = reopened.search(&unit_vec(7, TEST_DIM), 2);
         assert!(results.iter().any(|(id, _)| id == "memory-a"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(sidecar_path(&path));
@@ -283,9 +326,35 @@ mod tests {
     }
 
     #[test]
+    fn ann_dim_mismatch_resets_index() {
+        let dir = std::env::temp_dir().join(format!(
+            "memorypilot-ann-mismatch-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.usearch");
+        {
+            let ann = AnnIndex::open_with_dim(Some(path.clone()), 384).expect("open");
+            ann.add("a", &unit_vec(1, 384)).expect("add");
+            ann.persist().expect("persist");
+        }
+        // Reopening with a different dim should drop the stale file
+        // and yield a fresh, empty index — never panic.
+        let reopened = AnnIndex::open_with_dim(Some(path.clone()), 1024).expect("reopen");
+        assert_eq!(reopened.len(), 0, "stale 384-dim file must be discarded");
+        // And we should be able to write under the new dim.
+        reopened.add("b", &unit_vec(2, 1024)).expect("add");
+        assert_eq!(reopened.len(), 1);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(sidecar_path(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ann_empty_index_returns_no_results() {
-        let ann = AnnIndex::open(None).expect("open");
-        let v = unit_vec(7, DEFAULT_DIM);
+        let ann = AnnIndex::open_with_dim(None, TEST_DIM).expect("open");
+        let v = unit_vec(7, TEST_DIM);
         assert!(ann.search(&v, 5).is_empty());
     }
 }

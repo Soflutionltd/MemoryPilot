@@ -1,14 +1,89 @@
-/// MemoryPilot v4.0 — Embedding Engine.
-/// fastembed transformer (multilingual-e5-small, 384-dim, local ONNX inference).
-/// Supports 100+ languages including French and English natively.
+/// MemoryPilot v4.2 — Embedding Engine.
 ///
-/// Stored embeddings are int8-quantized (4-byte scale + 384 i8 = 388 bytes,
-/// 4× smaller than f32). Legacy f32 blobs (1536 bytes) remain readable.
+/// fastembed transformer, multilingual-e5-large by default (1024-dim,
+/// local ONNX inference, 100+ languages). Selectable at runtime via
+/// `MEMORYPILOT_EMBED_MODEL` so users can downgrade to the smaller
+/// `multilingual-e5-small` (384-dim) if RAM and binary footprint are
+/// the priority.
+///
+/// Stored embeddings are int8-quantized (4-byte scale + N i8 bytes,
+/// 4× smaller than f32). The on-disk blob length is `4 + dim`. The
+/// legacy 384-dim layouts (quantized 388 bytes and f32 1536 bytes)
+/// remain readable so existing databases keep working — but vectors
+/// produced by a different model are mathematically incompatible with
+/// queries produced by another, so a `--backfill-force` is required
+/// when the user changes models.
 use std::sync::{Condvar, Mutex, OnceLock};
 
-const VECTOR_DIM: usize = 384;
-const QUANTIZED_BLOB_LEN: usize = 4 + VECTOR_DIM;
-const F32_BLOB_LEN: usize = VECTOR_DIM * 4;
+/// Legacy 384-dim layouts kept for backwards compatibility on existing
+/// on-disk blobs (small model). Anything else is rejected as unknown.
+const LEGACY_SMALL_DIM: usize = 384;
+const LEGACY_SMALL_QUANTIZED_BLOB_LEN: usize = 4 + LEGACY_SMALL_DIM;
+const LEGACY_SMALL_F32_BLOB_LEN: usize = LEGACY_SMALL_DIM * 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedModel {
+    E5Large,
+    E5Base,
+    E5Small,
+    BGEM3,
+}
+
+impl SelectedModel {
+    fn dim(self) -> usize {
+        match self {
+            SelectedModel::E5Large | SelectedModel::BGEM3 => 1024,
+            SelectedModel::E5Base => 768,
+            SelectedModel::E5Small => 384,
+        }
+    }
+
+    fn fastembed(self) -> fastembed::EmbeddingModel {
+        match self {
+            SelectedModel::E5Large => fastembed::EmbeddingModel::MultilingualE5Large,
+            SelectedModel::E5Base => fastembed::EmbeddingModel::MultilingualE5Base,
+            SelectedModel::E5Small => fastembed::EmbeddingModel::MultilingualE5Small,
+            SelectedModel::BGEM3 => fastembed::EmbeddingModel::BGEM3,
+        }
+    }
+}
+
+fn selected_model() -> SelectedModel {
+    static CACHED: OnceLock<SelectedModel> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("MEMORYPILOT_EMBED_MODEL")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("e5-large") | Some("multilingual-e5-large") | Some("large") => {
+                SelectedModel::E5Large
+            }
+            Some("e5-base") | Some("multilingual-e5-base") | Some("base") => SelectedModel::E5Base,
+            Some("bge-m3") | Some("bgem3") | Some("baai/bge-m3") => SelectedModel::BGEM3,
+            // Default: small multilingual model. The big cousins
+            // (e5-large, BGE-M3) add only +3-6 pp R@5 on
+            // memorypilot-fr-v2 once the cross-encoder rerank kicks
+            // in, but cost ~1.4 GB extra resident RAM, ~30 ms per
+            // embedding and an order-of-magnitude longer LongMemEval
+            // run. Power users can opt in via `MEMORYPILOT_EMBED_MODEL`,
+            // the default stays sensible for a local-first MCP server.
+            _ => SelectedModel::E5Small,
+        }
+    })
+}
+
+/// Active embedding dimension. Cheap to call (one atomic load).
+pub fn vector_dim() -> usize {
+    selected_model().dim()
+}
+
+/// Length of the int8-quantized blob written to SQLite (4-byte scale + dim i8 bytes).
+pub fn quantized_blob_len() -> usize {
+    4 + vector_dim()
+}
 
 /// Pool of fastembed model instances.
 ///
@@ -21,14 +96,15 @@ const F32_BLOB_LEN: usize = VECTOR_DIM * 4;
 /// independent ONNX sessions and hands them out one at a time. A
 /// lightweight Condvar wakeup avoids busy spinning.
 ///
-/// Memory footprint: each session loads the multilingual-e5-small ONNX
-/// graph (~120 MB on disk) into a CPU runtime, but the arena allocator
-/// inflates the resident set to roughly 700 MB–1 GB once the session
-/// has run a few real batches. Sizing the pool at 4 keeps us under
-/// ~3.5 GB resident under steady state, which is the right operating
-/// point for a local-first server. Users who care about throughput
-/// more than RAM can opt into a bigger pool via the env var (capped
-/// at 8 to keep memory predictable).
+/// Memory footprint depends on the selected model. multilingual-e5-large
+/// (default, 1024-dim) is ~1.4 GB per session resident once the arena
+/// has stabilised; the smaller `multilingual-e5-small` (384-dim) is
+/// closer to ~700 MB. The pool default of 4 keeps us under ~6 GB
+/// resident with the large model and ~3.5 GB with the small model,
+/// which is the right operating point for a local-first server.
+/// Users who care about throughput more than RAM can opt into a
+/// bigger pool via `MEMORYPILOT_EMBED_POOL_SIZE` (capped at 8 to
+/// keep memory predictable).
 struct EmbedPool {
     available: Mutex<Vec<fastembed::TextEmbedding>>,
     notify: Condvar,
@@ -47,11 +123,18 @@ fn fastembed_cache_dir() -> std::path::PathBuf {
 }
 
 fn build_model() -> fastembed::TextEmbedding {
-    let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
-        .with_show_download_progress(false)
+    let model = selected_model();
+    let opts = fastembed::InitOptions::new(model.fastembed())
+        .with_show_download_progress(true)
         .with_cache_dir(fastembed_cache_dir());
     fastembed::TextEmbedding::try_new(opts)
-        .expect("[MemoryPilot] fastembed init failed — cannot start without embedding engine")
+        .unwrap_or_else(|error| {
+            panic!(
+                "[MemoryPilot] fastembed init failed for model {:?}: {} — \
+                 cannot start without embedding engine",
+                model, error
+            )
+        })
 }
 
 fn embed_pool() -> &'static EmbedPool {
@@ -116,7 +199,7 @@ pub fn embed_text(text: &str) -> Vec<f32> {
         .model()
         .embed(vec![text], None)
         .expect("fastembed embed failed");
-    embeddings.pop().unwrap_or_else(|| vec![0.0; VECTOR_DIM])
+    embeddings.pop().unwrap_or_else(|| vec![0.0; vector_dim()])
 }
 
 pub fn embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
@@ -144,12 +227,13 @@ pub fn rrf_score(bm25_rank: usize, vector_rank: usize) -> f64 {
     (1.0 / (k + bm25_rank as f64)) + (1.0 / (k + vector_rank as f64))
 }
 
-/// Quantize a normalized embedding to 4-byte scale + 384 i8 bytes (388 bytes total).
-/// E5 embeddings are L2-normalized so values fit in [-1, 1]; int8 keeps ~3 decimals.
+/// Quantize a normalized embedding to 4-byte scale + N i8 bytes
+/// (4 + dim bytes total). E5 embeddings are L2-normalized so values
+/// fit in [-1, 1]; int8 keeps ~3 decimals.
 pub fn quantize_to_blob(v: &[f32]) -> Vec<u8> {
     let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-    let mut out = Vec::with_capacity(QUANTIZED_BLOB_LEN);
+    let mut out = Vec::with_capacity(4 + v.len());
     out.extend_from_slice(&scale.to_le_bytes());
     for &x in v {
         let q = (x / scale).round().clamp(-127.0, 127.0) as i8;
@@ -158,8 +242,8 @@ pub fn quantize_to_blob(v: &[f32]) -> Vec<u8> {
     out
 }
 
-fn dequantize_from_blob(blob: &[u8]) -> Vec<f32> {
-    if blob.len() != QUANTIZED_BLOB_LEN {
+fn dequantize_from_blob(blob: &[u8], dim: usize) -> Vec<f32> {
+    if blob.len() != 4 + dim {
         return Vec::new();
     }
     let scale = f32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
@@ -174,12 +258,23 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     quantize_to_blob(v)
 }
 
-/// Auto-detect blob format and decode to f32. Supports both quantized int8 (388 bytes)
-/// and legacy f32 (1536 bytes) layouts so existing databases keep working.
+/// Auto-detect blob format and decode to f32. Supports the active
+/// model's int8 layout (4 + dim bytes) plus the legacy small-model
+/// formats (388 bytes int8, 1536 bytes f32) so older databases keep
+/// returning vectors during the one-shot re-embed pass triggered by
+/// `--backfill-force` after a model swap. A vector returned from a
+/// legacy layout is dimensionally incompatible with the active query
+/// vector — `similarity_with_blob` and `cosine_similarity` already
+/// short-circuit on length mismatch, so legacy rows transparently
+/// score 0 until the backfill rewrites them.
 pub fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
+    let active = quantized_blob_len();
     match blob.len() {
-        QUANTIZED_BLOB_LEN => dequantize_from_blob(blob),
-        F32_BLOB_LEN => blob
+        len if len == active => dequantize_from_blob(blob, vector_dim()),
+        LEGACY_SMALL_QUANTIZED_BLOB_LEN if active != LEGACY_SMALL_QUANTIZED_BLOB_LEN => {
+            dequantize_from_blob(blob, LEGACY_SMALL_DIM)
+        }
+        LEGACY_SMALL_F32_BLOB_LEN => blob
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
@@ -190,7 +285,9 @@ pub fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
 /// Fast similarity directly from blob, avoiding the intermediate Vec allocation.
 /// Falls back to the regular cosine path for legacy f32 blobs or unknown layouts.
 pub fn similarity_with_blob(query: &[f32], blob: &[u8]) -> f32 {
-    if query.len() == VECTOR_DIM && blob.len() == QUANTIZED_BLOB_LEN {
+    let active_dim = vector_dim();
+    let active_blob_len = quantized_blob_len();
+    if query.len() == active_dim && blob.len() == active_blob_len {
         let scale = f32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
         let mut sum = 0.0f32;
         for (q, &b) in query.iter().zip(blob[4..].iter()) {
@@ -224,7 +321,7 @@ mod tests {
     fn test_blob_roundtrip() {
         let v = embed_text("test embedding roundtrip");
         let blob = vec_to_blob(&v);
-        assert_eq!(blob.len(), QUANTIZED_BLOB_LEN);
+        assert_eq!(blob.len(), quantized_blob_len());
         let restored = blob_to_vec(&blob);
         assert_eq!(v.len(), restored.len());
         let mut max_err = 0.0f32;
@@ -258,12 +355,18 @@ mod tests {
 
     #[test]
     fn test_legacy_f32_blob_still_readable() {
-        let v = embed_text("legacy compatibility check");
-        let legacy_blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
-        assert_eq!(legacy_blob.len(), F32_BLOB_LEN);
+        // Legacy f32 layout was small-model only (1536 bytes = 384 × 4).
+        // The decoder must keep returning a 384-dim vector regardless
+        // of the active model so older databases survive an upgrade
+        // until `--backfill-force` rewrites them.
+        let synthetic: Vec<f32> = (0..LEGACY_SMALL_DIM)
+            .map(|i| (i as f32 / LEGACY_SMALL_DIM as f32) - 0.5)
+            .collect();
+        let legacy_blob: Vec<u8> = synthetic.iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert_eq!(legacy_blob.len(), LEGACY_SMALL_F32_BLOB_LEN);
         let restored = blob_to_vec(&legacy_blob);
-        assert_eq!(v.len(), restored.len());
-        for (a, b) in v.iter().zip(restored.iter()) {
+        assert_eq!(restored.len(), LEGACY_SMALL_DIM);
+        for (a, b) in synthetic.iter().zip(restored.iter()) {
             assert!((a - b).abs() < 1e-7);
         }
     }
