@@ -150,6 +150,26 @@ pub struct Database {
     conn: Connection,
     read_pool: Vec<Mutex<Connection>>,
     ann: Option<Arc<crate::ann::AnnIndex>>,
+    /// Set to `true` once the detached `spawn_ann_warmup` thread has
+    /// finished hydrating the in-memory ANN index from SQLite. Lets
+    /// callers opt into a deterministic search path via
+    /// [`Database::wait_for_ann_warm`] / [`Database::open_at_warm`]
+    /// without paying that cost on the default `open_at`.
+    ann_warm_complete: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// RAII helper used by the ANN warm-up thread: ensures the
+/// completion flag is published exactly once, no matter which exit
+/// path the worker takes (success, prepare failure, query failure).
+struct WarmupGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for WarmupGuard {
+    fn drop(&mut self) {
+        self.flag
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl Database {
@@ -171,18 +191,59 @@ impl Database {
         let ann = Self::open_ann_index(path);
         set_embed_ann_index(ann.clone());
 
+        let ann_warm_complete = Arc::new(std::sync::atomic::AtomicBool::new(
+            ann.as_ref().map(|index| !index.is_empty()).unwrap_or(true),
+        ));
         let db = Self {
             conn,
             read_pool,
             ann: ann.clone(),
+            ann_warm_complete: ann_warm_complete.clone(),
         };
         db.init_schema()?;
         db.upgrade_schema()?;
         db.normalize_project_identities()?;
         let _ = db.backfill_embeddings();
         let _ = db.migrate_fts_to_stemmed();
-        Self::spawn_ann_warmup(ann, path.to_path_buf());
+        Self::spawn_ann_warmup(ann, path.to_path_buf(), ann_warm_complete);
         Ok(db)
+    }
+
+    /// Open the database **and block until the ANN index is fully
+    /// hydrated in RAM**. The non-warm `open_at` returns immediately
+    /// and lets the SQL fallback serve the first few searches while
+    /// the ANN thread catches up — fine for an interactive process,
+    /// but disastrous for two specific scenarios:
+    ///
+    /// - benchmarks, where intermittent ANN hydration causes scoring
+    ///   to flicker between the ANN-pruned path and the full SQL scan
+    ///   (the source of the ±10pp variance on `--benchmark-fr`),
+    /// - cold-start sensitive workloads where the first 5 queries
+    ///   per process were paying the warm-up tail (p99 ~6 s in the
+    ///   concurrency bench).
+    ///
+    /// `open_at_warm` pays the warm-up upfront. Returns the same
+    /// `Database` handle as `open_at` once the index is ready.
+    pub fn open_at_warm(path: &Path) -> Result<Self, String> {
+        let db = Self::open_at(path)?;
+        db.wait_for_ann_warm(std::time::Duration::from_secs(120));
+        Ok(db)
+    }
+
+    /// Block until the detached ANN warm-up thread reports completion
+    /// (or `timeout` elapses). Cheap polling — we only spin every 25 ms
+    /// because the warm-up pass is bottlenecked on SQLite I/O, not on
+    /// the polling loop. Returns `true` if the warm-up finished within
+    /// the budget, `false` on timeout.
+    pub fn wait_for_ann_warm(&self, timeout: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        while !self.ann_warm_complete.load(std::sync::atomic::Ordering::Acquire) {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        true
     }
 
     /// One-shot migration that rewrites every memory's FTS5 entry to
@@ -248,17 +309,31 @@ impl Database {
 
     /// Hydrate the ANN index in a detached worker so `open_at` does not pay the
     /// upfront I/O cost. Until warm-up finishes, searches transparently fall
-    /// back to the deterministic SQL scan path.
-    fn spawn_ann_warmup(ann: Option<Arc<crate::ann::AnnIndex>>, db_path: PathBuf) {
+    /// back to the deterministic SQL scan path. The `complete` flag is set
+    /// once the worker exits so [`Database::wait_for_ann_warm`] can block on
+    /// it for benchmarks and cold-start-sensitive workloads.
+    fn spawn_ann_warmup(
+        ann: Option<Arc<crate::ann::AnnIndex>>,
+        db_path: PathBuf,
+        complete: Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let Some(index) = ann else {
+            complete.store(true, std::sync::atomic::Ordering::Release);
             return;
         };
         if !index.is_empty() {
+            complete.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
         std::thread::Builder::new()
             .name("memorypilot-ann-warmup".into())
             .spawn(move || {
+                // Always mark complete on exit, even on early returns,
+                // so callers blocking on `wait_for_ann_warm` are never
+                // stranded if the SQL probe fails for any reason.
+                let _guard = WarmupGuard {
+                    flag: complete.clone(),
+                };
                 let conn = match Connection::open(&db_path) {
                     Ok(conn) => conn,
                     Err(_) => return,
@@ -1872,6 +1947,31 @@ impl Database {
         metadata: Option<&serde_json::Value>,
         scope: &MemoryScope,
     ) -> Result<(Memory, bool), String> {
+        self.add_memory_with_id(
+            None, content, kind, project, tags, source, importance, expires_at, metadata, scope,
+        )
+    }
+
+    /// Same as [`Self::add_memory`] but lets the caller pin the row's
+    /// primary key. Used by benchmarks (and only by benchmarks) so that
+    /// the memory id is reproducible across runs — without it, the
+    /// random UUID drives the deterministic id-based tie-break we now
+    /// apply in `search`, which produced visible run-to-run variance
+    /// on `--benchmark-fr`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_memory_with_id(
+        &self,
+        explicit_id: Option<&str>,
+        content: &str,
+        kind: &str,
+        project: Option<&str>,
+        tags: &[String],
+        source: &str,
+        importance: i32,
+        expires_at: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        scope: &MemoryScope,
+    ) -> Result<(Memory, bool), String> {
         let canonical_project = Self::canonical_project(project);
         let scoped_metadata = Self::apply_scope_to_metadata(metadata, scope);
         // Check for near-duplicate
@@ -1903,7 +2003,9 @@ impl Database {
             return Ok((updated.unwrap_or(existing), true));
         }
 
-        let id = Uuid::new_v4().to_string();
+        let id = explicit_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let now = Utc::now().to_rfc3339();
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         let meta_json = scoped_metadata
@@ -2716,7 +2818,18 @@ impl Database {
             rrf_scores.push((id.clone(), score));
         }
 
-        rrf_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Deterministic tie-break on the memory id. Without it, two
+        // candidates that happen to score identically (a common case
+        // when the cross-encoder normalises into a small dynamic
+        // range) would be ordered by the unstable HashMap iteration
+        // order, producing different top-K from one process to the
+        // next on the same input. The id-based break costs nothing
+        // and turns the bench output into a reproducible artefact.
+        rrf_scores.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         let mut results: Vec<SearchResult> = Vec::new();
         let session_candidate_limit = if crate::session_fusion::should_expand_candidates(query) {

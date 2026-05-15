@@ -17,11 +17,18 @@ const F32_BLOB_LEN: usize = VECTOR_DIM * 4;
 /// embed() call. That is a hard ceiling on concurrent throughput in MCP
 /// servers that handle several clients in parallel.
 ///
-/// `EmbedPool` keeps `MEMPILOT_EMBED_POOL_SIZE` (default: number of CPUs
-/// capped at 4) independent ONNX sessions and hands them out one at a
-/// time. A lightweight Condvar wakeup avoids busy spinning. Each session
-/// is ~95 MB of resident memory, so the pool is small by default; users
-/// who care about throughput more than RAM can opt into a bigger pool.
+/// `EmbedPool` keeps `MEMORYPILOT_EMBED_POOL_SIZE` (default: 4)
+/// independent ONNX sessions and hands them out one at a time. A
+/// lightweight Condvar wakeup avoids busy spinning.
+///
+/// Memory footprint: each session loads the multilingual-e5-small ONNX
+/// graph (~120 MB on disk) into a CPU runtime, but the arena allocator
+/// inflates the resident set to roughly 700 MB–1 GB once the session
+/// has run a few real batches. Sizing the pool at 4 keeps us under
+/// ~3.5 GB resident under steady state, which is the right operating
+/// point for a local-first server. Users who care about throughput
+/// more than RAM can opt into a bigger pool via the env var (capped
+/// at 8 to keep memory predictable).
 struct EmbedPool {
     available: Mutex<Vec<fastembed::TextEmbedding>>,
     notify: Condvar,
@@ -49,10 +56,15 @@ fn build_model() -> fastembed::TextEmbedding {
 
 fn embed_pool() -> &'static EmbedPool {
     EMBED_POOL.get_or_init(|| {
+        // Default of 4: matches the comment, mirrors the read pool
+        // sizing that empirically saturates SQLite WAL on a 4-core
+        // worker, and keeps RAM under ~3.5 GB on the concurrency
+        // bench. Going to 8 only gives marginal extra throughput
+        // (the cross-encoder mutex becomes the next bottleneck).
         let pool_size = std::env::var("MEMORYPILOT_EMBED_POOL_SIZE")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+            .unwrap_or(4)
             .clamp(1, 8);
 
         let mut models = Vec::with_capacity(pool_size);

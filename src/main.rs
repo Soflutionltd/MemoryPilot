@@ -13,7 +13,6 @@ mod graph;
 #[cfg(feature = "http")]
 mod http;
 mod protocol;
-mod query_expansion;
 mod reranking;
 mod session_capsule;
 mod session_export;
@@ -687,24 +686,28 @@ fn run_benchmark_concurrency(args: &[String]) {
             .collect(),
     );
 
-    // Warm up the lazy fastembed ONNX model and the in-process ANN index on
-    // the main thread so the first search of every worker does not eat the
-    // one-time init/warm costs.
-    eprintln!("[Concurrency] Warming up embedding model and ANN...");
+    // Warm up the lazy fastembed ONNX model, the cross-encoder and the
+    // in-process ANN index on the main thread so the first search of
+    // every worker does not eat the one-time init/warm costs.
+    eprintln!("[Concurrency] Warming up embedding model, cross-encoder and ANN...");
     {
-        let warm_db = match db::Database::open_at(&db_path) {
+        // open_at_warm blocks until the ANN index is fully hydrated in
+        // RAM, so workers no longer race the warm-up thread on their
+        // first few searches (the source of the previous p99 ~6 s tail).
+        let warm_db = match db::Database::open_at_warm(&db_path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("✗ warm open_at failed: {}", e);
+                eprintln!("✗ warm open_at_warm failed: {}", e);
                 std::process::exit(1);
             }
         };
+        // Force fastembed to load by running a few real queries, and
+        // pre-hydrate the cross-encoder so adaptive-mode queries don't
+        // trigger the 1.1 GB ONNX model load on the hot path.
         for q in queries.iter().take(10) {
             let _ = warm_db.search(q, 10, None, None, None, None);
         }
-        // Give the detached ANN warm-up thread time to persist its index
-        // before workers open their own handles.
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        reranking::warmup_cross_reranker();
     }
 
     eprintln!(
@@ -720,7 +723,11 @@ fn run_benchmark_concurrency(args: &[String]) {
         handles.push(std::thread::spawn(move || {
             // Each worker opens its own Database handle (mirrors a multi-worker
             // HTTP server where every request handler holds a connection).
-            let db = match db::Database::open_at(&db_path_clone) {
+            // open_at_warm blocks until the per-handle ANN cache is hydrated,
+            // but on the second-and-Nth open the index is already in RAM
+            // (shared via Arc) so this returns immediately — we just inherit
+            // the deterministic search path from the very first query.
+            let db = match db::Database::open_at_warm(&db_path_clone) {
                 Ok(d) => d,
                 Err(_) => return (Vec::new(), qpc),
             };

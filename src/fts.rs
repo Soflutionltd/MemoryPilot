@@ -63,38 +63,16 @@ pub fn fts5_query_variants(query: &str) -> Vec<(String, &'static str)> {
     variants
 }
 
-/// Build the synonym/expansion FTS5 variants for a query. Returned
-/// separately from [`fts5_query_variants`] because callers run them
-/// **lazily**: only when the primary BM25 lane underperforms (empty
-/// or shallow candidate pool). Eagerly OR-ing synonyms into every
-/// query measurably hurts precision on the FR bench (R@5 -3pp on
-/// memorypilot-fr-30) — it is a recall-only tool. Currently dormant
-/// in `db.rs::search` (cross-encoder rerank handles the same problem
-/// more reliably); kept here for HTTP/CLI callers that want it.
-#[allow(dead_code)]
-pub fn fts5_synonym_variants(query: &str) -> Vec<(String, &'static str)> {
-    let mut variants: Vec<(String, &'static str)> = Vec::new();
-    let expansion_terms = crate::query_expansion::expand(query);
-    if expansion_terms.is_empty() {
-        return variants;
-    }
-    let joined = expansion_terms.join(" ");
-    if let Some(expanded) = sanitize_fts5_query(&joined) {
-        variants.push((expanded, "fts_synonym"));
-    }
-    let stemmed_expansion = crate::stemming::stem_query(&joined);
-    if !stemmed_expansion.is_empty() {
-        if let Some(expanded_stem) = sanitize_fts5_query(&stemmed_expansion) {
-            if !variants
-                .iter()
-                .any(|(existing, _)| existing == &expanded_stem)
-            {
-                variants.push((expanded_stem, "fts_synonym_stem"));
-            }
-        }
-    }
-    variants
-}
+// NOTE: a lexical synonym-expansion lane (`fts5_synonym_variants` plus
+// a curated FR/EN tech thesaurus) was implemented and benchmarked.
+// All three feeding strategies (eager OR, penalised rank, candidate-only
+// for the vector lane) regressed precision on memorypilot-fr-v2 because
+// generic tech synonyms inflate BM25 noise on small corpora. The
+// cross-encoder (jina-v2-multilingual, mode `adaptive`) closes the same
+// recall gap with a much better precision/latency trade-off, so the
+// dictionary lane was removed in favour of dead-code-free retrieval.
+// See git history for the experiment commits if a future iteration
+// wants to revisit pseudo-relevance feedback.
 
 #[allow(dead_code)]
 pub fn lexical_terms(query: &str) -> Vec<String> {
