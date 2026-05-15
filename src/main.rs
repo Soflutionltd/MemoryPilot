@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
-
+mod ann;
 mod chunker;
+mod code_chunker;
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
 /// (c) SOFLUTION LTD — Apache 2.0 License
@@ -17,8 +18,11 @@ mod session_capsule;
 mod session_export;
 mod session_fusion;
 mod splitter;
+mod stemming;
+mod telemetry;
 mod tools;
 mod watcher;
+mod working_memory;
 
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde_json::json;
@@ -66,6 +70,18 @@ fn main() {
     }
     if args.iter().any(|a| a == "--benchmark-longmemeval") {
         run_benchmark_longmemeval(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--benchmark-fr") {
+        run_benchmark_fr(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--benchmark-latency") {
+        run_benchmark_latency(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--benchmark-concurrency") {
+        run_benchmark_concurrency(&args);
         return;
     }
     #[cfg(feature = "http")]
@@ -333,6 +349,468 @@ fn parse_percent(value: &str) -> Option<f64> {
     value.trim().trim_end_matches('%').parse::<f64>().ok()
 }
 
+fn run_benchmark_fr(args: &[String]) {
+    eprintln!("[BenchFR] Starting French retrieval benchmark...");
+    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
+    let min_r5 = args
+        .windows(2)
+        .find(|w| w[0] == "--min-r5")
+        .and_then(|w| parse_percent(&w[1]));
+    match db::Database::benchmark_fr() {
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+            );
+            if let Some(minimum) = min_r5 {
+                let actual = report
+                    .get("metrics")
+                    .and_then(|metrics| metrics.get("recall_at_5"))
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_percent);
+                match actual {
+                    Some(value) if value + f64::EPSILON >= minimum => {
+                        eprintln!("[BenchFR] Guard passed: R@5 {:.1}% >= {:.1}%", value, minimum);
+                    }
+                    Some(value) => {
+                        eprintln!(
+                            "✗ BenchFR guard failed: R@5 {:.1}% < {:.1}%",
+                            value, minimum
+                        );
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!("✗ BenchFR guard failed: missing R@5 metric");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("✗ BenchFR failed: {}", error);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_benchmark_latency(args: &[String]) {
+    use std::time::Instant;
+
+    let queries_count = args
+        .windows(2)
+        .find(|w| w[0] == "--queries")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(50);
+    let seed_memories = args
+        .windows(2)
+        .find(|w| w[0] == "--seed-memories")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(5_000);
+    let custom_db = args
+        .windows(2)
+        .find(|w| w[0] == "--db")
+        .map(|w| w[1].clone());
+
+    eprintln!("[Latency] Starting bench (queries={}, seed_memories={})", queries_count, seed_memories);
+
+    let tmp_dir = std::env::temp_dir().join(format!("memorypilot-latency-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let db_path = match &custom_db {
+        Some(p) => std::path::PathBuf::from(p),
+        None => tmp_dir.join("bench.db"),
+    };
+    let needs_seed = custom_db.is_none() || !db_path.exists();
+
+    if needs_seed {
+        eprintln!("[Latency] Seeding {} synthetic memories at {}...", seed_memories, db_path.display());
+        let seed_start = Instant::now();
+        let db = match db::Database::open_at(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("✗ open_at failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let topics = [
+            "rust async runtime", "tokio mutex deadlock", "sqlite wal checkpoint",
+            "fastembed onnx model", "knowledge graph entity link", "stripe webhook signature",
+            "supabase rls policy", "svelte runes derived", "tailwind responsive grid",
+            "cloudflare wrangler deploy", "embedding cosine similarity", "bm25 ranking function",
+            "hnsw ann index", "tree sitter rust parser", "ttl garbage collection",
+        ];
+        let scope = db::MemoryScope::default();
+        for i in 0..seed_memories {
+            let topic = &topics[i % topics.len()];
+            // Synthesize content unique enough to defeat the dedup pass.
+            let nonce_a: u64 = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1);
+            let nonce_b: u64 = 0xBF58_476D_1CE4_E5B9u64.wrapping_mul(i as u64 + 7);
+            let content = format!(
+                "Memory #{} about {} (run-id {:016x}-{:016x}): unique entry detailing how {} \
+                 interacts with subsystem #{} under condition {}, batch {}, slot {}, scenario {}.",
+                i,
+                topic,
+                nonce_a,
+                nonce_b,
+                topic,
+                i % 257,
+                i % 91,
+                i / 500,
+                i % 13,
+                i.wrapping_mul(31)
+            );
+            let _ = db.add_memory(
+                &content,
+                "note",
+                Some("bench"),
+                &[topic.to_string(), format!("batch-{}", i / 500)],
+                "bench-latency",
+                3,
+                None,
+                None,
+                &scope,
+            );
+        }
+        let seed_ms = seed_start.elapsed().as_millis();
+        eprintln!("[Latency] Seed done in {} ms. Closing.", seed_ms);
+        drop(db);
+        // Wait briefly for async embed worker so the warm-up has real data.
+        eprintln!("[Latency] Waiting 8s for async embedding worker to populate vectors...");
+        std::thread::sleep(std::time::Duration::from_secs(8));
+    }
+
+    // Optional flag: clear persisted ANN to force a cold warm-up (useful to
+    // benchmark warm sync vs warm async startup paths).
+    if args.iter().any(|a| a == "--clear-ann") {
+        let mut ann_file = db_path.clone();
+        let ann_name = ann_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{}.ann.usearch", n))
+            .unwrap_or_default();
+        ann_file.set_file_name(&ann_name);
+        let _ = std::fs::remove_file(&ann_file);
+        let mut keys_file = ann_file.clone();
+        keys_file.set_file_name(format!("{}.keys.json", ann_name));
+        let _ = std::fs::remove_file(&keys_file);
+        eprintln!("[Latency] Cleared persisted ANN at {}", ann_file.display());
+    }
+
+    eprintln!("[Latency] Measuring open_at() startup...");
+    let open_start = Instant::now();
+    let db = match db::Database::open_at(&db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("✗ open_at failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let open_ms = open_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[Latency] open_at: {:.2} ms", open_ms);
+
+    let queries: Vec<String> = (0..queries_count)
+        .map(|i| {
+            let topics = [
+                "rust async runtime tokio", "sqlite wal mode performance",
+                "fastembed multilingual model", "knowledge graph entity",
+                "stripe webhook validation", "supabase row level security",
+                "svelte 5 runes pattern", "tailwind grid responsive",
+                "hnsw approximate nearest neighbor", "bm25 fts5 ranking",
+                "embedding cosine vector search", "tree sitter parser",
+            ];
+            format!("{} variant {}", topics[i % topics.len()], i)
+        })
+        .collect();
+
+    eprintln!("[Latency] Cold pass ({} queries, embed cache MISS expected)...", queries.len());
+    let mut cold_times = Vec::with_capacity(queries.len());
+    for q in &queries {
+        let t = Instant::now();
+        let _ = db.search(q, 10, None, None, None, None);
+        cold_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    eprintln!("[Latency] Warm pass (same queries, embed cache HIT expected)...");
+    let mut warm_times = Vec::with_capacity(queries.len());
+    for q in &queries {
+        let t = Instant::now();
+        let _ = db.search(q, 10, None, None, None, None);
+        warm_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let cold_stats = percentiles(&mut cold_times);
+    let warm_stats = percentiles(&mut warm_times);
+    let speedup = if warm_stats.p50 > 0.0 {
+        cold_stats.p50 / warm_stats.p50
+    } else {
+        0.0
+    };
+
+    let report = serde_json::json!({
+        "config": {
+            "queries": queries_count,
+            "seed_memories": if needs_seed { seed_memories } else { 0 },
+            "db_path": db_path.display().to_string(),
+            "user_provided_db": custom_db.is_some(),
+            "seeded_this_run": needs_seed,
+        },
+        "open_at_ms": format!("{:.2}", open_ms),
+        "cold_search_ms": {
+            "p50": format!("{:.2}", cold_stats.p50),
+            "p95": format!("{:.2}", cold_stats.p95),
+            "p99": format!("{:.2}", cold_stats.p99),
+            "avg": format!("{:.2}", cold_stats.avg),
+        },
+        "warm_search_ms": {
+            "p50": format!("{:.2}", warm_stats.p50),
+            "p95": format!("{:.2}", warm_stats.p95),
+            "p99": format!("{:.2}", warm_stats.p99),
+            "avg": format!("{:.2}", warm_stats.avg),
+        },
+        "cache_speedup_x": format!("{:.2}", speedup),
+    });
+
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+    if custom_db.is_none() {
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+}
+
+fn run_benchmark_concurrency(args: &[String]) {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let client_count = args
+        .windows(2)
+        .find(|w| w[0] == "--clients")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(8);
+    let queries_per_client = args
+        .windows(2)
+        .find(|w| w[0] == "--queries-per-client")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(50);
+    let seed_memories = args
+        .windows(2)
+        .find(|w| w[0] == "--seed-memories")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(2_000);
+
+    eprintln!(
+        "[Concurrency] Starting bench (clients={}, queries_per_client={}, seed={})",
+        client_count, queries_per_client, seed_memories
+    );
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "memorypilot-concurrency-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let db_path = tmp_dir.join("bench.db");
+
+    eprintln!("[Concurrency] Seeding {} synthetic memories...", seed_memories);
+    let seed_start = Instant::now();
+    {
+        let db = match db::Database::open_at(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("✗ open_at failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let topics = [
+            "rust async runtime", "tokio mutex deadlock", "sqlite wal checkpoint",
+            "fastembed onnx model", "knowledge graph entity", "stripe webhook",
+            "supabase rls policy", "svelte runes", "tailwind grid",
+            "cloudflare wrangler", "embedding cosine", "bm25 ranking",
+            "hnsw ann index", "tree sitter parser", "ttl garbage collection",
+        ];
+        let scope = db::MemoryScope::default();
+        for i in 0..seed_memories {
+            let topic = &topics[i % topics.len()];
+            let nonce: u64 = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1);
+            let content = format!(
+                "Memory #{} about {} (uniq {:016x}): detailed scenario {} variant {}.",
+                i, topic, nonce, i % 257, i.wrapping_mul(31)
+            );
+            let _ = db.add_memory(&content, "note", Some("bench"), &[topic.to_string()],
+                "bench-concurrency", 3, None, None, &scope);
+        }
+        eprintln!("[Concurrency] Seed done in {:.1}s", seed_start.elapsed().as_secs_f64());
+        eprintln!("[Concurrency] Waiting for embed worker to fully drain...");
+        let wait_start = Instant::now();
+        loop {
+            let probe = match rusqlite::Connection::open(&db_path) {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let _ = probe.busy_timeout(std::time::Duration::from_secs(2));
+            let pending: i64 = probe
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE embedding IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(-1);
+            if pending == 0 {
+                break;
+            }
+            if wait_start.elapsed().as_secs() > 600 {
+                eprintln!("[Concurrency] Timeout: {} embeddings still pending", pending);
+                break;
+            }
+            if wait_start.elapsed().as_millis() % 5000 < 250 && pending > 0 {
+                eprintln!("  ... {} pending after {:.0}s", pending, wait_start.elapsed().as_secs_f64());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        eprintln!(
+            "[Concurrency] Embed worker drained in {:.1}s.",
+            wait_start.elapsed().as_secs_f64()
+        );
+    }
+
+    let queries: Arc<Vec<String>> = Arc::new(
+        (0..queries_per_client * 4)
+            .map(|i| {
+                let topics = [
+                    "rust async tokio", "sqlite wal performance",
+                    "fastembed multilingual", "knowledge graph",
+                    "stripe webhook validation", "supabase row level security",
+                    "svelte 5 runes pattern", "tailwind responsive",
+                    "hnsw approximate nearest neighbor", "bm25 fts5",
+                    "embedding cosine search", "tree sitter parser",
+                ];
+                format!("{} variant {}", topics[i % topics.len()], i)
+            })
+            .collect(),
+    );
+
+    // Warm up the lazy fastembed ONNX model, the cross-encoder and the
+    // in-process ANN index on the main thread so the first search of
+    // every worker does not eat the one-time init/warm costs.
+    eprintln!("[Concurrency] Warming up embedding model, cross-encoder and ANN...");
+    {
+        // open_at_warm blocks until the ANN index is fully hydrated in
+        // RAM, so workers no longer race the warm-up thread on their
+        // first few searches (the source of the previous p99 ~6 s tail).
+        let warm_db = match db::Database::open_at_warm(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("✗ warm open_at_warm failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        // Force fastembed to load by running a few real queries, and
+        // pre-hydrate the cross-encoder so adaptive-mode queries don't
+        // trigger the 1.1 GB ONNX model load on the hot path.
+        for q in queries.iter().take(10) {
+            let _ = warm_db.search(q, 10, None, None, None, None);
+        }
+        reranking::warmup_cross_reranker();
+    }
+
+    eprintln!(
+        "[Concurrency] Launching {} clients × {} queries in parallel (each opens its own DB handle)...",
+        client_count, queries_per_client
+    );
+    let bench_start = Instant::now();
+    let mut handles = Vec::with_capacity(client_count);
+    for client_id in 0..client_count {
+        let queries_handle = Arc::clone(&queries);
+        let qpc = queries_per_client;
+        let db_path_clone = db_path.clone();
+        handles.push(std::thread::spawn(move || {
+            // Each worker opens its own Database handle (mirrors a multi-worker
+            // HTTP server where every request handler holds a connection).
+            // open_at_warm blocks until the per-handle ANN cache is hydrated,
+            // but on the second-and-Nth open the index is already in RAM
+            // (shared via Arc) so this returns immediately — we just inherit
+            // the deterministic search path from the very first query.
+            let db = match db::Database::open_at_warm(&db_path_clone) {
+                Ok(d) => d,
+                Err(_) => return (Vec::new(), qpc),
+            };
+            let mut latencies = Vec::with_capacity(qpc);
+            let mut errors = 0usize;
+            for i in 0..qpc {
+                let q_index = (client_id * qpc + i) % queries_handle.len();
+                let q = &queries_handle[q_index];
+                let t = Instant::now();
+                match db.search(q, 10, None, None, None, None) {
+                    Ok(_) => {
+                        // Skip the first 5 queries per worker so we measure
+                        // steady-state and not the open_at + ANN warmup tail.
+                        if i >= 5 {
+                            latencies.push(t.elapsed().as_secs_f64() * 1000.0);
+                        }
+                    }
+                    Err(_) => errors += 1,
+                }
+            }
+            (latencies, errors)
+        }));
+    }
+
+    let mut all_latencies: Vec<f64> = Vec::with_capacity(client_count * queries_per_client);
+    let mut total_errors = 0usize;
+    for handle in handles {
+        let (latencies, errors) = handle.join().unwrap_or((Vec::new(), 0));
+        all_latencies.extend(latencies);
+        total_errors += errors;
+    }
+    let bench_ms = bench_start.elapsed().as_secs_f64() * 1000.0;
+
+    let stats = percentiles(&mut all_latencies);
+    let total_queries = client_count * queries_per_client;
+    let throughput = total_queries as f64 / (bench_ms / 1000.0);
+
+    let report = serde_json::json!({
+        "config": {
+            "clients": client_count,
+            "queries_per_client": queries_per_client,
+            "total_queries": total_queries,
+            "seed_memories": seed_memories,
+            "db_path": db_path.display().to_string(),
+        },
+        "results": {
+            "wall_clock_ms": format!("{:.2}", bench_ms),
+            "throughput_qps": format!("{:.1}", throughput),
+            "errors": total_errors,
+            "search_latency_ms": {
+                "p50": format!("{:.2}", stats.p50),
+                "p95": format!("{:.2}", stats.p95),
+                "p99": format!("{:.2}", stats.p99),
+                "avg": format!("{:.2}", stats.avg),
+            },
+        },
+    });
+
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
+struct Percentiles {
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    avg: f64,
+}
+
+fn percentiles(values: &mut [f64]) -> Percentiles {
+    if values.is_empty() {
+        return Percentiles { p50: 0.0, p95: 0.0, p99: 0.0, avg: 0.0 };
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pick = |p: f64| -> f64 {
+        let idx = ((values.len() as f64 - 1.0) * p).round() as usize;
+        values[idx.min(values.len() - 1)]
+    };
+    let avg = values.iter().sum::<f64>() / values.len() as f64;
+    Percentiles { p50: pick(0.50), p95: pick(0.95), p99: pick(0.99), avg }
+}
+
 fn print_help() {
     println!(
         "MemoryPilot v{} — MCP memory server with SQLite FTS5",
@@ -350,11 +828,17 @@ fn print_help() {
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");
+    println!("  MemoryPilot --benchmark-fr [--min-r5 PCT]  French retrieval benchmark (30 in-memory scenarios)");
+    println!("  MemoryPilot --benchmark-concurrency [--clients N] [--queries-per-client N] [--seed-memories N]  Multi-client concurrent search throughput");
+    println!("  MemoryPilot --benchmark-latency [--queries N] [--seed-memories N] [--db PATH]  Cold/warm search latency");
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot --help           Show this help");
     println!();
-    println!("MCP TOOLS (38):");
+    println!("MCP TOOLS (41):");
     println!("  recall              Load all context in one shot (start here)");
+    println!("  remember_working    Store ephemeral session scratchpad context");
+    println!("  recall_working      Recall current in-process working memory");
+    println!("  clear_working       Clear scoped working memory");
     println!("  get_project_brain   Instant project summary (<1500 tokens)");
     println!("  search_memory       Hybrid BM25 + fastembed RRF search");
     println!("  get_file_context    Memories related to recently modified files");

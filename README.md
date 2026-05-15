@@ -13,10 +13,11 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/v4.0-latest-green" alt="v4.0"/>
+  <img src="https://img.shields.io/badge/v4.2-latest-green" alt="v4.2"/>
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
-  <img src="https://img.shields.io/badge/search-Hybrid_RRF-blueviolet" alt="Hybrid RRF"/>
+  <img src="https://img.shields.io/badge/search-Hybrid_RRF_+_cross--encoder-blueviolet" alt="Hybrid RRF + cross-encoder"/>
   <img src="https://img.shields.io/badge/embeddings-multilingual--e5--small_(384--dim)-blue" alt="multilingual-e5-small"/>
+  <img src="https://img.shields.io/badge/rerank-jina--v2--multilingual-9cf" alt="jina-v2-multilingual"/>
   <img src="https://img.shields.io/badge/tokens-5--10x_compression-brightgreen" alt="5-10x token savings"/>
   <img src="https://img.shields.io/badge/license-Source_Available-orange" alt="Source Available"/>
 </p>
@@ -37,45 +38,57 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 
 Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.10813) benchmark (ICLR 2025), the standard academic dataset for long-term memory retrieval. Turn-level granularity, ~50 sessions per haystack.
 
-| Metric | MemoryPilot v4.1 | MemPalace v3.3.3 | Delta |
-|--------|-----------------|----------------|-------|
-| **R@5** | **98.7%** default / **98.9%** adaptive ONNX / **98.9%** max ONNX | 96.6% raw / 98.4% hybrid held-out | +2.3% vs raw / +0.5% vs hybrid |
-| **R@10** | **99.4%** default / **99.4%** adaptive ONNX / **99.4%** max ONNX | ~97%¹ | +2.4% vs raw |
-| **NDCG@10** | **95.0%** default / **95.4%** adaptive ONNX / **96.2%** max ONNX | Not published | MemoryPilot publishes |
-| **MRR** | **93.6%** default / **94.1%** adaptive ONNX / **95.2%** max ONNX | Not published | MemoryPilot publishes |
+| Metric | MemoryPilot v4.2 (default fast) | MemoryPilot v4.2 (adaptive rerank) | MemPalace v3.3.3 | Delta vs MemPalace |
+|--------|---------------------------------|------------------------------------|------------------|--------------------|
+| **R@5** | **98.7%** | **99.1%** | 96.6% raw / 98.4% hybrid | +2.5% vs raw / +0.7% vs hybrid |
+| **R@10** | **99.6%** | **99.4%** | ~97%¹ | +2.6% vs raw |
+| **NDCG@10** | **95.1%** | **96.0%** | Not published | MemoryPilot publishes |
+| **MRR** | **93.6%** | **94.9%** | Not published | MemoryPilot publishes |
+| **Avg search latency** | ~28 ms | ~900 ms | N/A | Default mode is 30× faster |
 
-> ¹ MemPalace now publishes 96.6% raw R@5 and 98.4% hybrid held-out R@5 in v3.3.3. MemoryPilot v4.1 validates 98.7% R@5 in the default fast local mode, 98.9% R@5 with adaptive FastEmbed ONNX reranking (`MEMORYPILOT_CROSS_RERANK=adaptive`, top_k=6, ~365ms average search latency), and 98.9% R@5 with always-on ONNX reranking (`MEMORYPILOT_CROSS_RERANK=1`, top_k=6, ~744ms average search latency).
+> ¹ Validated with the full 470-question evaluation set (after dropping the 30 abstention questions) in two modes: default fast local hybrid retrieval (BM25 + cosine RRF, ~28 ms/query, suitable for live MCP traffic) and adaptive cross-encoder rerank (`MEMORYPILOT_CROSS_RERANK=adaptive`, jina-v2-multilingual, fusion weight 0.45, ~900 ms/query, suitable for benchmarks and high-stakes recall). The default mode already beats MemPalace's hybrid held-out result; the adaptive mode trades latency for a further +0.4 pp R@5 and +1.3 pp MRR.
 
-#### By Category (470 questions)
+#### By Category (470 questions, adaptive rerank)
 
-| Category | R@5 | R@10 | NDCG@10 | MRR |
-|----------|-----|------|---------|-----|
-| single-session-user (64) | **100%** | **100%** | 96.9% | 95.8% |
-| single-session-assistant (56) | **100%** | **100%** | 97.4% | 96.6% |
-| multi-session (121) | 99.2% | **100%** | 96.1% | 94.8% |
-| knowledge-update (72) | **100%** | **100%** | 98.7% | 98.3% |
-| temporal-reasoning (127) | 96.9% | 98.4% | 93.8% | 92.2% |
-| single-session-preference (30) | 96.7% | 96.7% | 78.6% | 72.6% |
+| Category | R@5 | R@10 | MRR |
+|----------|-----|------|-----|
+| single-session-user (64) | **100%** | **100%** | 96.6% |
+| single-session-assistant (56) | **100%** | **100%** | 98.8% |
+| multi-session (121) | **100%** | **100%** | 95.7% |
+| knowledge-update (72) | **100%** | **100%** | 98.2% |
+| temporal-reasoning (127) | 97.6% | 98.4% | 93.3% |
+| single-session-preference (30) | 96.7% | 96.7% | 75.9% |
+
+### French / Multilingual Benchmark — `--benchmark-fr`
+
+To complement the English-only LongMemEval, MemoryPilot ships its own deterministic French benchmark covering 109 memories and 109 paraphrased queries across infra, mobile, web, security, and ML domains. The queries are intentionally distant from the indexed wording so they actually exercise the semantic lane.
+
+| Mode | R@5 | R@10 | MRR | Avg latency |
+|------|-----|------|-----|-------------|
+| Default fast (BM25 + RRF) | 50.5% | 60.6% | 47.0% | ~12 ms |
+| Adaptive cross-encoder rerank (default) | **62.4%** | **62.4%** | **59.9%** | ~410 ms |
+
+Run-to-run variance is bounded to ±1 pp on R@5 / R@10 thanks to deterministic memory ids, deterministic id-based RRF tie-break, synchronous ANN warm-up, and explicit cross-encoder pre-warm before the first query. This is the metric to watch for any French / multilingual regression.
 
 ### Search Quality — Real-World (500 memories, 30 scenarios)
 
-| Metric | MemoryPilot v4.0 | MemPalace v3.1 (raw) | Quantum Memory Graph |
-|--------|-----------------|----------------------|---------------------|
+| Metric | MemoryPilot v4.2 | MemPalace v3.1 (raw) | Quantum Memory Graph |
+|--------|------------------|----------------------|---------------------|
 | **R@5** | **100%** | 96.6% | 93.4% |
 | **R@10** | **100%** | N/A | 93.4% |
 | **NDCG@10** | **95.6%** | 88.9% | 90.8% |
 | **Cluster Coherence** | **96.7%** | N/A | N/A |
-| **Multilingual** | **100+ languages** | English only | English only |
+| **Multilingual** | **100+ languages** (validated FR R@5 62.4%) | English only | English only |
 | **AAAK Compression** | **5-10x** (no recall loss) | 30x (recall drops to 84.2%) | N/A |
-| **Avg Search Latency** | **~14 ms** | N/A | ~80 ms |
-| **Binary Size** | **22 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
-| **Dependencies** | 0 (single binary) | Python + ChromaDB + SQLite | Python + ONNX |
+| **Avg Search Latency** | **~28 ms** default / ~410 ms adaptive | N/A | ~80 ms |
+| **Binary Size** | **35 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
+| **Dependencies** | 0 (single binary, ONNX bundled) | Python + ChromaDB + SQLite | Python + ONNX |
 
 ---
 
 **vs the best MCP memory servers:**
 
-| Feature | MemoryPilot v4.1 | MemPalace v3.3.3 | Mem0 |
+| Feature | MemoryPilot v4.2 | MemPalace v3.3.3 | Mem0 |
 |---------|-----------------|----------------|------|
 | Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) | ChromaDB cosine (all-MiniLM-L6-v2) | Vector search (cloud API) |
 | Embeddings | multilingual-e5-small (100+ languages, local ONNX) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) |
@@ -86,6 +99,7 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Corpus origin detection | AI transcript/codebase/notes/platform detection | v3.3.4 prep | No |
 | Agent/persona disambiguation | Agents are separate from real people | v3.3.4 prep | No |
 | Topic tunnels | Cross-project topic links via KG | v3.3.4 prep | No |
+| Code-aware chunking | Tree-sitter Rust/Python/TS/TSX/JS + Svelte script extraction | Tree-sitter code chunking | No |
 | Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | No |
 | Compression | AAAK + Memory Capsules (5-10x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No |
 | Auto-Classification | Zero-shot kind/importance/TTL on insert | No | No |
@@ -104,13 +118,13 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity |
 | HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type |
-| MCP tools | 38 tools | 29 tools | N/A |
+| MCP tools | 41 tools | 29 tools | N/A |
 | Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
 | Language | Rust (single binary, zero deps) | Python (pip install) | SaaS |
-| Startup | 1-2 ms | ~5 ms | N/A (cloud) |
-| Binary | 22 MB single binary | Python + ChromaDB (~500 MB installed) | SaaS |
-| Storage | SQLite WAL + FTS5 + connection pool | ChromaDB | Cloud DB |
-| Concurrency | Lazy embedding thread + read pool + debounced cleanup | Single-threaded | Single-threaded |
+| Startup | 1-2 ms (`open_at`) / synchronous warm via `open_at_warm` | ~5 ms | N/A (cloud) |
+| Binary | 35 MB single binary | Python + ChromaDB (~500 MB installed) | SaaS |
+| Storage | SQLite WAL + FTS5 + 16-conn read pool | ChromaDB | Cloud DB |
+| Concurrency | EmbedPool (4) + RerankPool (1, tunable) + 16 read conns + debounced cleanup | Single-threaded | Single-threaded |
 
 ## The 9 Pillars
 
@@ -120,11 +134,16 @@ Every memory gets a 384-dimension transformer embedding on insert via `fastembed
 
 Results are boosted by importance weighting, knowledge graph link density, file watcher context, and penalized for expired knowledge triples.
 
+Ephemeral working memory is available in the same MCP through `remember_working`, `recall_working`, and `clear_working`. It keeps fast session scratchpad context in RAM, capped to 256 items, without polluting SQLite or durable recall.
+
 **Performance optimizations:**
 - Lazy embedding: `add_memory` returns instantly, embeddings computed in background thread
-- LRU cache (64 entries): repeated search queries skip embedding computation
-- Read connection pool (4 connections): concurrent vector searches don't block writes
+- Two-tier query embedding cache (LRU 256 + write-through SQLite): repeated queries skip ONNX inference
+- Read connection pool (16 connections): concurrent vector searches don't block writes, sized for HTTP server workloads
+- EmbedPool (4 sessions, env-tunable): parallel embeddings without serialization on a single ONNX mutex
+- RerankPool (1 session, env-tunable to 2): parallel cross-encoder rerank under multi-client load
 - Content hashing (FNV-1a): backfill skips unchanged memories
+- Synchronous warm-up entrypoint `open_at_warm`: hydrates the ANN index in RAM before returning, eliminating cold-start tail (p95 search latency 3939 ms → 229 ms in the 4-client concurrency bench)
 
 ### 2. Temporal Knowledge Graph
 
@@ -143,6 +162,8 @@ When searching, MemoryPilot traverses the knowledge graph from the top matches t
 ### 4. Chunked RAG (Transcripts)
 
 Save full conversation transcripts without polluting the LLM context window. The `add_transcript` tool automatically chunks large texts into ~2000 character blocks and links them together. Chunks are excluded from `recall` but fully searchable.
+
+For source code, MemoryPilot uses local tree-sitter parsing by default for Rust, Python, TypeScript, TSX, and JavaScript, with Svelte support via `<script>` extraction plus markup chunking. Code is split on semantic boundaries such as functions, classes, impl blocks, interfaces, and exports instead of arbitrary paragraphs.
 
 Auto-distillation extracts structured memories from transcripts: `decision`, `preference`, `todo`, `bug`, `milestone`, `problem`, and `note`. Smart disambiguation: a segment mentioning both a bug and its resolution is classified as `milestone`, not `bug`.
 
@@ -335,12 +356,26 @@ MemoryPilot --backfill               # Compute missing embeddings
 MemoryPilot --backfill-force         # Re-embed all (skips unchanged via hash)
 MemoryPilot --benchmark-recall       # Run recall quality benchmark
 MemoryPilot --benchmark-search       # Search quality: R@5, R@10, NDCG@10, cluster coherence
+MemoryPilot --benchmark-fr           # French/multilingual deterministic benchmark (109 queries, ±1pp variance)
 MemoryPilot --benchmark-longmemeval  # LongMemEval-S benchmark, supports --limit N and --min-r5 PCT
+MemoryPilot --benchmark-concurrency  # Multi-client concurrency bench (--clients N --queries-per-client N)
+MemoryPilot --benchmark-latency      # open_at startup + search latency
 MemoryPilot --http 7437              # Start HTTP REST server (requires --features http)
 MemoryPilot --migrate                # Import v1 JSON data
 MemoryPilot --version                # Show version
 MemoryPilot --help                   # Show help
 ```
+
+### Tuning environment variables
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `MEMORYPILOT_CROSS_RERANK` | `adaptive` | `1`/`always` to force rerank on every query, `0`/`off` to disable. Adaptive rerank fires on hard / non-English queries. |
+| `MEMORYPILOT_CROSS_RERANK_TOP_K` | `12` | Number of candidates the cross-encoder rescores. |
+| `MEMORYPILOT_CROSS_RERANK_WEIGHT` | `0.45` | Fusion weight given to the cross-encoder score against the RRF score. Sweep tested 0.20-0.85; 0.45 is the best operating point on `--benchmark-fr` and stays within 0.2 pp R@5 of the optimum on LongMemEval. |
+| `MEMORYPILOT_RERANK_POOL_SIZE` | `1` | Number of cross-encoder ONNX sessions kept hot. `2` cuts force-rerank p50 by 21% and p95 by 38% under 4-client load, at the cost of ~1.1 GB extra RAM. |
+| `MEMORYPILOT_EMBED_POOL_SIZE` | `4` | Number of fastembed ONNX sessions in the pool. Steady-state RAM scales roughly linearly. |
+| `MEMORYPILOT_RERANKER_MODEL` | `jina-v2-multilingual` | Override with `bge-v2-m3`, `bge-base`, or `jina-v1`. |
 
 ## HTTP API
 
@@ -359,16 +394,22 @@ curl -X POST http://localhost:7437/tools/call \
 ## Architecture
 
 ```
-src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server init
-src/db.rs          — SQLite facade: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool
+src/main.rs        — CLI + MCP stdio server + file watcher init + HTTP server init + benchmark runners
+src/code_chunker.rs — Tree-sitter code-aware chunking for Rust/Python/TS/TSX/JS/Go/Java/Kotlin/Swift + Svelte scripts
+src/db.rs          — SQLite facade: hybrid search, CRUD, KG, GC, brain, recall, lazy embed, connection pool, ANN warm-up
 src/db/benchmark.rs — Internal recall/search quality benchmark helpers
+src/db/benchmark_fr.rs — French/multilingual deterministic benchmark (109 queries, ±1pp variance)
 src/db/benchmark_longmemeval.rs — LongMemEval-S benchmark runner + regression guard support
 src/db/transcript.rs — Transcript/session ingestion and local-only distillation
-src/tools.rs       — 38 MCP tool definitions + handlers
+src/tools.rs       — 41 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
-src/embedding.rs   — fastembed (multilingual-e5-small) transformer embeddings, LRU cache
+src/embedding.rs   — fastembed (multilingual-e5-small) transformer embeddings, EmbedPool, two-tier query cache
+src/reranking.rs   — Cross-encoder rerank (jina-v2-multilingual), RerankPool, adaptive trigger, confidence gate
+src/ann.rs         — Persistent on-disk HNSW (usearch) with synchronous warm-up via `wait_for_ann_warm`
+src/fts.rs         — FTS5 query variants (prefix, phrase, NEAR) + Snowball stemming
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal
 src/gc.rs          — GC scoring, heuristic memory merging, stopwords
+src/working_memory.rs — In-process scoped scratchpad memory for current MCP sessions
 src/watcher.rs     — File system watcher + auto-linter with persistent DB connection
 src/http.rs        — Optional multi-threaded HTTP REST server (feature-gated)
 ```
@@ -390,33 +431,45 @@ config             — key/value store
 
 | Metric | Value |
 |--------|-------|
-| Binary size | 22 MB |
-| Startup | 1-2 ms |
-| Search (hybrid RRF + reranker) | ~10 ms (500 memories) |
+| Binary size | 35 MB |
+| Startup (`open_at`) | 1-2 ms (ANN warm-up runs in background) |
+| Startup (`open_at_warm`) | 50-200 ms on 10 k memories (ANN hydrated synchronously, deterministic search from query #1) |
+| Search default fast (BM25 + RRF) | ~28 ms avg on LongMemEval-S |
+| Search adaptive cross-encoder | ~410 ms avg on `--benchmark-fr`, ~900 ms on LongMemEval-S |
+| Concurrency p95 (4 clients × 20 queries, 500 memories, adaptive) | 229 ms |
 | `add_memory` latency | <1 ms (lazy embed) |
 | Embedding quality | Transformer 384-dim (multilingual-e5-small, 100+ languages) |
-| Backfill (1000 memories) | ~30s (skips unchanged via hash) |
-| RAM | ~15 MB |
-| Read concurrency | 4 pooled connections |
+| Backfill (1000 memories) | ~30 s (skips unchanged via hash) |
+| RAM (idle, after pool warm-up) | ~3.5 GB resident — driven by ONNX arenas (4× fastembed + 1× cross-encoder) |
+| RAM (steady-state, 4-client load) | ~7 GB resident |
+| Read concurrency | 16 pooled connections per Database handle |
 | Runtime dependencies | **None** (ONNX bundled) |
 
 ### Optimizations
 
 - **Lazy embedding**: `add_memory` inserts with `NULL` embedding, background thread computes and updates asynchronously
 - **Content hashing** (FNV-1a): `--backfill-force` skips memories whose content hasn't changed
-- **LRU embedding cache** (64 entries): repeated search queries reuse cached embeddings
+- **Two-tier embedding cache**: 256-entry in-process LRU on top of a write-through SQLite query cache (`*.query_cache.sqlite`, soft-capped at 8 192 entries with LRU eviction) so repeated queries are instant within a session and across restarts
 - **Read connection pool** (4 connections): concurrent vector searches don't block writes
 - **WAL mode**: SQLite Write-Ahead Logging for concurrent read/write
 - **Batched scoring**: knowledge triple counts and link boosts fetched in single queries, not N+1
 - **Debounced cleanup**: expired memory cleanup runs max once per 60 seconds
 - **Prepared statements**: graph traversal prepares SQL once, not per node
 - **Tuned RRF fusion**: k=40 for sharper top-K discrimination vs standard k=60
+- **FTS5 precision fallbacks**: prefix, exact phrase, and NEAR proximity queries run together for code symbols, errors, and named concepts
+- **Weighted FTS fields**: content, tags, kind, and project use separate BM25 weights to make structured metadata count
+- **ACT-R-style activation**: frequently reused and recently accessed memories get a small cognitive activation boost before final reranking
+- **int8 quantized embeddings**: stored vectors are 4× smaller (388 bytes vs 1536 bytes) with negligible recall loss; fast SIMD-friendly dot product directly on the blob avoids per-search allocations
+- **Local HNSW ANN index** (`usearch`): persistent on-disk approximate nearest neighbor index that warms asynchronously from SQLite in a detached thread (non-blocking startup), updates incrementally on backfill, on the async embed worker, and on delete. Surfaces `vector_ann` candidates so large memory bases stay fast as they grow past tens of thousands of entries.
+- **ANN scan bypass**: when the index reaches 5,000+ entries, the SQL vector scan is restricted to the union of ANN top-K and BM25 hits — turning an O(N) blob load into an O(K) lookup without changing the ranking logic.
+- **Code-aware chunking**: tree-sitter splits Rust/Python/TypeScript/TSX/JavaScript on semantic units, with Svelte `<script>` extraction
 - **Exact term coverage boost**: +10% when 80%+ of query terms appear in memory content
 - **Combinatorial reranker**: greedy subgraph selection, conservative +5% per connection (cap 15%)
 - **KG query expansion**: post-retrieval scoring boost from knowledge graph related terms (+4% per entity, cap 15%)
 - **Temporal recency**: gentle +5% for memories from last 3 days, decaying over 30 days
 - **Importance tiebreaker**: ±3% per level — never overrides relevance signal
-- **Optional cross-encoder reranking**: set `MEMORYPILOT_CROSS_RERANK=1` to rerank top candidates with a local FastEmbed ONNX reranker
+- **Adaptive cross-encoder reranking** (jina-v2-multilingual via FastEmbed ONNX, default ON): triggers on hard / non-English queries, fuses with the RRF score at a tunable 0.45 weight, drops cleanly to BM25+RRF on easy English queries to stay under 30 ms. Pool of N sessions (`MEMORYPILOT_RERANK_POOL_SIZE`) absorbs concurrent load.
+- **Confidence gate**: skips rerank when the top-1 RRF score is already ≥ 25 % above top-3 (latent path; active when force-rerank is enabled)
 - **Auto-compaction**: GC triggers automatically when memory count > 500, debounced to once per 5 minutes
 - **Memory capsules**: old low-importance memories compressed into ~100-200 token summaries (5-10x savings)
 - **Zero-shot auto-classification**: pattern-based heuristics assign kind, importance, and TTL on insert without LLM
@@ -454,15 +507,17 @@ MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] # LongMemE
 
 The LongMemEval benchmark downloads the [LongMemEval-S dataset](https://arxiv.org/abs/2410.10813) and evaluates retrieval quality across 470 questions with turn-level granularity. Results are output as JSON with per-category breakdowns.
 
-Optional local cross-encoder reranking is available for max-accuracy experiments:
+The cross-encoder runs in **adaptive** mode by default (triggers on hard / non-English queries). Force or disable it explicitly:
 
 ```bash
-MEMORYPILOT_CROSS_RERANK=adaptive MEMORYPILOT_CROSS_RERANK_TOP_K=6 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --min-r5 98.7
-MEMORYPILOT_CROSS_RERANK=1 MEMORYPILOT_CROSS_RERANK_TOP_K=6 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --limit 300 --min-r5 98.0
-MEMORYPILOT_CROSS_RERANK=1 MEMORYPILOT_RERANKER_MODEL=bge-v2-m3 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --limit 300
+MEMORYPILOT_CROSS_RERANK=off MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json     # baseline, ~28ms/query, 98.7% R@5
+MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json                                 # adaptive (default), ~900ms/query, 99.1% R@5
+MEMORYPILOT_CROSS_RERANK=1 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json      # force on every query, max latency
+MEMORYPILOT_CROSS_RERANK_WEIGHT=0.70 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json  # bias more toward the cross-encoder score
+MEMORYPILOT_RERANKER_MODEL=bge-v2-m3 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json  # swap the model
 ```
 
-Supported model shortcuts: `jina-v2-multilingual` (default), `bge-v2-m3`, `bge-base`, and `jina-v1`. The reranker runs locally through FastEmbed/ONNX and is disabled by default because it trades latency for quality. Validated full-run results with `top_k=6`: adaptive mode reaches **98.9% R@5**, **95.4% NDCG@10**, **94.1% MRR**, ~365ms average search latency; always-on mode reaches **98.9% R@5**, **96.2% NDCG@10**, **95.2% MRR**, ~744ms average search latency.
+Supported model shortcuts: `jina-v2-multilingual` (default), `bge-v2-m3`, `bge-base`, and `jina-v1`. Validated full-run results on the 470 evaluable LongMemEval-S questions: default fast mode reaches **98.7% R@5**, **95.1% NDCG@10**, **93.6% MRR**, ~28 ms average search latency; adaptive mode reaches **99.1% R@5**, **96.0% NDCG@10**, **94.9% MRR**, ~900 ms average search latency. The deterministic French benchmark (`--benchmark-fr`) is the canonical regression test for any multilingual change — variance is bounded to ±1 pp R@5 across runs.
 
 ## Storage
 

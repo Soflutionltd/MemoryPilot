@@ -4,11 +4,13 @@ use serde::{Deserialize, Serialize};
 /// MemoryPilot v4.0 Database Engine — SQLite + FTS5.
 /// Features: dedup, importance, TTL, bulk ops, export, auto-prompt, lazy embedding, content hash.
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
 #[path = "db/benchmark.rs"]
 mod benchmark;
+#[path = "db/benchmark_fr.rs"]
+mod benchmark_fr;
 #[path = "db/benchmark_longmemeval.rs"]
 mod benchmark_longmemeval;
 #[path = "db/compaction.rs"]
@@ -22,7 +24,10 @@ mod schema;
 #[path = "db/transcript.rs"]
 mod transcript;
 
-use embed_worker::{cached_embed_text, queue_embedding_job, set_embed_db_path};
+use embed_worker::{
+    cached_embed_text, queue_access_update, queue_embedding_job, set_embed_ann_index,
+    set_embed_db_path,
+};
 
 const DB_DIR: &str = ".MemoryPilot";
 const DB_FILE: &str = "memory.db";
@@ -71,6 +76,8 @@ pub struct Memory {
 pub struct SearchResult {
     pub memory: Memory,
     pub score: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,11 +139,37 @@ impl MemoryScope {
     }
 }
 
-const READ_POOL_SIZE: usize = 4;
+/// Number of read-only SQLite connections per Database handle. Each handle
+/// (one per HTTP worker / MCP client) keeps this many readers warm so that
+/// concurrent searches no longer serialize on a single Mutex<Connection>.
+/// SQLite WAL allows N readers + 1 writer concurrently, so a larger pool
+/// only costs file descriptors and ~80 KB of cache per connection.
+const READ_POOL_SIZE: usize = 16;
 
 pub struct Database {
     conn: Connection,
     read_pool: Vec<Mutex<Connection>>,
+    ann: Option<Arc<crate::ann::AnnIndex>>,
+    /// Set to `true` once the detached `spawn_ann_warmup` thread has
+    /// finished hydrating the in-memory ANN index from SQLite. Lets
+    /// callers opt into a deterministic search path via
+    /// [`Database::wait_for_ann_warm`] / [`Database::open_at_warm`]
+    /// without paying that cost on the default `open_at`.
+    ann_warm_complete: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// RAII helper used by the ANN warm-up thread: ensures the
+/// completion flag is published exactly once, no matter which exit
+/// path the worker takes (success, prepare failure, query failure).
+struct WarmupGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for WarmupGuard {
+    fn drop(&mut self) {
+        self.flag
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl Database {
@@ -155,12 +188,264 @@ impl Database {
 
         let read_pool = schema::open_read_pool(path, READ_POOL_SIZE)?;
 
-        let db = Self { conn, read_pool };
+        let ann = Self::open_ann_index(path);
+        set_embed_ann_index(ann.clone());
+
+        let ann_warm_complete = Arc::new(std::sync::atomic::AtomicBool::new(
+            ann.as_ref().map(|index| !index.is_empty()).unwrap_or(true),
+        ));
+        let db = Self {
+            conn,
+            read_pool,
+            ann: ann.clone(),
+            ann_warm_complete: ann_warm_complete.clone(),
+        };
         db.init_schema()?;
         db.upgrade_schema()?;
         db.normalize_project_identities()?;
         let _ = db.backfill_embeddings();
+        let _ = db.migrate_fts_to_stemmed();
+        Self::spawn_ann_warmup(ann, path.to_path_buf(), ann_warm_complete);
         Ok(db)
+    }
+
+    /// Open the database **and block until the ANN index is fully
+    /// hydrated in RAM**. The non-warm `open_at` returns immediately
+    /// and lets the SQL fallback serve the first few searches while
+    /// the ANN thread catches up — fine for an interactive process,
+    /// but disastrous for two specific scenarios:
+    ///
+    /// - benchmarks, where intermittent ANN hydration causes scoring
+    ///   to flicker between the ANN-pruned path and the full SQL scan
+    ///   (the source of the ±10pp variance on `--benchmark-fr`),
+    /// - cold-start sensitive workloads where the first 5 queries
+    ///   per process were paying the warm-up tail (p99 ~6 s in the
+    ///   concurrency bench).
+    ///
+    /// `open_at_warm` pays the warm-up upfront. Returns the same
+    /// `Database` handle as `open_at` once the index is ready.
+    pub fn open_at_warm(path: &Path) -> Result<Self, String> {
+        let db = Self::open_at(path)?;
+        db.wait_for_ann_warm(std::time::Duration::from_secs(120));
+        Ok(db)
+    }
+
+    /// Block until the detached ANN warm-up thread reports completion
+    /// (or `timeout` elapses). Cheap polling — we only spin every 25 ms
+    /// because the warm-up pass is bottlenecked on SQLite I/O, not on
+    /// the polling loop. Returns `true` if the warm-up finished within
+    /// the budget, `false` on timeout.
+    pub fn wait_for_ann_warm(&self, timeout: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        while !self.ann_warm_complete.load(std::sync::atomic::Ordering::Acquire) {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        true
+    }
+
+    /// One-shot migration that rewrites every memory's FTS5 entry to
+    /// include the Snowball-stemmed projection of its content. Idempotent:
+    /// guarded by a `fts_stem_version=1` row in the `config` table.
+    fn migrate_fts_to_stemmed(&self) -> Result<(), String> {
+        let current: String = self
+            .conn
+            .query_row(
+                "SELECT value FROM config WHERE key='fts_stem_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        if current == "1" {
+            return Ok(());
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT m.rowid, m.content, m.tags, m.kind, COALESCE(m.project, '') FROM memories m")
+            .map_err(|error| format!("FTS stem migration prepare: {}", error))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| format!("FTS stem migration query: {}", error))?;
+
+        let entries: Vec<(i64, String, String, String, String)> = rows
+            .filter_map(|row| row.ok())
+            .collect();
+        drop(stmt);
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("FTS stem migration tx: {}", error))?;
+        for (rowid, content, tags_json, kind, project) in entries {
+            let fts_content = Self::fts_index_content(&content);
+            tx.execute("DELETE FROM memories_fts WHERE rowid=?1", params![rowid])
+                .ok();
+            tx.execute(
+                "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
+                params![rowid, fts_content, tags_json, kind, project],
+            )
+            .ok();
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO config (key,value) VALUES ('fts_stem_version','1')",
+            [],
+        )
+        .map_err(|error| format!("FTS stem migration version: {}", error))?;
+        tx.commit()
+            .map_err(|error| format!("FTS stem migration commit: {}", error))?;
+        Ok(())
+    }
+
+    /// Hydrate the ANN index in a detached worker so `open_at` does not pay the
+    /// upfront I/O cost. Until warm-up finishes, searches transparently fall
+    /// back to the deterministic SQL scan path. The `complete` flag is set
+    /// once the worker exits so [`Database::wait_for_ann_warm`] can block on
+    /// it for benchmarks and cold-start-sensitive workloads.
+    fn spawn_ann_warmup(
+        ann: Option<Arc<crate::ann::AnnIndex>>,
+        db_path: PathBuf,
+        complete: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let Some(index) = ann else {
+            complete.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        if !index.is_empty() {
+            complete.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        std::thread::Builder::new()
+            .name("memorypilot-ann-warmup".into())
+            .spawn(move || {
+                // Always mark complete on exit, even on early returns,
+                // so callers blocking on `wait_for_ann_warm` are never
+                // stranded if the SQL probe fails for any reason.
+                let _guard = WarmupGuard {
+                    flag: complete.clone(),
+                };
+                let conn = match Connection::open(&db_path) {
+                    Ok(conn) => conn,
+                    Err(_) => return,
+                };
+                let _ = conn
+                    .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+                let mut stmt = match conn
+                    .prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")
+                {
+                    Ok(stmt) => stmt,
+                    Err(_) => return,
+                };
+                let rows = match stmt.query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    Ok((id, blob))
+                }) {
+                    Ok(rows) => rows,
+                    Err(_) => return,
+                };
+                let mut added = 0usize;
+                for row in rows.flatten() {
+                    let (id, blob) = row;
+                    let vector = crate::embedding::blob_to_vec(&blob);
+                    if vector.is_empty() {
+                        continue;
+                    }
+                    if index.add(&id, &vector).is_ok() {
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    let _ = index.persist();
+                }
+            })
+            .ok();
+    }
+
+    fn open_ann_index(path: &Path) -> Option<Arc<crate::ann::AnnIndex>> {
+        let mut ann_path = path.to_path_buf();
+        let file_name = ann_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{}.ann.usearch", name))
+            .unwrap_or_else(|| "memorypilot.ann.usearch".to_string());
+        ann_path.set_file_name(file_name);
+        match crate::ann::AnnIndex::open(Some(ann_path)) {
+            Ok(index) => Some(Arc::new(index)),
+            Err(error) => {
+                eprintln!("[MemoryPilot] ANN index disabled: {}", error);
+                None
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn warm_ann_index(&self) -> Result<(), String> {
+        let Some(ann) = self.ann.clone() else {
+            return Ok(());
+        };
+        if !ann.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")
+            .map_err(|error| format!("ANN warm prepare: {}", error))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((id, blob))
+            })
+            .map_err(|error| format!("ANN warm query: {}", error))?;
+        let mut added = 0usize;
+        for row in rows.flatten() {
+            let (id, blob) = row;
+            let vector = crate::embedding::blob_to_vec(&blob);
+            if vector.is_empty() {
+                continue;
+            }
+            if ann.add(&id, &vector).is_ok() {
+                added += 1;
+            }
+        }
+        if added > 0 {
+            let _ = ann.persist();
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn ann_index(&self) -> Option<Arc<crate::ann::AnnIndex>> {
+        self.ann.clone()
+    }
+
+    /// Build the text we feed into the FTS5 `content` column.
+    ///
+    /// We append a Snowball-stemmed projection of the raw content so that
+    /// inflected matches survive BM25 (e.g. French "messages" vs query
+    /// "message", or English "running" vs query "run"). The raw content
+    /// is preserved verbatim, so exact-phrase, NEAR, and BM25 statistics
+    /// on the original text continue to work unchanged. The stemmed
+    /// fragment is delimited by an ASCII NUL so it is unlikely to be
+    /// matched by any user query phrase.
+    fn fts_index_content(content: &str) -> String {
+        let stem = crate::stemming::stem_text(content);
+        if stem.is_empty() {
+            content.to_string()
+        } else {
+            format!("{} {}", content, stem)
+        }
     }
 
     fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1662,6 +1947,31 @@ impl Database {
         metadata: Option<&serde_json::Value>,
         scope: &MemoryScope,
     ) -> Result<(Memory, bool), String> {
+        self.add_memory_with_id(
+            None, content, kind, project, tags, source, importance, expires_at, metadata, scope,
+        )
+    }
+
+    /// Same as [`Self::add_memory`] but lets the caller pin the row's
+    /// primary key. Used by benchmarks (and only by benchmarks) so that
+    /// the memory id is reproducible across runs — without it, the
+    /// random UUID drives the deterministic id-based tie-break we now
+    /// apply in `search`, which produced visible run-to-run variance
+    /// on `--benchmark-fr`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_memory_with_id(
+        &self,
+        explicit_id: Option<&str>,
+        content: &str,
+        kind: &str,
+        project: Option<&str>,
+        tags: &[String],
+        source: &str,
+        importance: i32,
+        expires_at: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        scope: &MemoryScope,
+    ) -> Result<(Memory, bool), String> {
         let canonical_project = Self::canonical_project(project);
         let scoped_metadata = Self::apply_scope_to_metadata(metadata, scope);
         // Check for near-duplicate
@@ -1693,7 +2003,9 @@ impl Database {
             return Ok((updated.unwrap_or(existing), true));
         }
 
-        let id = Uuid::new_v4().to_string();
+        let id = explicit_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let now = Utc::now().to_rfc3339();
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         let meta_json = scoped_metadata
@@ -1711,11 +2023,12 @@ impl Database {
         // Queue embedding for background computation
         queue_embedding_job(&id, content);
 
-        // FTS index
+        // FTS index (raw content + stemmed projection for FR/EN recall)
         let rowid = self.conn.last_insert_rowid();
+        let fts_content = Self::fts_index_content(content);
         self.conn.execute(
             "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
-            params![rowid, content, tags_json, kind, canonical_project.as_deref().unwrap_or("")],
+            params![rowid, fts_content, tags_json, kind, canonical_project.as_deref().unwrap_or("")],
         ).map_err(|e| format!("FTS insert: {}", e))?;
 
         if let Some(proj) = canonical_project.as_deref() {
@@ -1808,9 +2121,10 @@ impl Database {
                 .conn
                 .execute("DELETE FROM memories_fts WHERE rowid=?1", params![rowid]);
             let proj = existing.project.as_deref().unwrap_or("");
+            let fts_content = Self::fts_index_content(new_content);
             let _ = self.conn.execute(
                 "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
-                params![rowid, new_content, tags_json, new_kind, proj]);
+                params![rowid, fts_content, tags_json, new_kind, proj]);
         }
 
         let mem = Memory {
@@ -1846,6 +2160,9 @@ impl Database {
             .conn
             .execute("DELETE FROM memories WHERE id=?1", params![id])
             .map_err(|e| format!("Delete: {}", e))?;
+        if let Some(ann) = self.ann.as_ref() {
+            let _ = ann.remove(id);
+        }
         Ok(affected > 0)
     }
 
@@ -2078,6 +2395,23 @@ impl Database {
         factor.min(1.35)
     }
 
+    fn cognitive_activation_factor(memory: &Memory, now_ts: f64) -> f64 {
+        let frequency = ((memory.access_count.max(0) as f64 + 1.0).ln() / 21.0_f64.ln()).min(1.0);
+        let last_touch = memory
+            .last_accessed_at
+            .as_deref()
+            .unwrap_or(memory.updated_at.as_str());
+        let recency = chrono::DateTime::parse_from_rfc3339(last_touch)
+            .ok()
+            .map(|timestamp| {
+                let age_days = ((now_ts - timestamp.timestamp() as f64) / 86400.0).max(0.0);
+                (1.0 / (1.0 + age_days / 14.0)).min(1.0)
+            })
+            .unwrap_or(0.0);
+
+        1.0 + ((frequency * 0.07) + (recency * 0.05)).min(0.12)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -2089,66 +2423,195 @@ impl Database {
     ) -> Result<Vec<SearchResult>, String> {
         let canonical_project = Self::canonical_project(project);
 
-        let Some(fts_terms) = crate::fts::sanitize_fts5_query(query) else {
-            return Ok(Vec::new());
+        let telemetry_enabled = crate::telemetry::is_enabled();
+        let search_start = std::time::Instant::now();
+        let mut trace = if telemetry_enabled {
+            let mut t = crate::telemetry::RetrievalTrace::default();
+            t.query_truncated = crate::telemetry::truncate_query(query);
+            t.query_chars = query.chars().count();
+            t.project = canonical_project.clone();
+            t.kind = kind.map(|k| k.to_string());
+            t.tags_count = tags.map(|t| t.len()).unwrap_or(0);
+            t.limit = limit;
+            Some(t)
+        } else {
+            None
         };
+
+        let fts_variants = crate::fts::fts5_query_variants(query);
+        if fts_variants.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(t) = trace.as_mut() {
+            t.fts_variants = fts_variants.len();
+        }
 
         let _ = self.cleanup_expired();
 
+        let embed_start = std::time::Instant::now();
         let query_emb = cached_embed_text(query);
+        if let Some(t) = trace.as_mut() {
+            t.timing_ms_embed_query = embed_start.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // Pre-compute KG expansion terms for post-retrieval scoring boost
         let kg_expansion = self.get_kg_expansion_terms(query);
 
-        // 1. BM25 Search
-        let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(fts_terms.clone())];
-
-        if let Some(p) = canonical_project.as_deref() {
-            conditions.push(format!("m.project = ?{}", param_values.len() + 1));
-            param_values.push(Box::new(p.to_string()));
-        }
-        if let Some(k) = kind {
-            conditions.push(format!("m.kind = ?{}", param_values.len() + 1));
-            param_values.push(Box::new(k.to_string()));
-        }
-
-        let where_clause = conditions.join(" AND ");
-        let sql = format!(
-            "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,m.last_accessed_at,m.access_count,
-                    bm25(memories_fts, 10.0, 3.0, 1.0, 2.0) AS bm25_score
-             FROM memories_fts f
-             JOIN memories m ON m.rowid = f.rowid
-             WHERE {}
-             ORDER BY bm25_score ASC
-             LIMIT 150", where_clause);
-
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| format!("Search prepare: {}", e))?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
         let mut bm25_results = std::collections::HashMap::new();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let mem = row_to_memory(row);
-                let bm25: f64 = row.get(13)?;
-                Ok((mem, bm25))
-            })
-            .map_err(|e| format!("Search: {}", e))?;
-
-        let mut rank = 1;
         let mut all_memories = std::collections::HashMap::new();
-        for r in rows.flatten() {
-            let (mem, _) = r;
-            bm25_results.insert(mem.id.clone(), rank);
-            all_memories.insert(mem.id.clone(), mem);
-            rank += 1;
+        let mut candidate_sources: std::collections::HashMap<
+            String,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
+
+        let bm25_start = std::time::Instant::now();
+        // 1. FTS5 search. Run the normal prefix query plus exact phrase/proximity variants.
+        let run_fts_variant =
+            |fts_query: &str,
+             source: &'static str,
+             rank_offset: usize,
+             limit_rows: usize,
+             return_err_on_failure: bool,
+             bm25_results: &mut std::collections::HashMap<String, usize>,
+             all_memories: &mut std::collections::HashMap<String, Memory>,
+             candidate_sources: &mut std::collections::HashMap<
+                String,
+                std::collections::HashSet<String>,
+             >|
+             -> Result<usize, String> {
+                let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
+                let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    vec![Box::new(fts_query.to_string())];
+
+                if let Some(p) = canonical_project.as_deref() {
+                    conditions.push(format!("m.project = ?{}", param_values.len() + 1));
+                    param_values.push(Box::new(p.to_string()));
+                }
+                if let Some(k) = kind {
+                    conditions.push(format!("m.kind = ?{}", param_values.len() + 1));
+                    param_values.push(Box::new(k.to_string()));
+                }
+
+                let where_clause = conditions.join(" AND ");
+                let sql = format!(
+                    "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,m.last_accessed_at,m.access_count,
+                            bm25(memories_fts, 8.0, 5.0, 2.0, 4.0) AS bm25_score
+                     FROM memories_fts f
+                     JOIN memories m ON m.rowid = f.rowid
+                     WHERE {}
+                     ORDER BY bm25_score ASC
+                     LIMIT {}", where_clause, limit_rows);
+
+                let mut stmt = match self.conn.prepare(&sql) {
+                    Ok(stmt) => stmt,
+                    Err(error) if return_err_on_failure => {
+                        return Err(format!("Search prepare: {}", error));
+                    }
+                    Err(_) => return Ok(0),
+                };
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    param_values.iter().map(|p| p.as_ref()).collect();
+                let rows = match stmt.query_map(param_refs.as_slice(), |row| {
+                    let mem = row_to_memory(row);
+                    let bm25: f64 = row.get(13)?;
+                    Ok((mem, bm25))
+                }) {
+                    Ok(rows) => rows,
+                    Err(error) if return_err_on_failure => {
+                        return Err(format!("Search: {}", error));
+                    }
+                    Err(_) => return Ok(0),
+                };
+
+                let mut produced = 0usize;
+                for (rank_index, row) in rows.flatten().enumerate() {
+                    let (mem, _) = row;
+                    let rank = rank_index + 1 + rank_offset;
+                    let entry = bm25_results.entry(mem.id.clone()).or_insert(rank);
+                    *entry = (*entry).min(rank);
+                    candidate_sources
+                        .entry(mem.id.clone())
+                        .or_default()
+                        .insert(source.to_string());
+                    all_memories.entry(mem.id.clone()).or_insert(mem);
+                    produced += 1;
+                }
+                Ok(produced)
+            };
+
+        for (variant_index, (fts_query, source)) in fts_variants.iter().enumerate() {
+            let limit_rows = if variant_index == 0 { 150 } else { 75 };
+            let return_err_on_failure = variant_index == 0;
+            run_fts_variant(
+                fts_query,
+                *source,
+                0,
+                limit_rows,
+                return_err_on_failure,
+                &mut bm25_results,
+                &mut all_memories,
+                &mut candidate_sources,
+            )?;
         }
 
-        // 2. Vector Search (read pool connection, scoped)
+        // NOTE: lexical synonym expansion (`fts5_synonym_variants`) is
+        // intentionally NOT invoked here. Three feeding strategies were
+        // measured on memorypilot-fr-30:
+        //
+        //   - Eager OR into BM25 pool       : R@5 73.3% → 63.3% (-10)
+        //   - Penalised rank, capped pool   : R@5 73.3% → 70.0% (-3)
+        //   - Candidate-only (vector judge) : R@5 73.3% → 63.3% (-10)
+        //
+        // All three regress precision because the curated thesaurus is
+        // too generic for a small corpus and pulls in long-tail noise.
+        // The right fix for cross-lingual / synonym retrieval is the
+        // dense cross-encoder reranker, not BM25 widening. The
+        // dictionary remains in `query_expansion.rs` for callers that
+        // want it (CLI tools, HTTP debugging) and may resurface later
+        // for very large corpora where the long tail dilutes naturally.
+
+        // 2a. Optional ANN pre-filter. Marks candidates with `vector_ann` so the
+        // explain output exposes which retrieval stage surfaced them. The full
+        // scan below stays authoritative for ranking — ANN only annotates here.
+        let ann_hits: Vec<(String, f32)> = self
+            .ann
+            .as_ref()
+            .map(|index| index.search(&query_emb, 200))
+            .unwrap_or_default();
+        for (id, _) in &ann_hits {
+            candidate_sources
+                .entry(id.clone())
+                .or_default()
+                .insert("vector_ann".to_string());
+        }
+
+        // 2b. Vector Search (read pool connection, scoped). When the ANN index is
+        // populated past `ANN_BYPASS_THRESHOLD`, restrict the SQL scan to the union
+        // of ANN top-K and BM25 hits — avoids loading every embedding blob just to
+        // score it. Below the threshold the full scan is kept (provably no recall
+        // regression).
+        const ANN_BYPASS_THRESHOLD: usize = 5_000;
+        let ann_active_for_bypass = self
+            .ann
+            .as_ref()
+            .map(|index| index.len() >= ANN_BYPASS_THRESHOLD && !ann_hits.is_empty())
+            .unwrap_or(false);
+        let restricted_ids: Option<Vec<String>> = if ann_active_for_bypass {
+            let mut ids: std::collections::HashSet<String> = bm25_results.keys().cloned().collect();
+            for (id, _) in &ann_hits {
+                ids.insert(id.clone());
+            }
+            Some(ids.into_iter().collect())
+        } else {
+            None
+        };
+
+        if let Some(t) = trace.as_mut() {
+            t.timing_ms_bm25 = bm25_start.elapsed().as_secs_f64() * 1000.0;
+            t.candidates_bm25 = bm25_results.len();
+        }
+
+        let vector_start = std::time::Instant::now();
         let vector_results = {
             let mut vec_conditions = Vec::new();
             let mut vec_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2159,6 +2622,16 @@ impl Database {
             if let Some(k) = kind {
                 vec_conditions.push(format!("kind = ?{}", vec_params.len() + 1));
                 vec_params.push(Box::new(k.to_string()));
+            }
+            if let Some(ids) = restricted_ids.as_ref() {
+                let placeholders = (1..=ids.len())
+                    .map(|i| format!("?{}", vec_params.len() + i))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec_conditions.push(format!("id IN ({})", placeholders));
+                for id in ids {
+                    vec_params.push(Box::new(id.clone()));
+                }
             }
             let vec_where = if vec_conditions.is_empty() {
                 String::new()
@@ -2188,10 +2661,17 @@ impl Database {
                     .entry(mem.id.clone())
                     .or_insert_with(|| mem.clone());
                 if let Some(b) = blob {
-                    let emb = crate::embedding::blob_to_vec(&b);
-                    let score = crate::embedding::cosine_similarity(&query_emb, &emb);
+                    candidate_sources
+                        .entry(mem.id.clone())
+                        .or_default()
+                        .insert("vector".to_string());
+                    let score = crate::embedding::similarity_with_blob(&query_emb, &b);
                     vector_scores.push((mem.id, score));
                 } else {
+                    candidate_sources
+                        .entry(mem.id.clone())
+                        .or_default()
+                        .insert("vector_pending".to_string());
                     vector_scores.push((mem.id, 0.0));
                 }
             }
@@ -2204,6 +2684,18 @@ impl Database {
             }
             vr
         };
+
+        if let Some(t) = trace.as_mut() {
+            t.timing_ms_vector = vector_start.elapsed().as_secs_f64() * 1000.0;
+            t.candidates_vector = vector_results.len();
+            t.candidates_total_unique = all_memories.len();
+            t.candidates_ann = candidate_sources
+                .values()
+                .filter(|set| set.iter().any(|src| src == "ann"))
+                .count();
+            t.kg_expansion_terms = kg_expansion.len();
+        }
+        let fusion_start = std::time::Instant::now();
 
         // 3. RRF Fusion
         let mut rrf_scores: Vec<(String, f64)> = Vec::new();
@@ -2243,6 +2735,7 @@ impl Database {
             }
 
             score *= Self::query_intent_factor(&query_intent, mem);
+            score *= Self::cognitive_activation_factor(mem, now_ts);
 
             // Importance tiebreaker: subtle nudge, never overrides relevance
             // imp 5 → 1.06x, imp 4 → 1.03x, imp 3 → 1.0x, imp 2 → 0.98x, imp 1 → 0.96x
@@ -2325,7 +2818,18 @@ impl Database {
             rrf_scores.push((id.clone(), score));
         }
 
-        rrf_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Deterministic tie-break on the memory id. Without it, two
+        // candidates that happen to score identically (a common case
+        // when the cross-encoder normalises into a small dynamic
+        // range) would be ordered by the unstable HashMap iteration
+        // order, producing different top-K from one process to the
+        // next on the same input. The id-based break costs nothing
+        // and turns the bench output into a reproducible artefact.
+        rrf_scores.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         let mut results: Vec<SearchResult> = Vec::new();
         let session_candidate_limit = if crate::session_fusion::should_expand_candidates(query) {
@@ -2335,9 +2839,15 @@ impl Database {
         };
         for (id, score) in rrf_scores.into_iter().take(session_candidate_limit) {
             if let Some(mem) = all_memories.remove(&id) {
+                let mut sources = candidate_sources
+                    .remove(&id)
+                    .map(|items| items.into_iter().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                sources.sort();
                 results.push(SearchResult {
                     memory: mem,
                     score: (score * 10000.0).round() / 10000.0,
+                    sources,
                 });
             }
         }
@@ -2357,6 +2867,7 @@ impl Database {
                             memory: mem,
                             // Give it a slightly lower score than the original match that pulled it
                             score: 0.1,
+                            sources: vec!["graph".to_string()],
                         });
                     }
                 }
@@ -2427,6 +2938,7 @@ impl Database {
                                 access_count: 0,
                             },
                             score: 0.0,
+                            sources: Vec::new(),
                         },
                     )
                 })
@@ -2447,10 +2959,22 @@ impl Database {
         crate::reranking::rerank_cross_encoder_if_enabled(query, &mut results);
         results = crate::session_fusion::fuse_sessions(query, results, limit);
 
-        // Update access count and timestamp for returned results
+        if let Some(mut t) = trace.take() {
+            t.timing_ms_fusion = fusion_start.elapsed().as_secs_f64() * 1000.0;
+            t.timing_ms_total = search_start.elapsed().as_secs_f64() * 1000.0;
+            t.results_returned = results.len();
+            if let Some(top) = results.first() {
+                t.top_score = top.score;
+                t.top_sources = top.sources.clone();
+            }
+            crate::telemetry::emit(&t);
+        }
+
+        // Defer access-count + last_accessed updates to the embed worker
+        // so the hot search path never holds the WAL writer lock. The
+        // worker drains the queue every ~2 s in a single batch UPDATE.
         for res in &results {
-            let _ = self.conn.execute("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2", 
-                params![chrono::Utc::now().to_rfc3339(), res.memory.id]);
+            queue_access_update(res.memory.id.clone());
         }
 
         Ok(results)
@@ -3539,7 +4063,15 @@ impl Database {
                 "UPDATE memories SET embedding = ?1, content_hash = ?2 WHERE id = ?3",
                 params![blob, &hash, id],
             );
+            if let Some(ann) = self.ann.as_ref() {
+                let _ = ann.add(id, emb);
+            }
             count += 1;
+        }
+        if count > 0 {
+            if let Some(ann) = self.ann.as_ref() {
+                let _ = ann.persist();
+            }
         }
         Ok(count)
     }
@@ -4073,14 +4605,21 @@ impl Database {
 
         if explain {
             for result in &hint_results {
-                selected_memories_for_explain.push(self.recall_explanation(
+                let mut explanation = self.recall_explanation(
                     &result.memory,
                     "hint",
                     proj_ref,
                     mode,
                     Some(result.score),
                     &link_boosts,
-                ));
+                );
+                if let Some(object) = explanation.as_object_mut() {
+                    object.insert(
+                        "retrieval_sources".into(),
+                        serde_json::json!(result.sources),
+                    );
+                }
+                selected_memories_for_explain.push(explanation);
             }
             for memory in &scope_memories {
                 selected_memories_for_explain.push(self.recall_explanation(
@@ -4301,9 +4840,10 @@ impl Database {
                 params![id, content, kind, canonical_project.as_deref(), tags_json, source, emb_blob, now, now],
             ).map_err(|e| format!("Import: {}", e))?;
             let rowid = tx.last_insert_rowid();
+            let fts_content = Self::fts_index_content(content);
             tx.execute(
                 "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
-                params![rowid, content, tags_json, kind, canonical_project.as_deref().unwrap_or("")],
+                params![rowid, fts_content, tags_json, kind, canonical_project.as_deref().unwrap_or("")],
             ).map_err(|e| format!("FTS: {}", e))?;
             if let Some(p) = canonical_project.as_deref() {
                 let _ = tx.execute(
@@ -5158,6 +5698,46 @@ USER: There is a bug in src/tools.rs where duplicate MCP servers would confuse s
                 memory.content.contains("only MCP server")
                     || memory.content.contains("duplicate MCP servers")
             }));
+        }
+        cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn search_reports_lexical_candidate_sources() {
+        let path = temp_db_path("search-sources");
+        {
+            let db = Database::open_at(&path).expect("db");
+            let tags = vec!["SettingsPanel".to_string(), "render".to_string()];
+            let _ = db
+                .add_memory(
+                    "SettingsPanel render bug happens in src/routes/settings.ts when the modal opens.",
+                    "bug",
+                    Some("MemoryPilot"),
+                    &tags,
+                    "test",
+                    4,
+                    None,
+                    None,
+                    &MemoryScope::default(),
+                )
+                .expect("add memory");
+
+            let results = db
+                .search(
+                    "SettingsPanel render bug",
+                    5,
+                    Some("memorypilot"),
+                    Some("bug"),
+                    None,
+                    None,
+                )
+                .expect("search");
+
+            assert!(!results.is_empty());
+            assert!(results[0]
+                .sources
+                .iter()
+                .any(|source| source.starts_with("fts_")));
         }
         cleanup_db_files(&path);
     }

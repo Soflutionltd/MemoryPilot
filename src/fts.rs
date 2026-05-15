@@ -12,6 +12,68 @@ pub fn sanitize_fts5_query(query: &str) -> Option<String> {
     }
 }
 
+pub fn fts5_query_variants(query: &str) -> Vec<(String, &'static str)> {
+    let mut variants = Vec::new();
+    if let Some(primary) = sanitize_fts5_query(query) {
+        variants.push((primary, "fts_prefix"));
+    }
+
+    let terms = lexical_terms(query);
+    if terms.len() >= 2 {
+        let phrase = terms
+            .iter()
+            .take(6)
+            .map(|term| term.replace('"', "\"\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !phrase.is_empty() {
+            variants.push((format!("\"{}\"", phrase), "fts_phrase"));
+        }
+    }
+
+    if (2..=8).contains(&terms.len()) {
+        let near_terms = terms
+            .iter()
+            .take(5)
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        variants.push((format!("NEAR({}, 8)", near_terms), "fts_near"));
+    }
+
+    // Stemmed prefix variant. The FTS5 `content` column stores both the
+    // raw text and the Snowball-stemmed projection of every memory, so a
+    // stemmed-query prefix match recovers French/English inflection
+    // variants (e.g. "messages" vs "message", "running" vs "run") that
+    // unicode61 cannot bridge alone.
+    let stemmed_query = crate::stemming::stem_query(query);
+    if !stemmed_query.is_empty() {
+        if let Some(stem_primary) = sanitize_fts5_query(&stemmed_query) {
+            // Only add it if it differs from the raw prefix to avoid
+            // double-counting BM25 evidence on non-inflected queries.
+            if !variants
+                .iter()
+                .any(|(existing, _)| existing == &stem_primary)
+            {
+                variants.push((stem_primary, "fts_stem"));
+            }
+        }
+    }
+
+    variants
+}
+
+// NOTE: a lexical synonym-expansion lane (`fts5_synonym_variants` plus
+// a curated FR/EN tech thesaurus) was implemented and benchmarked.
+// All three feeding strategies (eager OR, penalised rank, candidate-only
+// for the vector lane) regressed precision on memorypilot-fr-v2 because
+// generic tech synonyms inflate BM25 noise on small corpora. The
+// cross-encoder (jina-v2-multilingual, mode `adaptive`) closes the same
+// recall gap with a much better precision/latency trade-off, so the
+// dictionary lane was removed in favour of dead-code-free retrieval.
+// See git history for the experiment commits if a future iteration
+// wants to revisit pseudo-relevance feedback.
+
 #[allow(dead_code)]
 pub fn lexical_terms(query: &str) -> Vec<String> {
     query
@@ -44,5 +106,13 @@ mod tests {
     #[test]
     fn returns_none_for_empty_query() {
         assert!(sanitize_fts5_query("()").is_none());
+    }
+
+    #[test]
+    fn builds_phrase_and_near_variants() {
+        let variants = fts5_query_variants("SettingsPanel render bug");
+        assert!(variants.iter().any(|(_, source)| *source == "fts_prefix"));
+        assert!(variants.iter().any(|(_, source)| *source == "fts_phrase"));
+        assert!(variants.iter().any(|(_, source)| *source == "fts_near"));
     }
 }

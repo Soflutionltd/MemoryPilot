@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use rusqlite::{params, Connection};
@@ -474,7 +474,12 @@ impl Database {
         let _ = rc.execute_batch("PRAGMA cache_size = -2000;");
         read_pool.push(Mutex::new(rc));
 
-        let db = Self { conn, read_pool };
+        let db = Self {
+            conn,
+            read_pool,
+            ann: None,
+            ann_warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
         db.init_schema()?;
         Ok(db)
     }
@@ -503,7 +508,12 @@ impl Database {
         let _ = rc.execute_batch("PRAGMA cache_size = -2000;");
         read_pool.push(Mutex::new(rc));
 
-        let db = Self { conn, read_pool };
+        let db = Self {
+            conn,
+            read_pool,
+            ann: None,
+            ann_warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
         db.init_schema()?;
         Ok(db)
     }
