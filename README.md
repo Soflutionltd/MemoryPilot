@@ -33,10 +33,26 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
 ### LongMemEval-S (ICLR 2025) — Academic Standard
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/benchmark_chart.png" alt="MemoryPilot vs MemPalace - LongMemEval-S Benchmark" width="680"/>
+  <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/benchmark_chart.png" alt="MemoryPilot vs Mem0, Zep, MemPalace, mcp-memory-service on LongMemEval-S" width="820"/>
 </p>
 
 Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.10813) benchmark (ICLR 2025), the standard academic dataset for long-term memory retrieval. Turn-level granularity, ~50 sessions per haystack.
+
+#### vs the entire market (LongMemEval-S, public numbers)
+
+| System | R@5 / Accuracy | Latency | Privacy | Stack | Source |
+|--------|---------------:|---------|---------|-------|--------|
+| **MemoryPilot v4.2 (adaptive)** | **99.1%** | ~900 ms | 100% local | Rust · 35 MB binary · zero API | This repo, `--benchmark-longmemeval` @470 |
+| **MemoryPilot v4.2 (default fast)** | **98.7%** | **~28 ms** | 100% local | Rust · 35 MB binary · zero API | This repo, `--benchmark-longmemeval` @470 |
+| MemPalace v3.3.3 (hybrid) | 98.4% | not published | 100% local | Python + ChromaDB · ~500 MB | MemPalace v3.3.3 release notes |
+| Mem0 (cloud, OpenAI backend) | 94.4% | ~6 787 tokens/query | Cloud (OpenAI) | SaaS + OpenAI embeddings | [mem0.ai blog](https://mem0.ai/blog/benchmarked-openai-memory-vs-langmem-vs-memgpt-vs-mem0-for-long-term-memory-here-s-how-they-stacked-up) |
+| mcp-memory-service v10.34.0 | 80.4% | not published | 100% local | Python + SQLite-Vec + MiniLM | [v10.34.0 release notes](https://github.com/doobidoo/mcp-memory-service/releases/tag/v10.34.0) |
+| Zep / Graphiti | 63.8% | "90% lower vs baseline" | Cloud or self-host | Python + Neo4j + LLM extraction | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956) |
+| Letta / MemGPT | not measured on LongMemEval | — | Self-host | Python framework | [Letta tracking issue #3115](https://github.com/letta-ai/letta/issues/3115) |
+
+> MemoryPilot is the **only system in this comparison that is both 100% local *and* tops the leaderboard**. The default fast mode (~28 ms) already beats every published competitor; the adaptive cross-encoder mode adds +0.4 pp R@5 for the cost of one ONNX rerank pass per query.
+
+#### Detailed view — MemoryPilot vs MemPalace (closest local competitor)
 
 | Metric | MemoryPilot v4.2 (default fast) | MemoryPilot v4.2 (adaptive rerank) | MemPalace v3.3.3 | Delta vs MemPalace |
 |--------|---------------------------------|------------------------------------|------------------|--------------------|
@@ -86,45 +102,47 @@ Run-to-run variance is bounded to ±1 pp on R@5 / R@10 thanks to deterministic m
 
 ---
 
-**vs the best MCP memory servers:**
+**vs the best memory servers on the market:**
 
-| Feature | MemoryPilot v4.2 | MemPalace v3.3.3 | Mem0 |
-|---------|-----------------|----------------|------|
-| Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) | ChromaDB cosine (all-MiniLM-L6-v2) | Vector search (cloud API) |
-| Embeddings | multilingual-e5-small (100+ languages, local ONNX) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) |
-| Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | Depends on API |
-| Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Basic graph (no temporal) |
-| GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | No |
-| Query-aware ranking | Preference/temporal/role/update/technical intent boosts | Hybrid v4 keyword + temporal boosts | Depends on API |
-| Corpus origin detection | AI transcript/codebase/notes/platform detection | v3.3.4 prep | No |
-| Agent/persona disambiguation | Agents are separate from real people | v3.3.4 prep | No |
-| Topic tunnels | Cross-project topic links via KG | v3.3.4 prep | No |
-| Code-aware chunking | Tree-sitter Rust/Python/TS/TSX/JS + Svelte script extraction | Tree-sitter code chunking | No |
-| Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | No |
-| Compression | AAAK + Memory Capsules (5-10x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No |
-| Auto-Classification | Zero-shot kind/importance/TTL on insert | No | No |
-| Auto-Compaction | GC triggers automatically at 500+ memories | No | No |
-| Memory Capsules | Compress old memories into dense summaries | No | No |
-| Memory Pinning | Pin critical memories — always in recall, GC-proof | No | No |
-| Graph Traversal | Find related memories via KG (depth 1-3) | No | No |
-| Bulk Operations | Delete by kind/project/tag/age with safety guards | No | No |
-| Health Dashboard | Memory distribution, stale count, orphans, DB size | No | No |
-| Dedup Detection | Jaccard similarity scan for near-duplicates | No | No |
-| Person detection | Auto-detects team members from text | No | No |
-| Self-Healing | Background auto-linting loop | No | No |
-| Garbage collection | Heuristic merge + scoring + orphan cleanup | No | Basic TTL |
-| Project brain | Yes, with team members (<1500 tokens) | No | No |
-| File watcher | Context boost from recent edits | No | No |
-| Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity |
-| HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted |
-| Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type |
-| MCP tools | 41 tools | 29 tools | N/A |
-| Privacy | 100% local, zero API calls | 100% local | Cloud dependent |
-| Language | Rust (single binary, zero deps) | Python (pip install) | SaaS |
-| Startup | 1-2 ms (`open_at`) / synchronous warm via `open_at_warm` | ~5 ms | N/A (cloud) |
-| Binary | 35 MB single binary | Python + ChromaDB (~500 MB installed) | SaaS |
-| Storage | SQLite WAL + FTS5 + 16-conn read pool | ChromaDB | Cloud DB |
-| Concurrency | EmbedPool (4) + RerankPool (1, tunable) + 16 read conns + debounced cleanup | Single-threaded | Single-threaded |
+| Feature | MemoryPilot v4.2 | MemPalace v3.3.3 | Mem0 | Zep / Graphiti |
+|---------|-----------------|----------------|------|----------------|
+| LongMemEval R@5 | **99.1%** | 98.4% | 94.4% | 63.8% |
+| Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) + adaptive jina cross-encoder | ChromaDB cosine (all-MiniLM-L6-v2) | Vector search (cloud API) | Temporal KG traversal + vector |
+| Embeddings | multilingual-e5-small (100+ languages, local ONNX) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) | OpenAI / cloud LLM extraction |
+| Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | Depends on API | Depends on LLM backend |
+| Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Basic graph (no temporal) | Temporal KG (Graphiti, core feature) |
+| GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | No | Yes (LLM-based extraction) |
+| Query-aware ranking | Preference/temporal/role/update/technical intent boosts | Hybrid v4 keyword + temporal boosts | Depends on API | Graph-distance scoring |
+| Corpus origin detection | AI transcript/codebase/notes/platform detection | v3.3.4 prep | No | No |
+| Agent/persona disambiguation | Agents are separate from real people | v3.3.4 prep | No | Partial (entity nodes) |
+| Topic tunnels | Cross-project topic links via KG | v3.3.4 prep | No | No |
+| Code-aware chunking | Tree-sitter Rust/Python/TS/TSX/JS + Svelte script extraction | Tree-sitter code chunking | No | No |
+| Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | No | LLM-based summarisation |
+| Compression | AAAK + Memory Capsules (5-10x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No | No |
+| Auto-Classification | Zero-shot kind/importance/TTL on insert | No | No | LLM-classified entities |
+| Auto-Compaction | GC triggers automatically at 500+ memories | No | No | Manual |
+| Memory Capsules | Compress old memories into dense summaries | No | No | No |
+| Memory Pinning | Pin critical memories — always in recall, GC-proof | No | No | No |
+| Graph Traversal | Find related memories via KG (depth 1-3) | No | No | Native (Cypher / Neo4j) |
+| Bulk Operations | Delete by kind/project/tag/age with safety guards | No | No | Manual |
+| Health Dashboard | Memory distribution, stale count, orphans, DB size | No | No | No |
+| Dedup Detection | Jaccard similarity scan for near-duplicates | No | No | LLM-based reconciliation |
+| Person detection | Auto-detects team members from text | No | No | LLM-extracted entities |
+| Self-Healing | Background auto-linting loop | No | No | No |
+| Garbage collection | Heuristic merge + scoring + orphan cleanup | No | Basic TTL | No automatic GC |
+| Project brain | Yes, with team members (<1500 tokens) | No | No | No |
+| File watcher | Context boost from recent edits | No | No | No |
+| Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity | LLM-based merge |
+| HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted | REST + GraphQL |
+| Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type | Episodic / semantic |
+| MCP tools | 41 tools | 29 tools | N/A | Limited MCP server |
+| Privacy | 100% local, zero API calls | 100% local | Cloud dependent | Cloud or self-host (LLM required) |
+| Language | Rust (single binary, zero deps) | Python (pip install) | SaaS | Python + Neo4j |
+| Startup | 1-2 ms (`open_at`) / synchronous warm via `open_at_warm` | ~5 ms | N/A (cloud) | Heavy (Neo4j boot) |
+| Binary | 35 MB single binary | Python + ChromaDB (~500 MB installed) | SaaS | Python + Neo4j (~1.5 GB) |
+| Storage | SQLite WAL + FTS5 + 16-conn read pool | ChromaDB | Cloud DB | Neo4j + Postgres |
+| Concurrency | EmbedPool (4) + RerankPool (1, tunable) + 16 read conns + debounced cleanup | Single-threaded | Single-threaded | Neo4j-bound |
+| External LLM dependency | **None** | None | OpenAI required | LLM required for ingestion |
 
 ## The 9 Pillars
 
