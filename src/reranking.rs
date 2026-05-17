@@ -89,7 +89,9 @@ pub fn rerank_cross_encoder_if_enabled(query: &str, results: &mut Vec<SearchResu
     // is confidently ahead, we skip rerank. Tuning: a gap >= 25% of
     // the top-1 score has been observed to leave R@5 unchanged on
     // memorypilot-fr and LongMemEval while halving the average rerank
-    // workload on the easy English tail.
+    // workload on the easy English tail. Lower thresholds were tried
+    // in v4.3 (0.12, 0.18) but cost R@5 on FR without producing a
+    // real latency win, so 0.25 was retained.
     //
     // The gate is intentionally OFF when the user forces rerank with
     // MEMORYPILOT_CROSS_RERANK=1: in that mode they explicitly want
@@ -205,7 +207,12 @@ enum CrossRerankerState {
 
 /// True when the top-1 score sits far enough above the top-3 score
 /// that a rerank is unlikely to change the ordering. Returns `false`
-/// for very short result lists where the gap is meaningless.
+/// for very short result lists where the gap is meaningless. The
+/// gate ratio is tunable via `MEMORYPILOT_GATE_RATIO` (default 0.25
+/// — empirically the best operating point on the FR bench, lower
+/// ratios cost R@5 without meaningfully improving latency because
+/// most non-English queries have naturally low gap/top ratios and
+/// fail the gate either way).
 fn is_confident_top(results: &[SearchResult]) -> bool {
     if results.len() < 3 {
         return false;
@@ -215,8 +222,13 @@ fn is_confident_top(results: &[SearchResult]) -> bool {
     if top <= 0.0 {
         return false;
     }
+    let ratio = std::env::var("MEMORYPILOT_GATE_RATIO")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(0.25)
+        .clamp(0.0, 1.0);
     let gap = top - third;
-    gap / top >= 0.25
+    gap / top >= ratio
 }
 
 fn is_force_enabled() -> bool {
@@ -235,6 +247,12 @@ fn should_run_cross_encoder(query: &str) -> bool {
     // temporal, "did I mention", multilingual). On the FR bench the
     // adaptive lane catches every French query (R@5 +6.6pp, R@10
     // +6.6pp, MRR +5.9pp at ~480ms/query).
+    //
+    // Tested in v4.3: dropping the heuristic entirely and relying
+    // only on the score-based confidence gate cost -2.8 pp R@5 on
+    // memorypilot-fr-v2 because the gate signal alone misclassifies
+    // a long tail of ambiguous French queries with naturally wide
+    // gaps. The surface heuristic + gate combo is strictly better.
     match std::env::var("MEMORYPILOT_CROSS_RERANK") {
         Ok(value)
             if matches!(
