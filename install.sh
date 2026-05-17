@@ -4,6 +4,9 @@ set -euo pipefail
 BINARY_NAME="MemoryPilot"
 INSTALL_DIR="$HOME/.local/bin"
 BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
+REPO_OWNER="Soflutionltd"
+REPO_NAME="MemoryPilot"
+REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
 
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -18,6 +21,87 @@ info()  { printf "${BOLD}▸${NC} %s\n" "$1"; }
 ok()    { printf "${GREEN}✓${NC} %s\n" "$1"; }
 warn()  { printf "${YELLOW}⚠${NC} %s\n" "$1"; }
 fail()  { printf "${RED}✗${NC} %s\n" "$1"; }
+
+# ─── Standalone helpers: detect target + fetch pre-built binary ──────────────
+
+detect_target() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "$os" in
+        Darwin)
+            case "$arch" in
+                arm64) echo "aarch64-apple-darwin" ;;
+                x86_64) echo "x86_64-apple-darwin" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        Linux)
+            case "$arch" in
+                x86_64) echo "x86_64-unknown-linux-gnu" ;;
+                aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+try_download_prebuilt() {
+    local target="$1" asset_url
+    if ! command -v curl &>/dev/null; then
+        return 1
+    fi
+    asset_url="${REPO_URL}/releases/latest/download/MemoryPilot-${target}.tar.gz"
+    info "Trying pre-built binary for ${target}..."
+    local tmp
+    tmp="$(mktemp -d)"
+    if curl -fsSL "$asset_url" -o "$tmp/MemoryPilot.tar.gz" 2>/dev/null; then
+        tar -xzf "$tmp/MemoryPilot.tar.gz" -C "$tmp"
+        if [ -f "$tmp/$BINARY_NAME" ]; then
+            mkdir -p "$INSTALL_DIR"
+            mv "$tmp/$BINARY_NAME" "$BINARY_PATH"
+            chmod +x "$BINARY_PATH"
+            if [ "$(uname)" = "Darwin" ]; then
+                xattr -cr "$BINARY_PATH" 2>/dev/null || true
+            fi
+            rm -rf "$tmp"
+            return 0
+        fi
+    fi
+    rm -rf "$tmp"
+    return 1
+}
+
+build_from_source() {
+    if ! command -v cargo &>/dev/null; then
+        fail "cargo not found and no pre-built binary available."
+        fail "Install Rust from https://rustup.rs and re-run, or grab"
+        fail "a release manually from ${REPO_URL}/releases/latest"
+        exit 1
+    fi
+    local src_dir="$1"
+    info "Building MemoryPilot from source (release + HTTP)..."
+    (cd "$src_dir" && cargo build --release --features http --quiet)
+    mkdir -p "$INSTALL_DIR"
+    cp "$src_dir/target/release/$BINARY_NAME" "$BINARY_PATH"
+    chmod +x "$BINARY_PATH"
+    if [ "$(uname)" = "Darwin" ]; then
+        xattr -cr "$BINARY_PATH" 2>/dev/null || true
+    fi
+}
+
+clone_and_build() {
+    if ! command -v git &>/dev/null; then
+        fail "git not found. Install git or run the in-repo install."
+        exit 1
+    fi
+    local clone_dir
+    clone_dir="$(mktemp -d)/MemoryPilot"
+    info "Cloning ${REPO_URL}..."
+    git clone --depth 1 --quiet "$REPO_URL" "$clone_dir"
+    build_from_source "$clone_dir"
+}
 
 # ─── JSON helper: upsert a key into an MCP config file ────────────────────────
 # Usage: upsert_mcp_config <file> <root_key> <server_json>
@@ -61,33 +145,27 @@ printf "━━━━━━━━━━━━━━━━━━━━━\n\n"
 if [ -x "$BINARY_PATH" ]; then
     info "Binary found at $BINARY_PATH — skipping build"
 else
-    if ! command -v cargo &>/dev/null; then
-        fail "cargo not found. Install Rust: https://rustup.rs"
-        exit 1
-    fi
+    # Three install paths, in order of preference:
+    #   1. Pre-built release binary (fastest, no Rust required).
+    #   2. In-repo cargo build (when run from a clone).
+    #   3. Standalone clone + cargo build (curl | bash from internet).
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+    target="$(detect_target || true)"
 
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
-        info "Building MemoryPilot (release)..."
-        cd "$SCRIPT_DIR"
-        cargo build --release --features http --quiet
-        mkdir -p "$INSTALL_DIR"
-        cp "target/release/$BINARY_NAME" "$BINARY_PATH"
+    if [ -n "$target" ] && try_download_prebuilt "$target"; then
+        ok "Installed pre-built binary to $BINARY_PATH"
+    elif [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
+        build_from_source "$SCRIPT_DIR"
+        ok "Built from source ($SCRIPT_DIR) → $BINARY_PATH"
     elif [ -f "./Cargo.toml" ]; then
-        info "Building MemoryPilot (release + HTTP)..."
-        cargo build --release --features http --quiet
-        mkdir -p "$INSTALL_DIR"
-        cp "target/release/$BINARY_NAME" "$BINARY_PATH"
+        build_from_source "$PWD"
+        ok "Built from source ($PWD) → $BINARY_PATH"
     else
-        fail "Cargo.toml not found. Run this script from the MemoryPilot repo."
-        exit 1
+        warn "No pre-built binary for this platform and no local checkout found."
+        info "Falling back to clone + build (requires git + cargo)..."
+        clone_and_build
+        ok "Built from cloned source → $BINARY_PATH"
     fi
-
-    chmod +x "$BINARY_PATH"
-    if [ "$(uname)" = "Darwin" ]; then
-        xattr -cr "$BINARY_PATH" 2>/dev/null || true
-    fi
-    ok "Built and installed to $BINARY_PATH"
 fi
 
 if ! command -v python3 &>/dev/null; then

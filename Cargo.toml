@@ -1,6 +1,6 @@
 [package]
 name = "memory-pilot"
-version = "4.0.0"
+version = "4.2.0"
 edition = "2021"
 authors = ["SOFLUTION LTD"]
 description = "God-Tier MCP memory server — Hybrid search (BM25 + multilingual-e5-small RRF), 100+ languages, Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server."

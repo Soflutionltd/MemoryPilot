@@ -1,10 +1,7 @@
 <p align="center">
-  <br/>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/logo.png"/>
-    <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/logo.png" alt="MemoryPilot" width="520"/>
-  </picture>
-  <br/><br/>
+  <a href="https://github.com/Soflutionltd/MemoryPilot">
+    <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/banner.png" alt="MemoryPilot — The fastest local memory layer for AI agents" width="100%"/>
+  </a>
 </p>
 
 <p align="center">
