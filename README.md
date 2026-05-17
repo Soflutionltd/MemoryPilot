@@ -251,21 +251,31 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 
 ## Install
 
-### Fastest path (one command, any platform)
+### One-liner (recommended — no clone, no Rust required)
 
 ```bash
-cargo install --git https://github.com/Soflutionltd/MemoryPilot --features http --bin MemoryPilot
+curl -fsSL https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/install.sh | bash
 ```
 
-This compiles the latest `main` release-mode and drops the `MemoryPilot` binary into `~/.cargo/bin/` (already on your `$PATH` if you installed Rust the standard way). Done. From here you can run `MemoryPilot --version` and wire it into any MCP client manually.
+What this does:
+1. Detects your platform (macOS arm64 / x64, Linux x64 / arm64).
+2. Fetches the pre-built binary from the [latest GitHub Release](https://github.com/Soflutionltd/MemoryPilot/releases/latest) (~11 MB tar.gz).
+3. Installs to `~/.local/bin/MemoryPilot` and clears Gatekeeper attributes on macOS.
+4. Auto-configures every supported IDE / agent it finds — Cursor, Claude Desktop, Claude Code, Codex CLI, Gemini CLI, Windsurf, VS Code, OpenCode, Cline, Roo Code — in a single pass.
 
-### Recommended path (auto-configures every IDE)
+If no pre-built binary is available for your platform, it falls back to `cargo build --release --features http` automatically (requires Rust).
+
+### Alternative paths
 
 ```bash
+# Via Cargo, pinned to a release tag — works anywhere Rust runs:
+cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.2.0 --features http --bin MemoryPilot
+
+# Local clone + auto-config (same installer, run from inside the repo):
 git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && ./install.sh
 ```
 
-The installer builds MemoryPilot, installs the binary to `~/.local/bin/`, detects every supported IDE / agent, and writes the right MCP config for each one — Cursor, Claude Desktop, Claude Code, Codex CLI, Gemini CLI, Windsurf, VS Code, OpenCode, Cline, Roo Code — in one pass. Idempotent: re-run it any time to refresh configs without breaking the others.
+The installer is idempotent: re-run it any time to refresh configs without breaking the others.
 
 **Supported IDEs / agents (auto-configured by `./install.sh`):**
 
