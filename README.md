@@ -19,6 +19,10 @@
   <img src="https://img.shields.io/badge/license-Source_Available-orange" alt="Source Available"/>
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/demo.svg" alt="MemoryPilot demo — instant recall in 28 ms" width="880"/>
+</p>
+
 ---
 
 ## Why
@@ -251,7 +255,15 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 
 ## Install
 
-### One-liner (recommended — no clone, no Rust required)
+### Homebrew (macOS / Linux)
+
+```bash
+brew install Soflutionltd/memorypilot/memorypilot
+```
+
+That's it. Builds from source via `cargo` (Homebrew pulls Rust automatically). After install, run `./install.sh` from the cloned repo or follow the manual MCP config below.
+
+### One-liner — auto-configures every IDE on your machine
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/install.sh | bash
@@ -276,6 +288,19 @@ git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && .
 ```
 
 The installer is idempotent: re-run it any time to refresh configs without breaking the others.
+
+### Pre-built binaries
+
+Every release ships pre-built binaries for the four mainstream targets — built by the [release CI workflow](https://github.com/Soflutionltd/MemoryPilot/actions/workflows/release.yml) on every `v*.*.*` tag:
+
+| Platform | Target triple | Archive |
+|----------|---------------|---------|
+| macOS Apple Silicon | `aarch64-apple-darwin` | `MemoryPilot-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `x86_64-apple-darwin` | `MemoryPilot-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `MemoryPilot-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` | `MemoryPilot-aarch64-unknown-linux-gnu.tar.gz` |
+
+Each archive is paired with a `.sha256` for verification. Grab them from the [releases page](https://github.com/Soflutionltd/MemoryPilot/releases/latest).
 
 **Supported IDEs / agents (auto-configured by `./install.sh`):**
 
