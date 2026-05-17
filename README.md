@@ -28,6 +28,25 @@
 
 AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness, semantic understanding, and automatic knowledge organization. Built-in AAAK compression and memory capsules reduce token consumption by 5-10x when loading context. Every memory is auto-classified with the right importance, kind, and TTL on insert. The database compacts itself automatically — zero maintenance.
 
+<table align="center" width="100%">
+  <tr>
+    <td align="center" width="50%" valign="top">
+      <br/>
+      <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/icon-install.svg" alt="Install MemoryPilot" width="120" height="120"/>
+      <h3>Install MemoryPilot</h3>
+      <p>One-liner install for Cursor, Claude Desktop, VS Code, Windsurf, Claude Code, Codex and ChatGPT. Single Rust binary, zero runtime dependencies.</p>
+      <p><a href="#install"><b>Install the latest release →</b></a></p>
+    </td>
+    <td align="center" width="50%" valign="top">
+      <br/>
+      <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/icon-docs.svg" alt="How MemoryPilot works" width="120" height="120"/>
+      <h3>How it works</h3>
+      <p>The 9 pillars — hybrid search, temporal knowledge graph, GraphRAG, AAAK compression, auto-classification, self-healing — explained end to end.</p>
+      <p><a href="#the-9-pillars"><b>Read the architecture →</b></a></p>
+    </td>
+  </tr>
+</table>
+
 ## Benchmarks
 
 ### LongMemEval-S (ICLR 2025) — Academic Standard
