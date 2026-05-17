@@ -6,6 +6,7 @@ across the leading LLM memory layers as of v4.2.
 Sources (all public, as of May 2026):
 - MemoryPilot v4.2: this repo, --benchmark-longmemeval @470, May 2026
 - MemPalace v3.3.3: MemPalace LongMemEval public release notes
+- agentmemory v0.9: github.com/rohitg00/agentmemory README + benchmark/LONGMEMEVAL.md (R@5 95.2%)
 - Mem0: https://mem0.ai/blog/benchmarked-openai-memory-... (94.4% accuracy)
 - mcp-memory-service v10.34.0: release notes (R@5 80.4%, zero-LLM ONNX)
 - Zep / Graphiti: arxiv 2501.13956 (63.8% LongMemEval accuracy)
@@ -26,7 +27,8 @@ OUTPUT_SVG = "static/benchmark_chart.svg"
 DATA = [
     ("MemoryPilot v4.2 (adaptive)",      99.1, "#84cc16", True),   # lime-500
     ("MemoryPilot v4.2 (fast, ~28 ms)",  98.7, "#a3e635", True),   # lime-400
-    ("MemPalace v3.3.3 (hybrid)",        98.4, "#475569", False),  # slate-600
+    ("MemPalace v3.3.3 (hybrid)",        98.4, "#334155", False),  # slate-700
+    ("agentmemory v0.9 (11k stars)",     95.2, "#475569", False),  # slate-600
     ("Mem0 (cloud, OpenAI)",             94.4, "#64748b", False),  # slate-500
     ("mcp-memory-service v10.34",        80.4, "#94a3b8", False),  # slate-400
     ("Zep / Graphiti",                   63.8, "#cbd5e1", False),  # slate-300
@@ -110,7 +112,8 @@ fig.text(
 fig.text(
     0.01, 0.02,
     "Sources: MemoryPilot --benchmark-longmemeval @470 · MemPalace v3.3.3 notes · "
-    "mem0.ai blog · mcp-memory-service v10.34.0 · Zep arXiv 2501.13956",
+    "agentmemory v0.9 (rohitg00) · mem0.ai blog · mcp-memory-service v10.34.0 · "
+    "Zep arXiv 2501.13956",
     fontsize=8,
     color="#94a3b8",
 )

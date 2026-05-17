@@ -146,6 +146,56 @@ else
     skipped+=("Windsurf")
 fi
 
+# Gemini CLI (standard MCP format)
+GEMINI_CONFIG="$HOME/.gemini/settings.json"
+if [ -d "$HOME/.gemini" ] || command -v gemini &>/dev/null; then
+    upsert_mcp_config "$GEMINI_CONFIG" "mcpServers" "$STDIO_CONFIG"
+    ok "Gemini CLI → $GEMINI_CONFIG"
+    configured+=("Gemini CLI")
+else
+    skipped+=("Gemini CLI")
+fi
+
+# OpenCode (standard MCP format)
+OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
+if [ -d "$HOME/.config/opencode" ] || command -v opencode &>/dev/null; then
+    upsert_mcp_config "$OPENCODE_CONFIG" "mcp" "$STDIO_CONFIG"
+    ok "OpenCode → $OPENCODE_CONFIG"
+    configured+=("OpenCode")
+else
+    skipped+=("OpenCode")
+fi
+
+# Cline (VS Code extension — auto-detect global storage on macOS / Linux)
+CLINE_MAC="$HOME/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"
+CLINE_LIN="$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"
+if [ -d "$(dirname "$CLINE_MAC")" ]; then
+    upsert_mcp_config "$CLINE_MAC" "mcpServers" "$STDIO_CONFIG"
+    ok "Cline → $CLINE_MAC"
+    configured+=("Cline")
+elif [ -d "$(dirname "$CLINE_LIN")" ]; then
+    upsert_mcp_config "$CLINE_LIN" "mcpServers" "$STDIO_CONFIG"
+    ok "Cline → $CLINE_LIN"
+    configured+=("Cline")
+else
+    skipped+=("Cline")
+fi
+
+# Roo Code (VS Code extension)
+ROO_MAC="$HOME/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json"
+ROO_LIN="$HOME/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json"
+if [ -d "$(dirname "$ROO_MAC")" ]; then
+    upsert_mcp_config "$ROO_MAC" "mcpServers" "$STDIO_CONFIG"
+    ok "Roo Code → $ROO_MAC"
+    configured+=("Roo Code")
+elif [ -d "$(dirname "$ROO_LIN")" ]; then
+    upsert_mcp_config "$ROO_LIN" "mcpServers" "$STDIO_CONFIG"
+    ok "Roo Code → $ROO_LIN"
+    configured+=("Roo Code")
+else
+    skipped+=("Roo Code")
+fi
+
 # Claude Code (CLI)
 if command -v claude &>/dev/null; then
     claude mcp add "$BINARY_NAME" -- "$BINARY_PATH" 2>/dev/null && \

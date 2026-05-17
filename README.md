@@ -64,12 +64,13 @@ Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.108
 | **MemoryPilot v4.2 (adaptive)** | **99.1%** | ~900 ms | 100% local | Rust · 35 MB binary · zero API | This repo, `--benchmark-longmemeval` @470 |
 | **MemoryPilot v4.2 (default fast)** | **98.7%** | **~28 ms** | 100% local | Rust · 35 MB binary · zero API | This repo, `--benchmark-longmemeval` @470 |
 | MemPalace v3.3.3 (hybrid) | 98.4% | not published | 100% local | Python + ChromaDB · ~500 MB | MemPalace v3.3.3 release notes |
+| agentmemory v0.9 (11k+ stars) | 95.2% | not published | 100% local | Node + iii-engine + SQLite | [github.com/rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) — `benchmark/LONGMEMEVAL.md` |
 | Mem0 (cloud, OpenAI backend) | 94.4% | ~6 787 tokens/query | Cloud (OpenAI) | SaaS + OpenAI embeddings | [mem0.ai blog](https://mem0.ai/blog/benchmarked-openai-memory-vs-langmem-vs-memgpt-vs-mem0-for-long-term-memory-here-s-how-they-stacked-up) |
 | mcp-memory-service v10.34.0 | 80.4% | not published | 100% local | Python + SQLite-Vec + MiniLM | [v10.34.0 release notes](https://github.com/doobidoo/mcp-memory-service/releases/tag/v10.34.0) |
 | Zep / Graphiti | 63.8% | "90% lower vs baseline" | Cloud or self-host | Python + Neo4j + LLM extraction | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956) |
 | Letta / MemGPT | not measured on LongMemEval | — | Self-host | Python framework | [Letta tracking issue #3115](https://github.com/letta-ai/letta/issues/3115) |
 
-> MemoryPilot is the **only system in this comparison that is both 100% local *and* tops the leaderboard**. The default fast mode (~28 ms) already beats every published competitor; the adaptive cross-encoder mode adds +0.4 pp R@5 for the cost of one ONNX rerank pass per query.
+> MemoryPilot is the **only system in this comparison that is both 100% local *and* tops the leaderboard**. The default fast mode (~28 ms) already beats every published competitor — including agentmemory (95.2%), the current darling of the AI-agent-memory category with 11k+ GitHub stars. The adaptive cross-encoder mode adds +0.4 pp R@5 for the cost of one ONNX rerank pass per query, and a +6.7 pp MRR lead vs agentmemory (94.9% vs 88.2%).
 
 #### Detailed view — MemoryPilot vs MemPalace (closest local competitor)
 
@@ -123,45 +124,49 @@ Run-to-run variance is bounded to ±1 pp on R@5 / R@10 thanks to deterministic m
 
 **vs the best memory servers on the market:**
 
-| Feature | MemoryPilot v4.2 | MemPalace v3.3.3 | Mem0 | Zep / Graphiti |
-|---------|-----------------|----------------|------|----------------|
-| LongMemEval R@5 | **99.1%** | 98.4% | 94.4% | 63.8% |
-| Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) + adaptive jina cross-encoder | ChromaDB cosine (all-MiniLM-L6-v2) | Vector search (cloud API) | Temporal KG traversal + vector |
-| Embeddings | multilingual-e5-small (100+ languages, local ONNX) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) | OpenAI / cloud LLM extraction |
-| Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | Depends on API | Depends on LLM backend |
-| Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Basic graph (no temporal) | Temporal KG (Graphiti, core feature) |
-| GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | No | Yes (LLM-based extraction) |
-| Query-aware ranking | Preference/temporal/role/update/technical intent boosts | Hybrid v4 keyword + temporal boosts | Depends on API | Graph-distance scoring |
-| Corpus origin detection | AI transcript/codebase/notes/platform detection | v3.3.4 prep | No | No |
-| Agent/persona disambiguation | Agents are separate from real people | v3.3.4 prep | No | Partial (entity nodes) |
-| Topic tunnels | Cross-project topic links via KG | v3.3.4 prep | No | No |
-| Code-aware chunking | Tree-sitter Rust/Python/TS/TSX/JS + Svelte script extraction | Tree-sitter code chunking | No | No |
-| Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | No | LLM-based summarisation |
-| Compression | AAAK + Memory Capsules (5-10x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | No | No |
-| Auto-Classification | Zero-shot kind/importance/TTL on insert | No | No | LLM-classified entities |
-| Auto-Compaction | GC triggers automatically at 500+ memories | No | No | Manual |
-| Memory Capsules | Compress old memories into dense summaries | No | No | No |
-| Memory Pinning | Pin critical memories — always in recall, GC-proof | No | No | No |
-| Graph Traversal | Find related memories via KG (depth 1-3) | No | No | Native (Cypher / Neo4j) |
-| Bulk Operations | Delete by kind/project/tag/age with safety guards | No | No | Manual |
-| Health Dashboard | Memory distribution, stale count, orphans, DB size | No | No | No |
-| Dedup Detection | Jaccard similarity scan for near-duplicates | No | No | LLM-based reconciliation |
-| Person detection | Auto-detects team members from text | No | No | LLM-extracted entities |
-| Self-Healing | Background auto-linting loop | No | No | No |
-| Garbage collection | Heuristic merge + scoring + orphan cleanup | No | Basic TTL | No automatic GC |
-| Project brain | Yes, with team members (<1500 tokens) | No | No | No |
-| File watcher | Context boost from recent edits | No | No | No |
-| Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Embedding similarity | LLM-based merge |
-| HTTP API | Multi-threaded REST server (optional) | No | Cloud hosted | REST + GraphQL |
-| Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | 1 type | Episodic / semantic |
-| MCP tools | 41 tools | 29 tools | N/A | Limited MCP server |
-| Privacy | 100% local, zero API calls | 100% local | Cloud dependent | Cloud or self-host (LLM required) |
-| Language | Rust (single binary, zero deps) | Python (pip install) | SaaS | Python + Neo4j |
-| Startup | 1-2 ms (`open_at`) / synchronous warm via `open_at_warm` | ~5 ms | N/A (cloud) | Heavy (Neo4j boot) |
-| Binary | 35 MB single binary | Python + ChromaDB (~500 MB installed) | SaaS | Python + Neo4j (~1.5 GB) |
-| Storage | SQLite WAL + FTS5 + 16-conn read pool | ChromaDB | Cloud DB | Neo4j + Postgres |
-| Concurrency | EmbedPool (4) + RerankPool (1, tunable) + 16 read conns + debounced cleanup | Single-threaded | Single-threaded | Neo4j-bound |
-| External LLM dependency | **None** | None | OpenAI required | LLM required for ingestion |
+| Feature | MemoryPilot v4.2 | MemPalace v3.3.3 | agentmemory v0.9 | Mem0 | Zep / Graphiti |
+|---------|-----------------|----------------|------------------|------|----------------|
+| LongMemEval R@5 | **99.1%** | 98.4% | 95.2% | 94.4% | 63.8% |
+| LongMemEval MRR | **94.9%** | not published | 88.2% | not published | not published |
+| Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) + adaptive jina cross-encoder | ChromaDB cosine (all-MiniLM-L6-v2) | BM25 + vector + graph (RRF) | Vector search (cloud API) | Temporal KG traversal + vector |
+| Embeddings | multilingual-e5-small (100+ languages, local ONNX) | all-MiniLM-L6-v2 (English only) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) | OpenAI / cloud LLM extraction |
+| Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | English only | Depends on API | Depends on LLM backend |
+| Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Knowledge graph (no validity window) | Basic graph (no temporal) | Temporal KG (Graphiti, core feature) |
+| GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | Partial (graph search lane) | No | Yes (LLM-based extraction) |
+| Cross-encoder rerank | jina-v2-multilingual (adaptive, ~250 ms) | No | No | No | No |
+| Query-aware ranking | Preference/temporal/role/update/technical intent boosts | Hybrid v4 keyword + temporal boosts | RRF fusion only | Depends on API | Graph-distance scoring |
+| Corpus origin detection | AI transcript/codebase/notes/platform detection | v3.3.4 prep | No | No | No |
+| Agent/persona disambiguation | Agents are separate from real people | v3.3.4 prep | Hooks-based session scoping | No | Partial (entity nodes) |
+| Topic tunnels | Cross-project topic links via KG | v3.3.4 prep | No | No | No |
+| Code-aware chunking | Tree-sitter Rust/Python/TS/TSX/JS + Svelte script extraction | Tree-sitter code chunking | No | No | No |
+| Chunked RAG | Transcript auto-chunking + auto-distillation (8 types) | Conversation chunking by exchange | Session replay + JSONL import | No | LLM-based summarisation |
+| Compression | AAAK + Memory Capsules (5-10x token savings) | AAAK dialect (experimental, regresses recall to 84.2%) | 4-tier consolidation + decay | No | No |
+| Auto-Classification | Zero-shot kind/importance/TTL on insert | No | Pattern-based via hooks | No | LLM-classified entities |
+| Auto-Compaction | GC triggers automatically at 500+ memories | No | Lifecycle decay + auto-forget | No | Manual |
+| Memory Capsules | Compress old memories into dense summaries | No | Tier-based consolidation | No | No |
+| Memory Pinning | Pin critical memories — always in recall, GC-proof | No | No | No | No |
+| Graph Traversal | Find related memories via KG (depth 1-3) | No | Yes (graph lane) | No | Native (Cypher / Neo4j) |
+| Bulk Operations | Delete by kind/project/tag/age with safety guards | No | Governance delete API | No | Manual |
+| Health Dashboard | Memory distribution, stale count, orphans, DB size | No | Real-time web viewer (port 3113) | No | No |
+| Dedup Detection | Jaccard similarity scan for near-duplicates | No | Not documented | No | LLM-based reconciliation |
+| Person detection | Auto-detects team members from text | No | No | No | LLM-extracted entities |
+| Self-Healing | Background auto-linting loop | No | No | No | No |
+| Garbage collection | Heuristic merge + scoring + orphan cleanup | No | Lifecycle + decay | Basic TTL | No automatic GC |
+| Project brain | Yes, with team members (<1500 tokens) | No | Session summary on demand | No | No |
+| File watcher | Context boost from recent edits | No | Filesystem connector (`@agentmemory/fs-watcher`) | No | No |
+| Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Confidence scoring | Embedding similarity | LLM-based merge |
+| HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
+| Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
+| MCP tools | 41 tools | 29 tools | **51 tools** | N/A | Limited MCP server |
+| Hooks / event capture | File watcher + auto-linter (Rust-only) | No | **12 named hooks** (SessionStart, UserPromptSubmit, PreToolUse...) | No | No |
+| Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |
+| Language | Rust (single binary, zero deps) | Python (pip install) | TypeScript / Node (npm install) | SaaS | Python + Neo4j |
+| Startup | 1-2 ms (`open_at`) / synchronous warm via `open_at_warm` | ~5 ms | Node boot + iii-engine init | N/A (cloud) | Heavy (Neo4j boot) |
+| Binary | 35 MB single binary | Python + ChromaDB (~500 MB installed) | Node runtime + iii-engine deps | SaaS | Python + Neo4j (~1.5 GB) |
+| Storage | SQLite WAL + FTS5 + 16-conn read pool | ChromaDB | SQLite + iii-engine | Cloud DB | Neo4j + Postgres |
+| Concurrency | EmbedPool (4) + RerankPool (1, tunable) + 16 read conns + debounced cleanup | Single-threaded | Node event loop | Single-threaded | Neo4j-bound |
+| External LLM dependency | **None** | None | None (local embeddings) | OpenAI required | LLM required for ingestion |
+| GitHub stars (May 2026) | nascent | nascent | **11 083** | 53k | — |
 
 ## The 9 Pillars
 
@@ -249,25 +254,47 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 
 ## Install
 
-### One-liner (recommended)
+### Fastest path (one command, any platform)
 
 ```bash
-git clone https://github.com/Soflution1/MemoryPilot.git && cd MemoryPilot && ./install.sh
+cargo install --git https://github.com/Soflutionltd/MemoryPilot --features http --bin MemoryPilot
 ```
 
-The installer builds MemoryPilot, installs the binary to `~/.local/bin/`, detects your IDEs, and configures each one automatically.
+This compiles the latest `main` release-mode and drops the `MemoryPilot` binary into `~/.cargo/bin/` (already on your `$PATH` if you installed Rust the standard way). Done. From here you can run `MemoryPilot --version` and wire it into any MCP client manually.
 
-**Supported IDEs:**
+### Recommended path (auto-configures every IDE)
 
-| IDE | Config file | Auto-configured |
-|-----|------------|-----------------|
+```bash
+git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && ./install.sh
+```
+
+The installer builds MemoryPilot, installs the binary to `~/.local/bin/`, detects every supported IDE / agent, and writes the right MCP config for each one — Cursor, Claude Desktop, Claude Code, Codex CLI, Gemini CLI, Windsurf, VS Code, OpenCode, Cline, Roo Code — in one pass. Idempotent: re-run it any time to refresh configs without breaking the others.
+
+**Supported IDEs / agents (auto-configured by `./install.sh`):**
+
+| Agent | Config file / command | Auto-configured |
+|-------|----------------------|-----------------|
 | **Cursor** | `~/.cursor/mcp.json` | ✓ (stdio) |
 | **VS Code** | `~/.vscode/mcp.json` | ✓ (stdio) |
 | **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` | ✓ (stdio) |
-| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | ✓ (stdio) |
 | **Claude Code** | `claude mcp add` | ✓ (CLI) |
-| **Codex** | `codex mcp add` | ✓ (CLI) |
+| **Codex CLI** | `codex mcp add` | ✓ (CLI) |
+| **Gemini CLI** | `~/.gemini/settings.json` | ✓ (stdio) |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` | ✓ (stdio) |
+| **OpenCode** | `~/.config/opencode/opencode.json` | ✓ (stdio) |
+| **Cline** (VS Code) | `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` | ✓ (stdio) |
+| **Roo Code** (VS Code) | `~/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json` | ✓ (stdio) |
 | **ChatGPT Desktop** | Settings → Apps → Create | via HTTP (see below) |
+
+**Additional MCP-compatible clients** (use the same stdio binary, manual config):
+
+| Agent | Notes |
+|-------|-------|
+| Goose | YAML config under `~/.config/goose/config.yaml` — add `MemoryPilot` under `extensions:` with `type: stdio`, `cmd: ~/.local/bin/MemoryPilot` |
+| Kilo Code | Same `cline_mcp_settings.json` format under the Kilo VS Code extension storage path |
+| Continue.dev | `~/.continue/config.json` — add to `mcpServers` |
+| Zed | Settings → Assistant → Context Servers → add stdio command |
+| Aider | No native MCP; use the REST API (see HTTP API section) |
 
 The script is idempotent — run it again to update without breaking existing MCP configs.
 
@@ -284,7 +311,7 @@ In ChatGPT: Settings → Apps → Create → URL: `http://localhost:7437/mcp`
 ### Manual install
 
 ```bash
-git clone https://github.com/Soflution1/MemoryPilot.git
+git clone https://github.com/Soflutionltd/MemoryPilot.git
 cd MemoryPilot
 cargo build --release --features http
 cp target/release/MemoryPilot ~/.local/bin/
@@ -300,7 +327,7 @@ Then add MemoryPilot to your IDE's MCP config manually (see table above for file
 
 For ChatGPT or any MCP client that needs HTTP: run `MemoryPilot --http` to expose the Streamable HTTP endpoint at `/mcp`.
 
-Or use via [McpHub](https://github.com/Soflution1/McpHub) for SSE transport with all your other MCP servers.
+Or use via [McpHub](https://github.com/Soflutionltd/McpHub) for SSE transport with all your other MCP servers.
 
 ### First run
 
