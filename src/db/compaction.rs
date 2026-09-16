@@ -20,6 +20,17 @@ const ROLLUP_INTERVAL_SECS: u64 = 600;
 /// at least a couple of interval rollups.
 const ROLLUP_MIN_MEMORIES: i64 = 8;
 
+/// Rewind the compaction debounce so the next `add_memory` runs GC +
+/// capsule compaction immediately. Test-only: the clock is process-wide.
+#[cfg(test)]
+pub(super) fn arm_compaction_for_tests() {
+    let last = LAST_COMPACT.get_or_init(|| Mutex::new(std::time::Instant::now()));
+    if let Ok(mut timestamp) = last.lock() {
+        *timestamp = std::time::Instant::now() - std::time::Duration::from_secs(600);
+    }
+    COMPACTING.store(false, Ordering::SeqCst);
+}
+
 pub(super) fn maybe_auto_compact(db: &Database) {
     maybe_roll_up_episodes(db);
     maybe_compact(db);

@@ -5232,6 +5232,68 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    /// Regression: auto-compaction used to hold `LAST_COMPACT` across
+    /// `run_gc` / `compact_to_capsules`, whose merged rows go through
+    /// `add_memory` → `maybe_auto_compact` → the same `Mutex`. With a
+    /// corpus over `AUTO_COMPACT_THRESHOLD` the server froze on its first
+    /// write. The test drives exactly that path and fails if the write
+    /// does not come back within a generous bound.
+    #[test]
+    fn auto_compaction_reenters_add_memory_without_deadlock() {
+        let path = temp_db_path("compaction-reentrancy");
+        {
+            let db = Database::open_at(&path).expect("db");
+            let stale = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+            for index in 0..crate::gc::AUTO_COMPACT_THRESHOLD {
+                let content = format!("Old low-value note number {index} about the ingestion worker.");
+                db.conn
+                    .execute(
+                        "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
+                         VALUES (?1,?2,'note','memorypilot','[]','test',1,NULL,NULL,NULL,?3,?4,?4,0)",
+                        params![Uuid::new_v4().to_string(), &content, super::content_hash(&content), &stale],
+                    )
+                    .expect("seed memory");
+            }
+            super::compaction::arm_compaction_for_tests();
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let outcome = db.add_memory(
+                    "Fresh decision that trips auto-compaction.",
+                    "decision",
+                    Some("memorypilot"),
+                    &[],
+                    "test",
+                    4,
+                    None,
+                    None,
+                    &MemoryScope::default(),
+                );
+                // Both GC merges (`gc_compressor`) and capsule compaction
+                // (`auto_capsule`) write their rows through `add_memory`.
+                let reentrant_writes: i64 = db
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories WHERE source IN ('auto_capsule', 'gc_compressor')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                let _ = done_tx.send((outcome.map(|_| ()), reentrant_writes));
+            });
+
+            let (outcome, reentrant_writes) = done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("add_memory deadlocked inside auto-compaction");
+            outcome.expect("add_memory");
+            assert!(
+                reentrant_writes > 0,
+                "compaction path was not exercised: no GC merge or capsule written"
+            );
+        }
+        cleanup_db_files(&path);
+    }
+
     #[test]
     fn episodic_rollup_search_and_drilldown() {
         let path = temp_db_path("episodic-rollup");
