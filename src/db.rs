@@ -11,12 +11,18 @@ use uuid::Uuid;
 mod benchmark;
 #[path = "db/benchmark_fr.rs"]
 mod benchmark_fr;
+#[path = "db/benchmark_episodic.rs"]
+mod benchmark_episodic;
 #[path = "db/benchmark_longmemeval.rs"]
 mod benchmark_longmemeval;
 #[path = "db/compaction.rs"]
 mod compaction;
+#[path = "db/consolidate.rs"]
+mod consolidate;
 #[path = "db/embed_worker.rs"]
 mod embed_worker;
+#[path = "db/episodic.rs"]
+mod episodic;
 #[path = "db/export.rs"]
 mod export;
 #[path = "db/schema.rs"]
@@ -25,14 +31,23 @@ mod schema;
 mod transcript;
 
 use embed_worker::{
-    cached_embed_text, queue_access_update, queue_embedding_job, set_embed_ann_index,
-    set_embed_db_path,
+    cached_embed_text, embed_db_path, queue_access_update, queue_embedding_job,
+    queue_startup_backfill, set_embed_ann_index, set_embed_db_path,
 };
+
+#[allow(unused_imports)]
+pub use episodic::{Episode, EpisodeHit, RollupReport};
+pub use consolidate::AUTO_THRESHOLD as AUTO_CONSOLIDATE_THRESHOLD;
 
 const DB_DIR: &str = ".MemoryPilot";
 const DB_FILE: &str = "memory.db";
 const PROMPT_FILE: &str = "GLOBAL_PROMPT.md";
 const DEDUP_THRESHOLD: f64 = 0.85;
+/// `config` key holding the label of the encoder that produced the
+/// stored vectors. See `Database::sync_embedding_model`.
+const EMBEDDING_MODEL_KEY: &str = "embedding_model";
+/// Startup backfills larger than this run in the background worker.
+const SYNC_BACKFILL_MAX: usize = 32;
 
 pub(crate) fn content_hash(text: &str) -> String {
     let mut h: u64 = 14695981039346656037;
@@ -204,16 +219,106 @@ impl Database {
         db.upgrade_schema()?;
         db.normalize_project_identities()?;
         // If the user just swapped the embedding model (or upgraded
-        // from v4.1 small-model blobs to a v4.2 default), the on-disk
-        // blob length no longer matches the active model. Wipe those
-        // stale blobs so the regular backfill pass below re-embeds
-        // them with the new model. Cheap one-shot SQL — no scan
-        // happens once everything is up to date.
-        let _ = db.invalidate_stale_embeddings();
-        let _ = db.backfill_embeddings();
+        // from an older default), the stored vectors no longer share
+        // the active model's geometry. Wipe them so the backfill pass
+        // below re-embeds everything with the new model. Cheap one-shot
+        // SQL — no scan happens once everything is up to date.
+        let _ = db.sync_embedding_model();
+        db.backfill_missing_at_startup();
         let _ = db.migrate_fts_to_stemmed();
         Self::spawn_ann_warmup(ann, path.to_path_buf(), ann_warm_complete);
         Ok(db)
+    }
+
+    /// A second handle on the same database for background maintenance
+    /// (episodic rollup). One writer connection, one reader, no ANN
+    /// index, none of the startup work `open_at` does — cheap enough to
+    /// open per job on a thread and drop when the job is done.
+    pub(crate) fn open_maintenance(path: &Path) -> Result<Self, String> {
+        let conn = Connection::open(path).map_err(|e| format!("SQLite open: {}", e))?;
+        schema::configure_connection(&conn)?;
+        let read_pool = schema::open_read_pool(path, 1)?;
+        Ok(Self {
+            conn,
+            read_pool,
+            ann: None,
+            ann_warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
+    }
+
+    /// Reconcile the stored embedding fingerprint with the active model.
+    ///
+    /// The database remembers which encoder produced its vectors
+    /// (`config.embedding_model`). When the active model differs — or
+    /// the fingerprint is missing on a database that already holds
+    /// vectors, i.e. an upgrade from a pre-fingerprint release — every
+    /// embedding is set to NULL and the ANN index is emptied, then the
+    /// fingerprint is rewritten. Blob length alone cannot do this job:
+    /// multilingual-e5-base and jina-nano are both 768-dim.
+    fn sync_embedding_model(&self) -> Result<usize, String> {
+        let active = crate::embedding::model_label();
+        let stored = self.get_config(EMBEDDING_MODEL_KEY);
+        let mut invalidated = self.invalidate_stale_embeddings()?;
+        if stored.as_deref() == Some(active) {
+            return Ok(invalidated);
+        }
+        let with_vectors = self
+            .conn
+            .execute(
+                "UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL",
+                [],
+            )
+            .map_err(|error| format!("Embedding model swap invalidate: {}", error))?;
+        if with_vectors > 0 {
+            invalidated += with_vectors;
+            if let Some(ann) = self.ann.as_ref() {
+                let _ = ann.clear();
+            }
+            eprintln!(
+                "[MemoryPilot] Embedding model changed ({} → {}): {} vectors dropped and queued for re-embedding.",
+                stored.as_deref().unwrap_or("unknown"),
+                active,
+                with_vectors
+            );
+        }
+        self.set_config(EMBEDDING_MODEL_KEY, active)?;
+        Ok(invalidated)
+    }
+
+    /// Embed every memory that lacks a vector. A handful is done inline
+    /// so a fresh install returns fully searchable; a whole corpus (model
+    /// swap, upgrade) goes to the background embed worker so `open_at`
+    /// — and therefore the MCP handshake — returns at once. BM25 keeps
+    /// answering while vectors stream back in.
+    fn backfill_missing_at_startup(&self) {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT id, content FROM memories WHERE embedding IS NULL")
+        {
+            Ok(stmt) => stmt,
+            Err(_) => return,
+        };
+        let missing: Vec<(String, String)> = match stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return,
+        };
+        if missing.is_empty() {
+            return;
+        }
+        if missing.len() <= SYNC_BACKFILL_MAX {
+            let _ = self.backfill_embeddings();
+            return;
+        }
+        let count = missing.len();
+        if queue_startup_backfill(missing) {
+            eprintln!(
+                "[MemoryPilot] Re-embedding {} memories in the background with {} — vector recall ramps up over the next minutes, BM25 serves meanwhile.",
+                count,
+                crate::embedding::model_label()
+            );
+        }
     }
 
     /// Set `embedding = NULL` on every row whose blob length doesn't
@@ -1447,6 +1552,29 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_triples_object ON knowledge_triples(object);
             CREATE INDEX IF NOT EXISTS idx_triples_valid ON knowledge_triples(valid_from, valid_to);
 
+            CREATE TABLE IF NOT EXISTS episodes (
+                id TEXT PRIMARY KEY,
+                project TEXT,
+                level TEXT NOT NULL DEFAULT 'interval',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL,
+                embedding BLOB,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                salience REAL NOT NULL DEFAULT 0.0,
+                memory_count INTEGER NOT NULL DEFAULT 0,
+                source_ids TEXT NOT NULL DEFAULT '[]',
+                entities TEXT NOT NULL DEFAULT '[]',
+                child_ids TEXT NOT NULL DEFAULT '[]',
+                content_hash TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_episodes_project ON episodes(project);
+            CREATE INDEX IF NOT EXISTS idx_episodes_level ON episodes(level);
+            CREATE INDEX IF NOT EXISTS idx_episodes_time ON episodes(start_at, end_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_hash ON episodes(content_hash) WHERE content_hash IS NOT NULL;
+
             CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
             CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
             CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
@@ -1547,6 +1675,33 @@ impl Database {
                 .conn
                 .execute_batch("ALTER TABLE memories ADD COLUMN content_hash TEXT;");
         }
+        // v4.3: hierarchical episodic memory. Additive — existing rows
+        // are untouched; the table is created empty and populated lazily
+        // by the rollup pass (`Database::roll_up_episodes`).
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS episodes (
+                 id TEXT PRIMARY KEY,
+                 project TEXT,
+                 level TEXT NOT NULL DEFAULT 'interval',
+                 title TEXT NOT NULL DEFAULT '',
+                 summary TEXT NOT NULL,
+                 embedding BLOB,
+                 start_at TEXT NOT NULL,
+                 end_at TEXT NOT NULL,
+                 salience REAL NOT NULL DEFAULT 0.0,
+                 memory_count INTEGER NOT NULL DEFAULT 0,
+                 source_ids TEXT NOT NULL DEFAULT '[]',
+                 entities TEXT NOT NULL DEFAULT '[]',
+                 child_ids TEXT NOT NULL DEFAULT '[]',
+                 content_hash TEXT,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE INDEX IF NOT EXISTS idx_episodes_project ON episodes(project);
+             CREATE INDEX IF NOT EXISTS idx_episodes_level ON episodes(level);
+             CREATE INDEX IF NOT EXISTS idx_episodes_time ON episodes(start_at, end_at);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_hash ON episodes(content_hash) WHERE content_hash IS NOT NULL;",
+        );
         Ok(())
     }
 
@@ -2889,17 +3044,35 @@ impl Database {
             .take(3)
             .map(|r| r.memory.id.clone())
             .collect();
+        // Graph neighbours are context, not matches: they must rank below
+        // every candidate the query itself retrieved. RRF scores live in
+        // 0.002–0.049 (k = 40), so the former hard-coded 0.1 put every
+        // neighbour *above* the genuine top-10, the combinatorial pass
+        // then kept them there, and the cross-encoder's top-12 window
+        // was spent on them while real hits fell past `limit` — R@10 on
+        // memorypilot-fr-v2 was capped at ~70% by this alone. Neighbours
+        // now enter at half the weakest genuine score, capped in number,
+        // and only the cross-encoder can promote one.
+        const GRAPH_EXPANSION_MAX: usize = 4;
+        let graph_score = results
+            .last()
+            .map(|weakest| weakest.score * 0.5)
+            .unwrap_or(0.0);
         if let Ok(related_ids) = crate::graph::traverse_graph(&self.conn, &top_ids, 1) {
+            let mut added = 0usize;
             for rel_id in related_ids {
+                if added >= GRAPH_EXPANSION_MAX {
+                    break;
+                }
                 // If it's not already in results, fetch it and add it
                 if !results.iter().any(|r| r.memory.id == rel_id) {
                     if let Ok(Some(mem)) = self.get_memory(&rel_id) {
                         results.push(SearchResult {
                             memory: mem,
-                            // Give it a slightly lower score than the original match that pulled it
-                            score: 0.1,
+                            score: graph_score,
                             sources: vec!["graph".to_string()],
                         });
+                        added += 1;
                     }
                 }
             }
@@ -3388,7 +3561,7 @@ impl Database {
                     "kind": mem.kind,
                     "project": mem.project,
                     "importance": mem.importance,
-                    "preview": if mem.content.len() > 150 { format!("{}...", &mem.content[..150]) } else { mem.content.clone() },
+                    "preview": crate::text::preview(&mem.content, 150),
                     "tags": mem.tags,
                 }));
             }
@@ -3694,7 +3867,7 @@ impl Database {
                             "id": memories[i].0,
                             "kind": memories[i].2,
                             "importance": memories[i].3,
-                            "preview": if memories[i].1.len() > 120 { format!("{}...", &memories[i].1[..120]) } else { memories[i].1.clone() },
+                            "preview": crate::text::preview(&memories[i].1, 120),
                         }));
                     }
                     group.push(json!({
@@ -3702,7 +3875,7 @@ impl Database {
                         "kind": memories[j].2,
                         "importance": memories[j].3,
                         "similarity": (jaccard * 100.0).round() / 100.0,
-                        "preview": if memories[j].1.len() > 120 { format!("{}...", &memories[j].1[..120]) } else { memories[j].1.clone() },
+                        "preview": crate::text::preview(&memories[j].1, 120),
                     }));
                     seen.insert(j);
                 }
@@ -4104,6 +4277,11 @@ impl Database {
                 let _ = ann.persist();
             }
         }
+        if force {
+            // Every vector now comes from the active model: record it so
+            // the next `open_at` does not re-invalidate the corpus.
+            self.set_config(EMBEDDING_MODEL_KEY, crate::embedding::model_label())?;
+        }
         Ok(count)
     }
 
@@ -4126,11 +4304,7 @@ impl Database {
             "problem" => "PROB",
             _ => "MEM",
         };
-        let truncated = if mem.content.len() > 200 {
-            format!("{}...", &mem.content[..200])
-        } else {
-            mem.content.clone()
-        };
+        let truncated = crate::text::preview(&mem.content, 200);
         let tags_str = if mem.tags.is_empty() {
             String::new()
         } else {
@@ -4167,11 +4341,7 @@ impl Database {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let truncated = if s.len() > 150 {
-                    format!("{}...", &s[..150])
-                } else {
-                    s.clone()
-                };
+                let truncated = crate::text::preview(s, 150);
                 format!("[{}:{}] {}", tag, i + 1, truncated.replace('\n', " "))
             })
             .collect::<Vec<_>>()
@@ -4765,11 +4935,7 @@ impl Database {
                 ));
             }
             if let Some(gp) = &global_prompt {
-                let gp_short = if gp.len() > 500 {
-                    format!("{}...", &gp[..500])
-                } else {
-                    gp.clone()
-                };
+                let gp_short = crate::text::preview(gp, 500);
                 lines.push(format!("--- global_prompt ---\n{}", gp_short));
             }
             return Ok(serde_json::json!({
@@ -5064,6 +5230,63 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn episodic_rollup_search_and_drilldown() {
+        let path = temp_db_path("episodic-rollup");
+        {
+            let db = Database::open_at(&path).expect("db");
+            let empty_tags: Vec<String> = Vec::new();
+            let contents = [
+                "Decided to use Tokio for the async runtime in the ingestion worker.",
+                "Switched the embedding model to BGE-M3 for better multilingual recall.",
+                "Fixed a deadlock between two tokio mutexes in the rollup path.",
+                "Benchmarked French retrieval: R@5 improved after the model swap.",
+            ];
+            for content in contents {
+                db.add_memory(
+                    content,
+                    "decision",
+                    Some("MemoryPilot"),
+                    &empty_tags,
+                    "test",
+                    4,
+                    None,
+                    None,
+                    &MemoryScope::default(),
+                )
+                .expect("add memory");
+            }
+
+            let report = db.roll_up_episodes().expect("rollup");
+            assert!(
+                report.interval_created >= 1,
+                "expected at least one interval episode, got {:?}",
+                report
+            );
+            assert!(db.episode_count() >= 1, "episodes table should be populated");
+
+            let hits = db
+                .search_episodes("tokio async runtime deadlock", 5, Some("MemoryPilot"))
+                .expect("search episodes");
+            assert!(!hits.is_empty(), "episodic search should return a hit");
+
+            let top = &hits[0].episode;
+            let memories = db.episode_memories(&top.id).expect("drill down");
+            assert!(
+                !memories.is_empty(),
+                "drill-down should resolve raw memories"
+            );
+
+            // Idempotent: a second rollup creates nothing new.
+            let second = db.roll_up_episodes().expect("rollup again");
+            assert_eq!(
+                second.interval_created, 0,
+                "rollup must be idempotent on unchanged data"
+            );
+        }
+        cleanup_db_files(&path);
     }
 
     #[test]

@@ -397,7 +397,7 @@ impl Database {
             "questions_evaluated": eval_count,
             "questions_abstention_skipped": abstention_count,
             "granularity": "turn",
-            "embedding_model": "multilingual-e5-small (384-dim)",
+            "embedding_model": crate::embedding::model_label(),
             "search_engine": "BM25 + cosine RRF (k=40)",
             "metrics": {
                 "recall_at_5": format!("{}%", r5),

@@ -138,6 +138,33 @@ impl AnnIndex {
         Ok(())
     }
 
+    /// Drop every vector, in memory and on disk. Used when the embedding
+    /// model changes while keeping the same dimension (e.g. e5-base →
+    /// jina-nano, both 768-dim): the stale vectors would otherwise keep
+    /// being served against queries from a different geometry.
+    pub fn clear(&self) -> Result<(), String> {
+        {
+            let index = self
+                .inner
+                .lock()
+                .map_err(|_| "ANN lock poisoned".to_string())?;
+            index
+                .reset()
+                .map_err(|error| format!("ANN reset: {}", error))?;
+            index
+                .reserve_capacity_and_threads(DEFAULT_CAPACITY, DEFAULT_RESERVE_THREADS)
+                .map_err(|error| format!("ANN reserve after reset: {}", error))?;
+        }
+        if let Ok(mut map) = self.key_map.write() {
+            map.clear();
+        }
+        if let Some(path) = self.storage_path.as_ref() {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(sidecar_path(path));
+        }
+        Ok(())
+    }
+
     pub fn remove(&self, id: &str) -> Result<(), String> {
         let key = id_to_key(id);
         if let Ok(index) = self.inner.lock() {

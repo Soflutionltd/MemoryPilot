@@ -92,7 +92,7 @@ fn handle_health() -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
         "status": "ok",
         "server": "MemoryPilot",
         "version": env!("CARGO_PKG_VERSION"),
-        "embedding_engine": "fastembed (multilingual-e5-small, 384-dim)",
+        "embedding_engine": crate::embedding::model_label(),
     });
     tiny_http::Response::from_string(serde_json::to_string_pretty(&body).unwrap())
         .with_header(content_type_json())

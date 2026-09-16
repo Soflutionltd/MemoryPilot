@@ -48,11 +48,11 @@ fn first_sentence(content: &str) -> Option<String> {
     if cleaned.len() < 24 {
         return None;
     }
-    let end = cleaned
-        .find(". ")
-        .map(|index| index + 1)
-        .unwrap_or_else(|| cleaned.len().min(180));
-    Some(cleaned[..end].trim().to_string())
+    let sentence = match cleaned.find(". ") {
+        Some(index) => &cleaned[..index + 1],
+        None => crate::text::prefix(cleaned, 180),
+    };
+    Some(sentence.trim().to_string())
 }
 
 fn sentence_score(sentence: &str, memory: &Memory) -> i32 {

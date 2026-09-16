@@ -6,14 +6,14 @@
 
 <p align="center">
   <strong>The most advanced MCP memory server. Period.</strong><br><br>
-  <sub>Hybrid search (BM25 + multilingual-e5-small RRF) · 100+ languages · Temporal Knowledge Graph · Query-aware ranking · Corpus origin detection · Agent/persona disambiguation · Topic tunnels · AAAK compression (5-10x token savings) · GraphRAG · Chunked RAG · Auto-Compaction · Auto-Classification · Memory Capsules · HTTP API · Single binary · Zero API calls</sub>
+  <sub>Hybrid search (BM25 + jina-embeddings-v5 RRF + cross-encoder rerank) · 100+ languages · Temporal Knowledge Graph · Query-aware ranking · Corpus origin detection · Agent/persona disambiguation · Topic tunnels · AAAK compression (5-10x token savings) · GraphRAG · Chunked RAG · Auto-Compaction · Auto-Classification · Memory Capsules · HTTP API · Single binary · Zero API calls</sub>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/v4.2-latest-green" alt="v4.2"/>
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF_+_cross--encoder-blueviolet" alt="Hybrid RRF + cross-encoder"/>
-  <img src="https://img.shields.io/badge/embeddings-multilingual--e5--small_(384--dim)-blue" alt="multilingual-e5-small"/>
+  <img src="https://img.shields.io/badge/embeddings-jina--embeddings--v5--nano_(768--dim,_int8)-blue" alt="jina-embeddings-v5-text-nano-retrieval"/>
   <img src="https://img.shields.io/badge/rerank-jina--v2--multilingual-9cf" alt="jina-v2-multilingual"/>
   <img src="https://img.shields.io/badge/tokens-5--10x_compression-brightgreen" alt="5-10x token savings"/>
   <img src="https://img.shields.io/badge/license-Source_Available-orange" alt="Source Available"/>
@@ -102,8 +102,12 @@ To complement the English-only LongMemEval, MemoryPilot ships its own determinis
 
 | Mode | R@5 | R@10 | MRR | Avg latency |
 |------|-----|------|-----|-------------|
-| Default fast (BM25 + RRF) | 50.5% | 60.6% | 47.0% | ~12 ms |
-| Adaptive cross-encoder rerank (default) | **62.4%** | **62.4%** | **59.9%** | ~410 ms |
+| Default fast (BM25 + jina RRF) | 92.7% | 99.1% | 74.4% | ~100 ms |
+| Adaptive cross-encoder rerank (default) | **99.1%** | **99.1%** | **97.4%** | ~210 ms |
+
+v4.5 fixed a ranking bug that had capped this benchmark at R@5 ≈ 70% since v4.0: knowledge-graph neighbours were injected at a hard-coded score (0.1) above every genuine RRF hit (max 2/41 ≈ 0.049), so they occupied the cross-encoder window and pushed real matches past `limit`. Neighbours now enter below the weakest genuine candidate and only the cross-encoder can promote them.
+
+v4.5.0 also closes two write-path stability bugs surfaced by that work: the episodic rollup embedded every hourly bucket on **each** pass (before checking whether the episode already existed) and did so synchronously inside `add_memory`, then panicked on multi-byte French text; it now runs on its own thread with a cheap existence check first. And auto-compaction held a `Mutex` across `run_gc`/`compact_to_capsules`, whose merged rows re-enter `add_memory` — a deadlock hidden until the rollup stopped panicking ahead of it.
 
 Run-to-run variance is bounded to ±1 pp on R@5 / R@10 thanks to deterministic memory ids, deterministic id-based RRF tie-break, synchronous ANN warm-up, and explicit cross-encoder pre-warm before the first query. This is the metric to watch for any French / multilingual regression.
 
@@ -115,7 +119,7 @@ Run-to-run variance is bounded to ±1 pp on R@5 / R@10 thanks to deterministic m
 | **R@10** | **100%** | N/A | 93.4% |
 | **NDCG@10** | **95.6%** | 88.9% | 90.8% |
 | **Cluster Coherence** | **96.7%** | N/A | N/A |
-| **Multilingual** | **100+ languages** (validated FR R@5 62.4%) | English only | English only |
+| **Multilingual** | **100+ languages** (validated FR R@5 99.1%) | English only | English only |
 | **AAAK Compression** | **5-10x** (no recall loss) | 30x (recall drops to 84.2%) | N/A |
 | **Avg Search Latency** | **~28 ms** default / ~410 ms adaptive | N/A | ~80 ms |
 | **Binary Size** | **35 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
@@ -129,8 +133,8 @@ Run-to-run variance is bounded to ±1 pp on R@5 / R@10 thanks to deterministic m
 |---------|-----------------|----------------|------------------|------|----------------|
 | LongMemEval R@5 | **99.1%** | 98.4% | 95.2% | 94.4% | 63.8% |
 | LongMemEval MRR | **94.9%** | not published | 88.2% | not published | not published |
-| Search | Hybrid BM25 + multilingual-e5-small RRF (384-dim) + adaptive jina cross-encoder | ChromaDB cosine (all-MiniLM-L6-v2) | BM25 + vector + graph (RRF) | Vector search (cloud API) | Temporal KG traversal + vector |
-| Embeddings | multilingual-e5-small (100+ languages, local ONNX) | all-MiniLM-L6-v2 (English only) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) | OpenAI / cloud LLM extraction |
+| Search | Hybrid BM25 + jina-embeddings-v5-nano RRF (768-dim, int8) + adaptive mmarco cross-encoder | ChromaDB cosine (all-MiniLM-L6-v2) | BM25 + vector + graph (RRF) | Vector search (cloud API) | Temporal KG traversal + vector |
+| Embeddings | jina-embeddings-v5-text-nano-retrieval (100+ languages, 8k context, local ONNX) | all-MiniLM-L6-v2 (English only) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) | OpenAI / cloud LLM extraction |
 | Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | English only | Depends on API | Depends on LLM backend |
 | Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Knowledge graph (no validity window) | Basic graph (no temporal) | Temporal KG (Graphiti, core feature) |
 | GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | Partial (graph search lane) | No | Yes (LLM-based extraction) |
@@ -171,9 +175,9 @@ Run-to-run variance is bounded to ±1 pp on R@5 / R@10 thanks to deterministic m
 
 ## The 9 Pillars
 
-### 1. Hybrid Search (BM25 + fastembed RRF)
+### 1. Hybrid Search (BM25 + jina RRF)
 
-Every memory gets a 384-dimension transformer embedding on insert via `fastembed` (multilingual-e5-small, local ONNX inference — supports 100+ languages including French, English, Spanish, German, Japanese, Chinese — no API calls, no external services). Search runs both BM25 full-text and cosine similarity in parallel, then merges results with Reciprocal Rank Fusion.
+Every memory gets a 768-dimension transformer embedding on insert via ONNX Runtime (`jina-embeddings-v5-text-nano-retrieval`, int8, local inference — 100+ languages including French, English, Spanish, German, Japanese, Chinese — no API calls, no external services; the model is fetched from its Hugging Face repository on first run, licence CC-BY-NC-4.0). Queries and documents use the model's asymmetric `Query:` / `Document:` prefixes. The int8 weights are memory-mapped, so the embedder costs ~250 MB resident, most of it reclaimable file-backed pages. Search runs both BM25 full-text and cosine similarity in parallel, then merges results with Reciprocal Rank Fusion.
 
 Results are boosted by importance weighting, knowledge graph link density, file watcher context, and penalized for expired knowledge triples.
 
@@ -383,7 +387,7 @@ MemoryPilot --backfill-force
 |------|-------------|
 | **`recall`** | Start here. Loads all context in one shot: project memories, scoped thread/window memories, preferences, critical facts, patterns, decisions, global prompt. Supports `mode = safe/default/full`, `compact = true` for AAAK compression. |
 | **`get_project_brain`** | Instant project summary (<1500 tokens): tech stack, architecture, bugs, recent changes, components, team members. Supports `compact = true`. |
-| **`search_memory`** | Hybrid BM25 + fastembed RRF search, boosted by importance, graph links, and file watcher context. Batched triple scoring. |
+| **`search_memory`** | Hybrid BM25 + jina RRF search, boosted by importance, graph links, and file watcher context. Batched triple scoring. |
 | **`get_file_context`** | Memories related to recently modified files in working directory. |
 
 ### Memory CRUD
@@ -434,6 +438,7 @@ MemoryPilot --backfill-force
 | `bulk_delete` | Delete memories by kind, project, tag, age, or importance. Never touches pinned memories. |
 | `get_memory_health` | Health report: distribution by kind/project/importance, stale count, orphans, compression potential, DB size. |
 | `dedupe_report` | Find potential duplicates via Jaccard similarity for manual review. |
+| `consolidate_memories` | Fold near-duplicate ephemeral memories (embedding cosine ≥ threshold, same project, never decisions/credentials/pinned) into their newest member — tags, importance, access counts and graph links merged. Dry-run by default, `apply: true` to execute; also runs automatically once a day. |
 | `analyze_corpus` | Inspect text without writing memory: origin, platform, agents/personas, and reliable topics. |
 | `benchmark_recall` | Recall quality benchmark with golden scenarios. |
 | `benchmark_search` | Search quality benchmark: R@5, R@10, NDCG@10, cluster coherence, latency. |
@@ -470,10 +475,13 @@ MemoryPilot --help                   # Show help
 | `MEMORYPILOT_CROSS_RERANK` | `adaptive` | `1`/`always` to force rerank on every query, `0`/`off` to disable. Adaptive rerank fires on hard / non-English queries. |
 | `MEMORYPILOT_CROSS_RERANK_TOP_K` | `12` | Number of candidates the cross-encoder rescores. |
 | `MEMORYPILOT_CROSS_RERANK_WEIGHT` | `0.45` | Fusion weight given to the cross-encoder score against the RRF score. Sweep tested 0.20-0.85; 0.45 is the best operating point on `--benchmark-fr` and stays within 0.2 pp R@5 of the optimum on LongMemEval. |
-| `MEMORYPILOT_RERANK_POOL_SIZE` | `1` | Number of cross-encoder ONNX sessions kept hot. `2` cuts force-rerank p50 by 21% and p95 by 38% under 4-client load, at the cost of ~1.1 GB extra RAM. |
-| `MEMORYPILOT_EMBED_POOL_SIZE` | `4` | Number of fastembed ONNX sessions in the pool. Steady-state RAM scales roughly linearly. |
-| `MEMORYPILOT_RERANKER_MODEL` | `jina-v2-multilingual` | Override with `bge-v2-m3`, `bge-base`, or `jina-v1`. |
-| `MEMORYPILOT_EMBED_MODEL` | `e5-small` | Embedding model. Override with `e5-large` (1024-dim, +3-6 pp R@5 on FR, +1.4 GB RAM, ~3× slower per embedding) or `bge-m3` (1024-dim, 8192 context). The on-disk blob format adapts automatically and stale embeddings are re-computed at next start. |
+| `MEMORYPILOT_RERANK_POOL_SIZE` | `1` | Number of cross-encoder ONNX sessions kept hot. `2` helps only under heavy concurrent load; each extra mmarco session costs ~120 MB. |
+| `MEMORYPILOT_EMBED_POOL_SIZE` | `1` | Number of embedding ONNX sessions in the pool (legacy fastembed models keep `4`, or `2` for 1024-dim). A second jina session adds ~250 MB and only pays off under heavy concurrent writes. |
+| `MEMORYPILOT_EMBED_THREADS` | `min(4, cores)` | ONNX intra-op threads for the embedder. `MEMORYPILOT_RERANK_THREADS` (default `min(2, cores)`) does the same for the cross-encoder. |
+| `MEMORYPILOT_RERANKER_MODEL` | `mmarco` | `mmarco-mMiniLMv2-L12-H384-v1` int8 (Apache-2.0, ~120 MB resident). Alternatives served the same way (int8, memory-mapped): `jina-v2` (`jina-reranker-v2-base-multilingual`, 280 MB, CC-BY-NC) and `gte-multilingual` (`gte-multilingual-reranker-base`, 341 MB, Apache-2.0) — both measured *lower* on `--benchmark-fr` (MRR 63.5% / 62.1% vs 65.3% before the v4.5 fix) at 2× the latency, hence not the default. Legacy fp32 fastembed models: `jina-v2-multilingual-fp32` (1.1 GB), `bge-v2-m3`, `bge-base`, `jina-v1`. |
+| `MEMORYPILOT_MODEL_IDLE_SECS` | `600` | Idle time after which the embedder and reranker sessions are dropped to free memory (~250 MB). `0` keeps them resident (benchmarks). |
+| `MEMORYPILOT_CONSOLIDATE` | `on` | Daily embedding-based consolidation of near-duplicate ephemeral memories (cosine ≥ 0.95 and word overlap ≥ 0.6, same project, newest kept). `off` disables it; `consolidate_memories` runs it on demand. |
+| `MEMORYPILOT_EMBED_MODEL` | `jina` | `jina-embeddings-v5-text-nano-retrieval` int8 (768-dim). `jina-q4` = 4-bit variant (140 MB download, ~5× faster queries, −1 pp R@5 / −3 pp MRR on FR). Apache-2.0 alternatives via fastembed: `e5-small` (384-dim), `e5-base`, `e5-large`, `bge-m3` (1024-dim). The database records which model produced its vectors; changing the model drops them and re-embeds everything in the background at next start (BM25 keeps answering meanwhile). |
 
 ## HTTP API
 
@@ -501,7 +509,11 @@ src/db/benchmark_longmemeval.rs — LongMemEval-S benchmark runner + regression 
 src/db/transcript.rs — Transcript/session ingestion and local-only distillation
 src/tools.rs       — 41 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
-src/embedding.rs   — fastembed (multilingual-e5-small) transformer embeddings, EmbedPool, two-tier query cache
+src/embedding.rs   — jina-embeddings-v5 via ONNX Runtime (fastembed for legacy models), EmbedPool, two-tier query cache
+src/tokenizer.rs   — lean byte-level BPE (tiktoken ranks) and Unigram tokenizers, ~65 MB instead of ~535 MB with the `tokenizers` crate
+src/onnx_external.rs — one-shot rewrite of embedded ONNX weights into a memory-mapped sidecar (ORT 1.28 keeps 3 copies otherwise)
+src/pool.rs        — lazily-built, idle-evicting pool shared by the embedder and reranker sessions
+src/db/consolidate.rs — embedding-based near-duplicate consolidation (daily + `consolidate_memories`)
 src/reranking.rs   — Cross-encoder rerank (jina-v2-multilingual), RerankPool, adaptive trigger, confidence gate
 src/ann.rs         — Persistent on-disk HNSW (usearch) with synchronous warm-up via `wait_for_ann_warm`
 src/fts.rs         — FTS5 query variants (prefix, phrase, NEAR) + Snowball stemming
@@ -533,13 +545,14 @@ config             — key/value store
 | Startup (`open_at`) | 1-2 ms (ANN warm-up runs in background) |
 | Startup (`open_at_warm`) | 50-200 ms on 10 k memories (ANN hydrated synchronously, deterministic search from query #1) |
 | Search default fast (BM25 + RRF) | ~28 ms avg on LongMemEval-S |
-| Search adaptive cross-encoder | ~410 ms avg on `--benchmark-fr`, ~900 ms on LongMemEval-S |
+| Search adaptive cross-encoder | ~210 ms avg on `--benchmark-fr` (R@5 99.1%, MRR 97.4%; v4.4 was 230 ms / R@5 70.6% / MRR 65%, v4.3 415 ms / R@5 60% / MRR 57%) |
 | Concurrency p95 (4 clients × 20 queries, 500 memories, adaptive) | 229 ms |
 | `add_memory` latency | <1 ms (lazy embed) |
-| Embedding quality | Transformer 384-dim (multilingual-e5-small, 100+ languages) |
-| Backfill (1000 memories) | ~30 s (skips unchanged via hash) |
-| RAM (idle, after pool warm-up) | ~3.5 GB resident — driven by ONNX arenas (4× fastembed + 1× cross-encoder) |
-| RAM (steady-state, 4-client load) | ~7 GB resident |
+| Embedding quality | Transformer 768-dim (jina-embeddings-v5-text-nano-retrieval int8, 100+ languages, 8k context) |
+| Backfill (1000 memories) | ~2 min in the background (model swap re-embed; `recall` stays interactive, ~1 s, while it runs) |
+| RAM (both models loaded, steady state) | ~370 MB on a fresh database, ~485 MB with 2 000 memories in the ANN index — almost all of it memory-mapped int8 weights (247 MB jina + 118 MB mmarco) the OS can reclaim under pressure (was ~3.5 GB idle / ~7 GB peak in v4.3) |
+| RAM (idle) | ~130 MB: both ONNX sessions are released after `MEMORYPILOT_MODEL_IDLE_SECS` (default 600 s) without a query and rebuilt on the next one (~0.8 s once, ~0.3 s for the reranker alone) |
+| RAM (`--benchmark-fr`, peak) | 364 MB (was 7.05 GB) |
 | Read concurrency | 16 pooled connections per Database handle |
 | Runtime dependencies | **None** (ONNX bundled) |
 
@@ -621,7 +634,7 @@ Supported model shortcuts: `jina-v2-multilingual` (default), `bge-v2-m3`, `bge-b
 
 - Database: `~/.MemoryPilot/memory.db`
 - Global prompt: `~/.MemoryPilot/GLOBAL_PROMPT.md`
-- Fastembed model cache: `~/.fastembed_cache/` (downloaded on first run)
+- Model cache: `~/.cache/fastembed/` (Hugging Face layout, downloaded on first run; `FASTEMBED_CACHE_PATH` overrides). Externalized ONNX weights live in `memorypilot-external/` inside it.
 
 ## License
 

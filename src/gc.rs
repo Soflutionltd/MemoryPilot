@@ -112,11 +112,10 @@ pub fn merge_memories(contents: &[String], kind: &str, project: Option<&str>) ->
         .filter_map(|c| {
             let trimmed = c.trim();
             // Take first sentence or first 120 chars
-            let end = trimmed
-                .find(". ")
-                .map(|i| i + 1)
-                .unwrap_or_else(|| trimmed.len().min(120));
-            let sentence = &trimmed[..end];
+            let sentence = match trimmed.find(". ") {
+                Some(i) => &trimmed[..i + 1],
+                None => crate::text::prefix(trimmed, 120),
+            };
             if sentence.len() > 5 {
                 Some(format!("- {}", sentence))
             } else {
@@ -188,12 +187,12 @@ pub fn capsule_summary(contents: &[String], kinds: &[String], project: Option<&s
             }
         }
         let trimmed = c.trim();
-        let end = trimmed
-            .find(". ")
-            .map(|i| i + 1)
-            .unwrap_or_else(|| trimmed.len().min(100));
-        if end > 5 {
-            fact_sentences.push(trimmed[..end].to_string());
+        let sentence = match trimmed.find(". ") {
+            Some(i) => &trimmed[..i + 1],
+            None => crate::text::prefix(trimmed, 100),
+        };
+        if sentence.len() > 5 {
+            fact_sentences.push(sentence.to_string());
         }
     }
 

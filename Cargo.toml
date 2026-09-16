@@ -1,9 +1,9 @@
 [package]
 name = "memory-pilot"
-version = "4.2.0"
+version = "4.5.0"
 edition = "2021"
 authors = ["SOFLUTION LTD"]
-description = "God-Tier MCP memory server — Hybrid search (BM25 + multilingual-e5-small RRF), 100+ languages, Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server."
+description = "God-Tier MCP memory server — Hybrid search (BM25 + jina-embeddings-v5 RRF + cross-encoder rerank), hierarchical episodic memory, 100+ languages, Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server."
 license-file = "LICENSE"
 repository = "https://github.com/Soflutionltd/MemoryPilot"
 keywords = ["mcp", "memory", "sqlite", "cursor", "ai"]
@@ -21,7 +21,18 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 notify = { version = "6", features = ["macos_kqueue"] }
-fastembed = "5"
+fastembed = { version = "7.0.1", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+# Pinned to the exact `ort` release fastembed 7.0.1 links against: two
+# `ort-sys` versions in one binary would fail to link (duplicate symbols).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "api-24"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
+# Lean tokenizers (src/tokenizer.rs): tiktoken's rank BPE for jina, a
+# hand-rolled Unigram for XLM-R. The `tokenizers` crate (pulled in by
+# fastembed for the legacy models) costs 205 MB + 330 MB resident for
+# these two vocabularies; this pair costs ~65 MB for identical output.
+tiktoken-rs = { version = "0.12", default-features = false }
+rustc-hash = "2"
+unicode-normalization = "0.1"
 tiny_http = { version = "0.12", optional = true }
 tree-sitter = "0.26.8"
 tree-sitter-rust = "0.24.2"
@@ -45,3 +56,7 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[dev-dependencies]
+# Reference implementation the lean tokenizers are asserted against.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }

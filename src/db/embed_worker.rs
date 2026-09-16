@@ -104,6 +104,10 @@ pub(super) fn set_embed_db_path(path: &Path) {
     let _ = EMBED_DB_PATH.set(path.to_path_buf());
 }
 
+pub(super) fn embed_db_path() -> Option<&'static Path> {
+    EMBED_DB_PATH.get().map(|path| path.as_path())
+}
+
 pub(super) fn set_embed_ann_index(ann: Option<Arc<AnnIndex>>) {
     let slot = EMBED_ANN_INDEX.get_or_init(|| RwLock::new(None));
     if let Ok(mut guard) = slot.write() {
@@ -127,6 +131,35 @@ pub(super) fn queue_embedding_job(id: &str, content: &str) {
     ensure_embed_worker();
 }
 
+static STARTUP_BACKFILL_QUEUED: OnceLock<()> = OnceLock::new();
+
+/// Queue the whole corpus for background embedding after a model swap,
+/// once per process. `open_at` runs several times per process (main
+/// handle, watcher, HTTP workers) and each would otherwise re-queue the
+/// same still-NULL rows while the worker is busy on the first copy.
+pub(super) fn queue_startup_backfill(jobs: Vec<(String, String)>) -> bool {
+    let mut queued = false;
+    STARTUP_BACKFILL_QUEUED.get_or_init(|| {
+        queue_embedding_jobs(jobs);
+        queued = true;
+    });
+    queued
+}
+
+/// Queue many memories for background embedding in one lock acquisition.
+fn queue_embedding_jobs(jobs: Vec<(String, String)>) {
+    if jobs.is_empty() {
+        return;
+    }
+    if let Ok(mut queue) = embed_queue().lock() {
+        queue.extend(
+            jobs.into_iter()
+                .map(|(id, content)| EmbedJob { id, content }),
+        );
+    }
+    ensure_embed_worker();
+}
+
 pub(super) fn cached_embed_text(text: &str) -> Vec<f32> {
     if let Ok(cache) = embed_cache().lock() {
         if let Some(embedding) = cache.get(text) {
@@ -141,12 +174,19 @@ pub(super) fn cached_embed_text(text: &str) -> Vec<f32> {
         return embedding;
     }
 
-    let embedding = crate::embedding::embed_text(text);
+    let embedding = crate::embedding::embed_query(text);
     if let Ok(mut cache) = embed_cache().lock() {
         cache.insert(text.to_string(), embedding.clone());
     }
     write_disk_query_cache(text, &embedding);
     embedding
+}
+
+/// Disk cache key. Salted with the active model label: a cached query
+/// vector from another encoder has the wrong geometry (and possibly the
+/// same length), so it must never be served after a model swap.
+fn query_cache_key(text: &str) -> String {
+    content_hash(&format!("{}\u{0}{}", crate::embedding::model_label(), text))
 }
 
 fn query_cache_path() -> Option<PathBuf> {
@@ -178,7 +218,7 @@ fn open_query_cache() -> Option<Connection> {
 
 fn read_disk_query_cache(text: &str) -> Option<Vec<f32>> {
     let conn = open_query_cache()?;
-    let key = content_hash(text);
+    let key = query_cache_key(text);
     let blob: Vec<u8> = conn
         .query_row(
             "SELECT embedding FROM query_cache WHERE text_hash = ?1",
@@ -203,7 +243,7 @@ fn write_disk_query_cache(text: &str, embedding: &[f32]) {
     let Some(conn) = open_query_cache() else {
         return;
     };
-    let key = content_hash(text);
+    let key = query_cache_key(text);
     let blob = crate::embedding::vec_to_blob(embedding);
     let now = chrono::Utc::now().timestamp();
     let _ = conn.execute(
@@ -239,16 +279,36 @@ fn ensure_embed_worker() {
     });
 }
 
+/// Jobs embedded per pool acquisition. A model-swap re-embed queues
+/// thousands of memories; taking them in slices keeps the (single)
+/// embedding session free every ~second so interactive `recall`
+/// queries interleave instead of waiting behind the whole corpus.
+const EMBED_SLICE: usize = 32;
+
 fn embed_worker_loop() {
+    let mut backlog = false;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // With a backlog, pause just long enough for a waiting `recall`
+        // to grab the embedding session between two slices — the
+        // Condvar hand-off is not fair, and re-acquiring immediately
+        // would starve interactive queries for the whole backfill.
+        std::thread::sleep(std::time::Duration::from_millis(if backlog { 25 } else { 100 }));
 
         let jobs: Vec<EmbedJob> = {
             let mut queue = match embed_queue().lock() {
                 Ok(queue) => queue,
                 Err(_) => continue,
             };
-            queue.drain(..).collect()
+            let take = queue.len().min(EMBED_SLICE);
+            let mut slice: Vec<EmbedJob> = queue.drain(..take).collect();
+            backlog = !queue.is_empty();
+            // Same memory queued twice (double open, rapid edits): keep
+            // the most recent content only.
+            let mut seen = std::collections::HashSet::with_capacity(slice.len());
+            slice.reverse();
+            slice.retain(|job| seen.insert(job.id.clone()));
+            slice.reverse();
+            slice
         };
 
         // Even with no embed jobs we still want to drain the access

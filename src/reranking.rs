@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use crate::db::SearchResult;
 
@@ -123,22 +123,23 @@ pub fn rerank_cross_encoder_if_enabled(query: &str, results: &mut Vec<SearchResu
         // concurrency bench).
         match acquire_pooled_reranker() {
             Some(mut handle) => handle
-                .with_model(|model| {
-                    model
-                        .rerank(query.to_string(), &documents, false, Some(16))
-                        .ok()
-                })
+                .with_model(|model| model.scores(query, &documents))
                 .flatten(),
             None => None,
         }
     };
 
-    let Some(reranked) = reranked else {
+    let Some(scores) = reranked else {
         return;
     };
-    if reranked.len() != top_k {
+    if scores.len() != top_k {
         return;
     }
+    let reranked: Vec<CrossScore> = scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, score)| CrossScore { index, score })
+        .collect();
 
     let min_cross = reranked
         .iter()
@@ -200,9 +201,189 @@ pub fn rerank_cross_encoder_if_enabled(query: &str, results: &mut Vec<SearchResu
     *results = fused;
 }
 
+struct CrossScore {
+    index: usize,
+    score: f32,
+}
+
 enum CrossRerankerState {
-    Ready(fastembed::TextRerank),
+    Ready(Reranker),
     Unavailable(String),
+}
+
+/// A loaded cross-encoder. The default mmarco model is driven through
+/// `ort` directly; the legacy fastembed rerankers stay available behind
+/// `MEMORYPILOT_RERANKER_MODEL`.
+enum Reranker {
+    Ort(OrtReranker),
+    Fastembed(fastembed::TextRerank),
+}
+
+impl Reranker {
+    /// One relevance score per document, in input order.
+    fn scores(&mut self, query: &str, documents: &[String]) -> Option<Vec<f32>> {
+        match self {
+            Reranker::Ort(model) => match model.scores(query, documents) {
+                Ok(scores) => Some(scores),
+                Err(error) => {
+                    eprintln!("[reranker] cross-encoder run failed: {}", error);
+                    None
+                }
+            },
+            Reranker::Fastembed(model) => {
+                let results = model
+                    .rerank(query.to_string(), documents, false, Some(16))
+                    .ok()?;
+                let mut scores = vec![0.0f32; documents.len()];
+                for result in results {
+                    if let Some(slot) = scores.get_mut(result.index) {
+                        *slot = result.score;
+                    }
+                }
+                Some(scores)
+            }
+        }
+    }
+}
+
+/// Padded tokens per ONNX run for the cross-encoder (batch × longest
+/// pair). 12 memory snippets of ~100 tokens fit in one run; 512-token
+/// pairs go two at a time. Small on purpose — see the embedder.
+const RERANK_TOKEN_BUDGET: usize = 1024;
+const RERANK_MAX_TOKENS: usize = 512;
+
+struct OrtReranker {
+    session: ort::session::Session,
+    tokenizer: crate::tokenizer::Unigram,
+    run_options: ort::session::RunOptions,
+    needs_token_type_ids: bool,
+}
+
+/// An XLM-R–family cross-encoder served through `ort`: Hugging Face repo
+/// plus the int8 graph inside it. All three share the same Unigram
+/// tokenizer and `<s> q </s></s> d </s>` pair template.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OrtRerankerSpec {
+    pub repo: &'static str,
+    pub onnx_file: &'static str,
+    pub label: &'static str,
+}
+
+impl OrtReranker {
+    fn load(spec: OrtRerankerSpec) -> Result<Self, String> {
+        // The repositories embed the weights in the protobuf; ONNX Runtime
+        // 1.28 loads that layout with ~3 copies resident. Convert once to
+        // external data so the weights are memory-mapped instead.
+        let graph_path = crate::onnx_external::externalized(spec.repo, spec.onnx_file, false)?;
+        let tokenizer_path = crate::embedding::hf_file(spec.repo, "tokenizer.json", false)?;
+        let tokenizer = crate::tokenizer::Unigram::from_file(&tokenizer_path)
+            .map_err(|error| format!("reranker tokenizer load: {}", error))?;
+
+        use ort::session::builder::GraphOptimizationLevel;
+        let session = ort::session::Session::builder()
+            .map_err(|error| format!("ort builder: {}", error))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|error| format!("ort optimization level: {}", error))?
+            .with_intra_threads(rerank_intra_threads())
+            .map_err(|error| format!("ort intra threads: {}", error))?
+            .with_memory_pattern(false)
+            .map_err(|error| format!("ort memory pattern: {}", error))?
+            .with_config_entry("session.use_device_allocator_for_initializers", "1")
+            .map_err(|error| format!("ort config entry: {}", error))?
+            .commit_from_file(&graph_path)
+            .map_err(|error| format!("ort session load {}: {}", graph_path.display(), error))?;
+        let needs_token_type_ids = session
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids");
+
+        let mut run_options = ort::session::RunOptions::new()
+            .map_err(|error| format!("ort run options: {}", error))?;
+        run_options
+            .set("memory.enable_memory_arena_shrinkage", "cpu:0")
+            .map_err(|error| format!("ort arena shrinkage: {}", error))?;
+
+        Ok(Self {
+            session,
+            tokenizer,
+            run_options,
+            needs_token_type_ids,
+        })
+    }
+
+    fn scores(&mut self, query: &str, documents: &[String]) -> Result<Vec<f32>, String> {
+        let encodings: Vec<Vec<u32>> = documents
+            .iter()
+            .map(|document| self.tokenizer.encode_pair(query, document, RERANK_MAX_TOKENS))
+            .collect();
+
+        let mut order: Vec<usize> = (0..encodings.len()).collect();
+        order.sort_by_key(|&index| std::cmp::Reverse(encodings[index].len()));
+
+        let mut scores = vec![0.0f32; documents.len()];
+        let mut start = 0;
+        while start < order.len() {
+            let width = encodings[order[start]].len().max(1);
+            let rows = (RERANK_TOKEN_BUDGET / width).max(1);
+            let end = (start + rows).min(order.len());
+            let pack = &order[start..end];
+            let logits = self.run_pack(&encodings, pack, width)?;
+            for (&index, logit) in pack.iter().zip(logits) {
+                scores[index] = logit;
+            }
+            start = end;
+        }
+        Ok(scores)
+    }
+
+    fn run_pack(
+        &mut self,
+        encodings: &[Vec<u32>],
+        pack: &[usize],
+        width: usize,
+    ) -> Result<Vec<f32>, String> {
+        let batch = pack.len();
+        let pad_id = self.tokenizer.pad_id() as i64;
+        let mut ids = Vec::with_capacity(batch * width);
+        let mut mask = Vec::with_capacity(batch * width);
+        for &index in pack {
+            let encoding = &encodings[index];
+            let len = encoding.len().min(width);
+            ids.extend(encoding[..len].iter().map(|&id| id as i64));
+            ids.extend(std::iter::repeat(pad_id).take(width - len));
+            mask.extend(std::iter::repeat(1i64).take(len));
+            mask.extend(std::iter::repeat(0i64).take(width - len));
+        }
+        let shape = [batch, width];
+        let mut inputs = ort::inputs![
+            "input_ids" => ort::value::Tensor::from_array((shape, ids))
+                .map_err(|error| format!("input_ids tensor: {}", error))?,
+            "attention_mask" => ort::value::Tensor::from_array((shape, mask))
+                .map_err(|error| format!("attention_mask tensor: {}", error))?,
+        ];
+        if self.needs_token_type_ids {
+            let zeros = vec![0i64; batch * width];
+            inputs.push((
+                "token_type_ids".into(),
+                ort::value::Tensor::from_array((shape, zeros))
+                    .map_err(|error| format!("token_type_ids tensor: {}", error))?
+                    .into(),
+            ));
+        }
+        let outputs = self
+            .session
+            .run_with_options(inputs, &self.run_options)
+            .map_err(|error| format!("ort run: {}", error))?;
+        let (out_shape, data) = outputs["logits"]
+            .try_extract_tensor::<f32>()
+            .map_err(|error| format!("logits extract: {}", error))?;
+        let dims: Vec<i64> = out_shape.iter().copied().collect();
+        // [batch, 1] for the single-label regression head.
+        if dims.first().copied() != Some(batch as i64) || data.len() != batch {
+            return Err(format!("logits shape {:?}, expected [{}, 1]", dims, batch));
+        }
+        Ok(data.to_vec())
+    }
 }
 
 /// True when the top-1 score sits far enough above the top-3 score
@@ -350,44 +531,35 @@ fn looks_non_english(query: &str) -> bool {
 }
 
 /// Pool of cross-encoder model instances. Each instance owns its own
-/// ONNX session (~1.1 GB resident for jina-v2-multilingual-base), so
-/// the default pool size is intentionally small (1). Throughput-bound
-/// workloads can opt in to 2 via `MEMORYPILOT_RERANK_POOL_SIZE=2`,
-/// trading another ~1 GB of RAM for parallel rerank calls.
-struct RerankPool {
-    available: Mutex<Vec<CrossRerankerState>>,
-    notify: Condvar,
-    capacity: usize,
-}
+/// ONNX session (~120 MB resident for the default int8
+/// mmarco-mMiniLMv2, ~1.1 GB for the legacy jina-v2-multilingual-base),
+/// so the default pool size is intentionally small (1). Throughput-bound
+/// workloads can opt in to 2 via `MEMORYPILOT_RERANK_POOL_SIZE=2`.
+/// Sessions are built on first use and released after
+/// `MEMORYPILOT_MODEL_IDLE_SECS` idle (see `crate::pool`).
+static RERANK_POOL: OnceLock<crate::pool::IdlePool<CrossRerankerState>> = OnceLock::new();
 
-static RERANK_POOL: OnceLock<RerankPool> = OnceLock::new();
-
-fn rerank_pool() -> &'static RerankPool {
-    RERANK_POOL.get_or_init(|| {
+fn rerank_pool() -> &'static crate::pool::IdlePool<CrossRerankerState> {
+    let pool = RERANK_POOL.get_or_init(|| {
         let pool_size = std::env::var("MEMORYPILOT_RERANK_POOL_SIZE")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .unwrap_or(1)
             .clamp(1, 4);
-        let mut models = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            models.push(init_cross_reranker());
-        }
-        RerankPool {
-            available: Mutex::new(models),
-            notify: Condvar::new(),
-            capacity: pool_size,
-        }
-    })
+        crate::pool::IdlePool::new("reranker", pool_size, init_cross_reranker)
+    });
+    static EVICTOR: OnceLock<()> = OnceLock::new();
+    EVICTOR.get_or_init(|| pool.spawn_evictor());
+    pool
 }
 
 struct PooledReranker {
-    inner: Option<CrossRerankerState>,
+    inner: crate::pool::PoolGuard<CrossRerankerState>,
 }
 
 impl PooledReranker {
-    fn with_model<R>(&mut self, f: impl FnOnce(&mut fastembed::TextRerank) -> R) -> Option<R> {
-        match self.inner.as_mut()? {
+    fn with_model<R>(&mut self, f: impl FnOnce(&mut Reranker) -> R) -> Option<R> {
+        match self.inner.get() {
             CrossRerankerState::Ready(model) => Some(f(model)),
             CrossRerankerState::Unavailable(error) => {
                 eprintln!("[reranker] cross-encoder unavailable: {}", error);
@@ -397,87 +569,136 @@ impl PooledReranker {
     }
 }
 
-impl Drop for PooledReranker {
-    fn drop(&mut self) {
-        if let Some(state) = self.inner.take() {
-            let pool = rerank_pool();
-            if let Ok(mut guard) = pool.available.lock() {
-                guard.push(state);
-                pool.notify.notify_one();
-            }
-        }
-    }
-}
-
 fn acquire_pooled_reranker() -> Option<PooledReranker> {
-    let pool = rerank_pool();
-    if pool.capacity == 0 {
-        return None;
-    }
-    let mut guard = pool.available.lock().ok()?;
-    while guard.is_empty() {
-        guard = pool.notify.wait(guard).ok()?;
-    }
-    let state = guard.pop()?;
-    Some(PooledReranker { inner: Some(state) })
+    Some(PooledReranker {
+        inner: rerank_pool().acquire(),
+    })
 }
 
 /// Pre-load every cross-encoder model in the pool and run a single
 /// throwaway query against a tiny document so the first real call
-/// from a benchmark or HTTP handler does not pay the ~1.1 GB ONNX
-/// hydration cost. Safe to call multiple times — protected by the
-/// `OnceLock` that backs the pool.
+/// from a benchmark or HTTP handler does not pay the ONNX hydration
+/// cost. Safe to call multiple times.
 pub fn warmup_cross_reranker() {
     let pool = rerank_pool();
-    let mut warmed: Vec<PooledReranker> = Vec::with_capacity(pool.capacity);
-    for _ in 0..pool.capacity {
+    let mut warmed: Vec<PooledReranker> = Vec::with_capacity(pool.capacity());
+    for _ in 0..pool.capacity() {
         let Some(mut handle) = acquire_pooled_reranker() else {
             break;
         };
-        let _ = handle.with_model(|model| {
-            model.rerank(
-                "warmup".to_string(),
-                &["warmup".to_string()],
-                false,
-                Some(1),
-            )
-        });
+        let _ = handle.with_model(|model| model.scores("warmup", &["warmup".to_string()]));
         warmed.push(handle);
     }
     drop(warmed);
 }
 
-fn init_cross_reranker() -> CrossRerankerState {
-    let model = cross_reranker_model();
-    let cache_dir = dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".fastembed_cache")
-        .join("rerank");
-    let _ = std::fs::create_dir_all(&cache_dir);
-    let options = fastembed::RerankInitOptions::new(model)
-        .with_show_download_progress(false)
-        .with_cache_dir(cache_dir);
+/// Default cross-encoder: `mmarco-mMiniLMv2-L12-H384-v1` (Apache-2.0,
+/// 14 languages incl. French, trained on mMARCO), dynamically quantized
+/// to int8 — 118 MB on disk, ~250 MB resident. It replaces
+/// jina-reranker-v2-base-multilingual (1.1 GB) as the default, for a
+/// rerank of 12 candidates in ~100 ms instead of ~200 ms. Its quality on
+/// short memory snippets is on par: the cross-encoder only refines the
+/// top of an already good hybrid list.
+///
+/// Why this export and not the official `cross-encoder/…/onnx/*qint8*`
+/// files: those are QDQ-format graphs whose 250k-row embedding table
+/// ONNX Runtime materialises in fp32 at load — measured +306 MB after
+/// load and +552 MB after a few runs, versus +118 MB / +249 MB for the
+/// dynamic-quantization export below, which keeps the table int8.
+const MMARCO: OrtRerankerSpec = OrtRerankerSpec {
+    repo: "SugoLabs/mmarco-mMiniLMv2-L12-H384-v1",
+    onnx_file: "onnx/model_quantized.onnx",
+    label: "mmarco-mMiniLMv2-L12-H384-v1 int8",
+};
 
-    match fastembed::TextRerank::try_new(options) {
+/// `jina-reranker-v2-base-multilingual` (278M params, CC-BY-NC-4.0) as
+/// the int8 export shipped in the official repository: 280 MB on disk,
+/// memory-mapped. Opt in with `MEMORYPILOT_RERANKER_MODEL=jina-v2`.
+const JINA_V2_INT8: OrtRerankerSpec = OrtRerankerSpec {
+    repo: "jinaai/jina-reranker-v2-base-multilingual",
+    onnx_file: "onnx/model_int8.onnx",
+    label: "jina-reranker-v2-base-multilingual int8",
+};
+
+/// `gte-multilingual-reranker-base` (306M params, Apache-2.0), int8
+/// export from onnx-community: 341 MB on disk, memory-mapped. Opt in
+/// with `MEMORYPILOT_RERANKER_MODEL=gte-multilingual`.
+const GTE_MULTILINGUAL_INT8: OrtRerankerSpec = OrtRerankerSpec {
+    repo: "onnx-community/gte-multilingual-reranker-base",
+    onnx_file: "onnx/model_int8.onnx",
+    label: "gte-multilingual-reranker-base int8",
+};
+
+enum RerankerChoice {
+    Ort(OrtRerankerSpec),
+    Fastembed(fastembed::RerankerModel),
+}
+
+fn init_cross_reranker() -> CrossRerankerState {
+    let result = match cross_reranker_model() {
+        RerankerChoice::Ort(spec) => OrtReranker::load(spec)
+            .map(Reranker::Ort)
+            .map_err(|error| format!("{} init: {}", spec.label, error)),
+        RerankerChoice::Fastembed(model) => {
+            let cache_dir = dirs::home_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".fastembed_cache")
+                .join("rerank");
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let options = fastembed::RerankInitOptions::new(model)
+                .with_show_download_progress(false)
+                .with_cache_dir(cache_dir)
+                .with_intra_threads(rerank_intra_threads());
+            fastembed::TextRerank::try_new(options)
+                .map(Reranker::Fastembed)
+                .map_err(|error| error.to_string())
+        }
+    };
+    match result {
         Ok(model) => CrossRerankerState::Ready(model),
-        Err(error) => CrossRerankerState::Unavailable(error.to_string()),
+        Err(error) => CrossRerankerState::Unavailable(error),
     }
 }
 
-fn cross_reranker_model() -> fastembed::RerankerModel {
+/// Rerank runs on 12 short query/document pairs; two threads saturate
+/// it. `MEMORYPILOT_RERANK_THREADS` overrides.
+fn rerank_intra_threads() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    std::env::var("MEMORYPILOT_RERANK_THREADS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or_else(|| available.min(2))
+        .clamp(1, available.max(1))
+}
+
+fn cross_reranker_model() -> RerankerChoice {
     match std::env::var("MEMORYPILOT_RERANKER_MODEL")
-        .unwrap_or_else(|_| "jina-v2-multilingual".to_string())
+        .unwrap_or_default()
+        .trim()
         .to_ascii_lowercase()
         .as_str()
     {
         "bge-base" | "bge-reranker-base" | "baai/bge-reranker-base" => {
-            fastembed::RerankerModel::BGERerankerBase
+            RerankerChoice::Fastembed(fastembed::RerankerModel::BGERerankerBase)
         }
-        "bge-v2-m3" | "rozgo/bge-reranker-v2-m3" => fastembed::RerankerModel::BGERerankerV2M3,
+        "bge-v2-m3" | "rozgo/bge-reranker-v2-m3" => {
+            RerankerChoice::Fastembed(fastembed::RerankerModel::BGERerankerV2M3)
+        }
         "jina-v1" | "jinaai/jina-reranker-v1-turbo-en" => {
-            fastembed::RerankerModel::JINARerankerV1TurboEn
+            RerankerChoice::Fastembed(fastembed::RerankerModel::JINARerankerV1TurboEn)
         }
-        _ => fastembed::RerankerModel::JINARerankerV2BaseMultiligual,
+        "jina-v2-multilingual-fp32" => {
+            RerankerChoice::Fastembed(fastembed::RerankerModel::JINARerankerV2BaseMultiligual)
+        }
+        "jina-v2" | "jina-v2-multilingual" | "jinaai/jina-reranker-v2-base-multilingual" => {
+            RerankerChoice::Ort(JINA_V2_INT8)
+        }
+        "gte" | "gte-multilingual" | "alibaba-nlp/gte-multilingual-reranker-base" => {
+            RerankerChoice::Ort(GTE_MULTILINGUAL_INT8)
+        }
+        _ => RerankerChoice::Ort(MMARCO),
     }
 }
 
@@ -647,6 +868,65 @@ const STOPWORDS: &[&str] = &[
 mod tests {
     use super::*;
     use crate::db::Memory;
+
+    fn rss_mb() -> f64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0)
+            / 1024.0
+    }
+
+    /// Memory probe for the default cross-encoder: load + a realistic
+    /// rerank of 12 snippets. Prints RSS deltas; asserts the model ranks
+    /// the relevant snippet first. Run with `--nocapture` to read the
+    /// numbers.
+    #[test]
+    fn mmarco_ort_reranker_scores_and_footprint() {
+        let before = rss_mb();
+        let mut model = OrtReranker::load(MMARCO).expect("mmarco load");
+        let loaded = rss_mb();
+        let query = "comment publier un post Instagram depuis Sociomator";
+        let mut docs: Vec<String> = (0..11)
+            .map(|i| format!("Mémoire {} : configuration WAL SQLite et pool de lecture pour la concurrence.", i))
+            .collect();
+        docs.push("Publier une publication Instagram depuis l'app Sociomator : onglet Planifier, bouton Publier.".to_string());
+        let mut scores = Vec::new();
+        for _ in 0..5 {
+            scores = model.scores(query, &docs).expect("scores");
+        }
+        let after = rss_mb();
+        // Worst case the search path produces: 12 snippets at the
+        // 1400-char truncation limit (~400 tokens each).
+        let long_docs: Vec<String> = (0..12)
+            .map(|i| format!("Mémoire {} : ", i) + &"configuration WAL SQLite, pool de lecture, index ANN usearch et migration du modèle d'embedding. ".repeat(14))
+            .collect();
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            model.scores(query, &long_docs).expect("long scores");
+        }
+        let long_ms = started.elapsed().as_millis() / 3;
+        let after_long = rss_mb();
+        eprintln!(
+            "[mmarco probe] load +{:.0} MB, after 5 short reranks +{:.0} MB, after 3 long reranks +{:.0} MB ({} ms each, total {:.0} MB)",
+            loaded - before,
+            after - before,
+            after_long - before,
+            long_ms,
+            after_long
+        );
+        let best = scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(best, 11, "relevant snippet must rank first: {:?}", scores);
+    }
 
     #[test]
     fn confidence_gate_skips_when_top_is_clear() {

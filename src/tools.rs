@@ -484,6 +484,18 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "consolidate_memories",
+            "description": "Fold near-duplicate memories (same project, embedding cosine >= threshold, ephemeral kinds only, never pinned/decisions/credentials) into their newest member: tags, importance, access counts and links are merged, older restatements deleted. Dry-run unless apply=true. Runs automatically once a day at 0.95.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "threshold": { "type": "number", "default": 0.95, "description": "Cosine similarity threshold (0.80-0.999). 0.95 = restatements of one event; 0.90 starts catching distinct items." },
+                    "apply": { "type": "boolean", "default": false, "description": "Actually merge and delete. Default reports only." },
+                    "project": { "type": "string", "description": "Limit to a specific project" }
+                }
+            }
+        },
+        {
             "name": "analyze_corpus",
             "description": "Analyze text without writing memory: detects corpus origin, platform, agents/personas, and reliable topics for graph linking.",
             "inputSchema": {
@@ -494,6 +506,48 @@ pub fn tool_definitions() -> Value {
                 },
                 "required": ["content"]
             }
+        },
+        {
+            "name": "recall_episode",
+            "description": "Hierarchical episodic recall. Searches the episode tree (hourly→daily→long-term summaries) instead of raw memories — fast, dense, and resonant for 'what happened around X' or 'remind me about Y' questions. Set drill_down=true to also return the raw memories behind each matching episode.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What to recall" },
+                    "project": { "type": ["string","null"], "description": "Limit to a project" },
+                    "limit": { "type": "integer", "default": 5, "description": "Max episodes to return (1-20)" },
+                    "drill_down": { "type": "boolean", "default": false, "description": "Also return the raw memories behind each episode" }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "get_episode",
+            "description": "Fetch one episode by id plus the raw memories it summarises (recursive drill-down through daily/long-term children).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Episode id" }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "list_episodes",
+            "description": "List episodes for inspection: filter by project and/or level (interval, daily, longterm), most recent first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": ["string","null"], "description": "Limit to a project" },
+                    "level": { "type": ["string","null"], "description": "interval | daily | longterm" },
+                    "limit": { "type": "integer", "default": 20, "description": "Max episodes (1-500)" }
+                }
+            }
+        },
+        {
+            "name": "rebuild_episodes",
+            "description": "Force a hierarchical episodic rollup now (raw memories → hourly → daily → long-term). Idempotent; normally runs automatically in the background.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ]})
 }
@@ -541,7 +595,12 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "bulk_delete" => handle_bulk_delete(db, args),
         "get_memory_health" => handle_memory_health(db),
         "dedupe_report" => handle_dedupe_report(db, args),
+        "consolidate_memories" => handle_consolidate_memories(db, args),
         "analyze_corpus" => handle_analyze_corpus(args),
+        "recall_episode" => handle_recall_episode(db, args),
+        "get_episode" => handle_get_episode(db, args),
+        "list_episodes" => handle_list_episodes(db, args),
+        "rebuild_episodes" => handle_rebuild_episodes(db),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
 }
@@ -627,6 +686,38 @@ fn handle_recall(db: &Database, args: &Value) -> Value {
             if !working_context.is_empty() {
                 if let Some(object) = ctx.as_object_mut() {
                     object.insert("working_context".into(), json!(working_context));
+                }
+            }
+            // Episodic resonance: when the caller gave a query (hints) and
+            // the episode tree is populated, surface the top few episodes
+            // alongside raw memories. Opt out with include_episodes=false.
+            let include_episodes = args
+                .get("include_episodes")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if include_episodes {
+                if let Some(query) = hints.filter(|h| !h.trim().is_empty()) {
+                    if let Ok(hits) = db.search_episodes(query, 3, project) {
+                        if !hits.is_empty() {
+                            let episodes: Vec<Value> = hits
+                                .into_iter()
+                                .map(|hit| {
+                                    json!({
+                                        "id": hit.episode.id,
+                                        "level": hit.episode.level,
+                                        "title": hit.episode.title,
+                                        "summary": hit.episode.summary,
+                                        "start_at": hit.episode.start_at,
+                                        "end_at": hit.episode.end_at,
+                                        "score": (hit.score * 1000.0).round() / 1000.0,
+                                    })
+                                })
+                                .collect();
+                            if let Some(object) = ctx.as_object_mut() {
+                                object.insert("episodes".into(), json!(episodes));
+                            }
+                        }
+                    }
                 }
             }
             tool_result(&serde_json::to_string_pretty(&ctx).unwrap())
@@ -1550,6 +1641,19 @@ fn handle_dedupe_report(db: &Database, args: &Value) -> Value {
     }
 }
 
+fn handle_consolidate_memories(db: &Database, args: &Value) -> Value {
+    let threshold = args
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(crate::db::AUTO_CONSOLIDATE_THRESHOLD as f64) as f32;
+    let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+    let project = args.get("project").and_then(|v| v.as_str());
+    match db.consolidate_memories(threshold, apply, project) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
 fn handle_analyze_corpus(args: &Value) -> Value {
     let content = match args.get("content").and_then(|v| v.as_str()) {
         Some(c) if !c.trim().is_empty() => c,
@@ -1558,4 +1662,102 @@ fn handle_analyze_corpus(args: &Value) -> Value {
     let source = args.get("source").and_then(|v| v.as_str());
     let analysis = crate::graph::analyze_corpus(content, source);
     tool_result(&serde_json::to_string_pretty(&analysis).unwrap())
+}
+
+// ─── Episodic Memory ──────────────────────────────
+
+fn handle_recall_episode(db: &Database, args: &Value) -> Value {
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) if !q.trim().is_empty() => q,
+        _ => return tool_error("query is required"),
+    };
+    let project = args.get("project").and_then(|v| v.as_str());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .clamp(1, 20) as usize;
+    let drill_down = args
+        .get("drill_down")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let hits = match db.search_episodes(query, limit, project) {
+        Ok(hits) => hits,
+        Err(e) => return tool_error(&e),
+    };
+
+    let episodes: Vec<Value> = hits
+        .into_iter()
+        .map(|hit| {
+            let mut obj = json!({
+                "episode": hit.episode,
+                "score": (hit.score * 1000.0).round() / 1000.0,
+                "sources": hit.sources,
+            });
+            if drill_down {
+                let memories = db.episode_memories(&hit.episode.id).unwrap_or_default();
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("memories".into(), json!(memories));
+                }
+            }
+            obj
+        })
+        .collect();
+
+    tool_result(
+        &serde_json::to_string_pretty(&json!({
+            "query": query,
+            "count": episodes.len(),
+            "episodes": episodes,
+        }))
+        .unwrap(),
+    )
+}
+
+fn handle_get_episode(db: &Database, args: &Value) -> Value {
+    let id = match args.get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return tool_error("id is required"),
+    };
+    let episode = match db.get_episode(id) {
+        Ok(Some(ep)) => ep,
+        Ok(None) => return tool_error(&format!("Episode not found: {}", id)),
+        Err(e) => return tool_error(&e),
+    };
+    let memories = db.episode_memories(id).unwrap_or_default();
+    tool_result(
+        &serde_json::to_string_pretty(&json!({
+            "episode": episode,
+            "memories": memories,
+        }))
+        .unwrap(),
+    )
+}
+
+fn handle_list_episodes(db: &Database, args: &Value) -> Value {
+    let project = args.get("project").and_then(|v| v.as_str());
+    let level = args.get("level").and_then(|v| v.as_str());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .clamp(1, 500) as usize;
+    match db.list_episodes(project, level, limit) {
+        Ok(episodes) => tool_result(
+            &serde_json::to_string_pretty(&json!({
+                "count": episodes.len(),
+                "episodes": episodes,
+            }))
+            .unwrap(),
+        ),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_rebuild_episodes(db: &Database) -> Value {
+    match db.roll_up_episodes() {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
 }

@@ -12,14 +12,18 @@ mod gc;
 mod graph;
 #[cfg(feature = "http")]
 mod http;
+mod onnx_external;
+mod pool;
 mod protocol;
 mod reranking;
+mod tokenizer;
 mod session_capsule;
 mod session_export;
 mod session_fusion;
 mod splitter;
 mod stemming;
 mod telemetry;
+mod text;
 mod tools;
 mod watcher;
 mod working_memory;
@@ -74,6 +78,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--benchmark-fr") {
         run_benchmark_fr(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--benchmark-episodic") {
+        run_benchmark_episodic(&args);
         return;
     }
     if args.iter().any(|a| a == "--benchmark-latency") {
@@ -187,7 +195,7 @@ fn run_migrate() {
 }
 
 fn run_backfill() {
-    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
+    eprintln!("Embedding engine: {}", embedding::model_label());
     let db = match db::Database::open() {
         Ok(d) => d,
         Err(e) => {
@@ -218,7 +226,10 @@ fn run_http_server(port: u16) {
 }
 
 fn run_backfill_force() {
-    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim) (force overwrite ALL)");
+    eprintln!(
+        "Embedding engine: {} (force overwrite ALL)",
+        embedding::model_label()
+    );
     let db = match db::Database::open() {
         Ok(d) => d,
         Err(e) => {
@@ -287,7 +298,7 @@ fn run_benchmark_search(args: &[String]) {
 
 fn run_benchmark_longmemeval(args: &[String]) {
     eprintln!("[LongMemEval] Starting benchmark runner...");
-    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
+    eprintln!("Embedding engine: {}", embedding::model_label());
     let dataset_path = args
         .windows(2)
         .find(|w| w[0] == "--benchmark-longmemeval")
@@ -351,7 +362,7 @@ fn parse_percent(value: &str) -> Option<f64> {
 
 fn run_benchmark_fr(args: &[String]) {
     eprintln!("[BenchFR] Starting French retrieval benchmark...");
-    eprintln!("Embedding engine: fastembed (multilingual-e5-small, 384-dim)");
+    eprintln!("Embedding engine: {}", embedding::model_label());
     let min_r5 = args
         .windows(2)
         .find(|w| w[0] == "--min-r5")
@@ -388,6 +399,58 @@ fn run_benchmark_fr(args: &[String]) {
         }
         Err(error) => {
             eprintln!("✗ BenchFR failed: {}", error);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_benchmark_episodic(args: &[String]) {
+    eprintln!("[BenchEpisodic] Starting episodic-scale retrieval benchmark...");
+    eprintln!("Embedding engine: {}", embedding::model_label());
+    let sessions = args
+        .windows(2)
+        .find(|w| w[0] == "--sessions")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(40);
+    let min_lift = args
+        .windows(2)
+        .find(|w| w[0] == "--min-lift")
+        .and_then(|w| parse_percent(&w[1]));
+    match db::Database::benchmark_episodic(sessions) {
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+            );
+            if let Some(minimum) = min_lift {
+                let actual = report
+                    .get("metrics")
+                    .and_then(|m| m.get("episodic_lift_pp"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.trim_start_matches('+').parse::<f64>().ok());
+                match actual {
+                    Some(value) if value + f64::EPSILON >= minimum => {
+                        eprintln!(
+                            "[BenchEpisodic] Guard passed: lift {:+.1}pp >= {:.1}pp",
+                            value, minimum
+                        );
+                    }
+                    Some(value) => {
+                        eprintln!(
+                            "✗ BenchEpisodic guard failed: lift {:+.1}pp < {:.1}pp",
+                            value, minimum
+                        );
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!("✗ BenchEpisodic guard failed: missing lift metric");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("✗ BenchEpisodic failed: {}", error);
             std::process::exit(1);
         }
     }
@@ -871,6 +934,9 @@ fn print_help() {
     println!();
     println!("STORAGE:    ~/.MemoryPilot/memory.db");
     println!("SEARCH:     Hybrid BM25 + vector RRF + KG boost + watcher context");
-    println!("EMBEDDINGS: fastembed (multilingual-e5-small, 384-dim, 100+ languages)");
+    println!(
+        "EMBEDDINGS: {} (ONNX Runtime, 100+ languages)",
+        embedding::model_label()
+    );
     println!("BUILT BY:   SOFLUTION LTD");
 }
