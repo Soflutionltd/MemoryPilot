@@ -175,7 +175,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_memory",
-            "description": "FTS5 BM25 full-text search weighted by importance. Supports prefix (svelt*) and multi-word queries. Auto-cleans expired.",
+            "description": "Hybrid search (BM25 + vectors, reranked, diversified). Returns a `confidence` block — when `abstain` is true nothing in the store answers the query. Temporal phrases (\"last week\", \"en mars\") are resolved against stored dates. Set `answer: true` to also extract a short answer span from the top passages with the local reader (English, opt-in, downloads a 125 MB model on first use).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -183,7 +183,8 @@ pub fn tool_definitions() -> Value {
                     "limit": { "type": "integer", "default": 10 },
                     "project": { "type": ["string","null"] },
                     "kind": { "type": ["string","null"] },
-                    "tags": { "type": ["array","null"], "items": { "type": "string" } }
+                    "tags": { "type": ["array","null"], "items": { "type": "string" } },
+                    "answer": { "type": "boolean", "default": false, "description": "Run the extractive reader on the top-5 passages." }
                 },
                 "required": ["query"]
             }
@@ -1094,15 +1095,53 @@ fn handle_search(db: &Database, args: &Value) -> Value {
         Some(watcher_keywords.as_slice())
     };
 
-    match db.search(query, limit, project, kind, tags.as_deref(), wk_ref) {
-        Ok(results) => {
-            let output = json!({ "query": query, "count": results.len(),
+    let want_answer = args.get("answer").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    match db.search_at(
+        chrono::Utc::now(),
+        query,
+        limit,
+        project,
+        kind,
+        tags.as_deref(),
+        wk_ref,
+    ) {
+        Ok((results, confidence)) => {
+            let mut output = json!({ "query": query, "count": results.len(),
+                "confidence": confidence,
                 "results": results.iter().map(|r| json!({
                     "id": r.memory.id, "content": r.memory.content, "kind": r.memory.kind,
                     "project": r.memory.project, "tags": r.memory.tags, "score": r.score, "importance": r.memory.importance,
                     "sources": r.sources,
                 })).collect::<Vec<_>>()
             });
+            if confidence.abstain {
+                output["note"] = json!(
+                    "No stored memory answers this query with confidence; treat the results as loosely related context, not as an answer."
+                );
+            }
+            if want_answer && !confidence.abstain {
+                let passages: Vec<&str> = results
+                    .iter()
+                    .take(5)
+                    .map(|r| r.memory.content.as_str())
+                    .collect();
+                match crate::reader::answer(query, &passages) {
+                    Ok(Some(found)) => {
+                        output["answer"] = json!({
+                            "text": found.text,
+                            "score": (found.score * 1000.0).round() / 1000.0,
+                            "memory_id": results.get(found.passage_index).map(|r| r.memory.id.clone()),
+                        });
+                    }
+                    Ok(None) => {
+                        output["answer"] = serde_json::Value::Null;
+                    }
+                    Err(e) => {
+                        output["answer_error"] = json!(e);
+                    }
+                }
+            }
             tool_result(&serde_json::to_string_pretty(&output).unwrap())
         }
         Err(e) => tool_error(&e),
@@ -1649,7 +1688,21 @@ fn handle_consolidate_memories(db: &Database, args: &Value) -> Value {
     let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
     let project = args.get("project").and_then(|v| v.as_str());
     match db.consolidate_memories(threshold, apply, project) {
-        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Ok(mut report) => {
+            // The supersede pass only writes ranking edges (never deletes),
+            // so it runs whenever the caller applies.
+            if apply {
+                match db.link_superseded_memories(project) {
+                    Ok(supersede) => {
+                        report["supersede"] = supersede;
+                    }
+                    Err(e) => {
+                        report["supersede"] = json!({ "error": e });
+                    }
+                }
+            }
+            tool_result(&serde_json::to_string_pretty(&report).unwrap())
+        }
         Err(e) => tool_error(&e),
     }
 }

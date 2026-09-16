@@ -38,6 +38,7 @@ use embed_worker::{
 #[allow(unused_imports)]
 pub use episodic::{Episode, EpisodeHit, RollupReport};
 pub use consolidate::AUTO_THRESHOLD as AUTO_CONSOLIDATE_THRESHOLD;
+pub use benchmark_longmemeval::LongMemEvalOptions;
 
 const DB_DIR: &str = ".MemoryPilot";
 const DB_FILE: &str = "memory.db";
@@ -56,6 +57,41 @@ pub(crate) fn content_hash(text: &str) -> String {
         h = h.wrapping_mul(1099511628211);
     }
     format!("{:016x}", h)
+}
+
+/// Kinds whose text is a slice of something larger and carries no
+/// context of its own — a transcript chunk does not say which project
+/// or which day it belongs to, so the vector cannot either.
+const CONTEXT_POOR_KINDS: &[&str] = &["transcript", "transcript_chunk", "session"];
+
+impl Database {
+    /// The text handed to the encoder for a memory. Context-poor kinds
+    /// are prefixed with `[project; date]` — the same idea as
+    /// contextual retrieval, sourced from metadata instead of a model —
+    /// so "what did we do on Sociomator in March" lands on the right
+    /// chunk. Every other kind is embedded verbatim; the stored content
+    /// and its hash are never touched.
+    pub(crate) fn embedding_input(
+        kind: &str,
+        project: Option<&str>,
+        created_at: &str,
+        content: &str,
+    ) -> String {
+        if !CONTEXT_POOR_KINDS.contains(&kind) || content.trim_start().starts_with('[') {
+            return content.to_string();
+        }
+        let mut header: Vec<String> = Vec::with_capacity(2);
+        if let Some(project) = project.filter(|p| !p.trim().is_empty()) {
+            header.push(format!("project: {}", project.trim()));
+        }
+        if let Some(day) = crate::temporal::day_of_timestamp(created_at) {
+            header.push(format!("date: {}", day.format("%Y-%m-%d")));
+        }
+        if header.is_empty() {
+            return content.to_string();
+        }
+        format!("[{}] {}", header.join("; "), content)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,6 +129,87 @@ pub struct SearchResult {
     pub score: f64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
+}
+
+/// How much the ranker trusts its own top hit. Built from signals that
+/// exist for every query — the raw cosine between the query and the
+/// top-1 vector, the relative gap to the runner-up — plus the raw
+/// cross-encoder logit when that lane ran. `abstain` is the calibrated
+/// verdict: nothing in the store answers this query, callers should say
+/// so rather than present the least-bad candidate.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SearchConfidence {
+    pub top_cosine: f32,
+    /// How far the top-1 cosine stands above the mean of the other
+    /// finalists: a flat profile means nothing really matched.
+    pub peak: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_score: Option<f32>,
+    pub margin: f64,
+    pub level: &'static str,
+    pub abstain: bool,
+}
+
+impl SearchConfidence {
+    /// `MEMORYPILOT_ABSTAIN_COSINE` — below this query·top-1 cosine the
+    /// search abstains unless the cross-encoder vouches for the hit.
+    ///
+    /// Calibrated on LongMemEval-S (100 answerable + 7 abstention): the
+    /// answerable top-1 cosine sits at p10 = 0.42, p50 = 0.54, and the
+    /// abstention questions — built from the *same user's* other sessions —
+    /// overlap it almost entirely (p50 = 0.46). No cheap signal separates
+    /// them, so the hard `abstain` is deliberately conservative (0.35 loses
+    /// 4 % of answerable questions) and is meant for genuinely off-topic
+    /// queries; `level` carries the graded signal for everything else.
+    pub fn abstain_cosine() -> f32 {
+        std::env::var("MEMORYPILOT_ABSTAIN_COSINE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f32>().ok())
+            .unwrap_or(0.35)
+    }
+
+    /// Cross-encoder logit above which the hit is trusted whatever the
+    /// cosine says (mmarco logits are positive for relevant pairs).
+    pub fn trusted_cross_score() -> f32 {
+        std::env::var("MEMORYPILOT_TRUST_CROSS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f32>().ok())
+            .unwrap_or(1.0)
+    }
+
+    fn none() -> Self {
+        Self {
+            level: "none",
+            abstain: true,
+            ..Self::default()
+        }
+    }
+
+    fn assess(top_cosine: f32, peak: f32, cross_score: Option<f32>, margin: f64) -> Self {
+        let floor = Self::abstain_cosine();
+        let cross_vouches = cross_score
+            .map(|score| score >= Self::trusted_cross_score())
+            .unwrap_or(false);
+        // mmarco logits below −4 on the top hit: 1 in 8 answerable LME
+        // questions still land there, so this only bites with a weak cosine.
+        let cross_denies = cross_score.map(|score| score < -4.0).unwrap_or(false);
+        let abstain = (top_cosine < floor && !cross_vouches) || (cross_denies && top_cosine < floor + 0.05);
+        let level = if abstain {
+            "low"
+        } else if top_cosine >= floor + 0.2 || cross_vouches || margin >= 0.25 {
+            "high"
+        } else {
+            "medium"
+        };
+        Self {
+            top_cosine,
+            peak,
+            cross_score,
+            margin,
+            level,
+            abstain,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,13 +410,20 @@ impl Database {
     fn backfill_missing_at_startup(&self) {
         let mut stmt = match self
             .conn
-            .prepare("SELECT id, content FROM memories WHERE embedding IS NULL")
+            .prepare("SELECT id, content, kind, project, created_at FROM memories WHERE embedding IS NULL")
         {
             Ok(stmt) => stmt,
             Err(_) => return,
         };
-        let missing: Vec<(String, String)> = match stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        let missing: Vec<(String, String, String)> = match stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let kind: String = row.get(2)?;
+            let project: Option<String> = row.get(3)?;
+            let created_at: String = row.get(4)?;
+            let embed_text =
+                Self::embedding_input(&kind, project.as_deref(), &created_at, &content);
+            Ok((id, content, embed_text))
         }) {
             Ok(rows) => rows.flatten().collect(),
             Err(_) => return,
@@ -1043,6 +1167,10 @@ impl Database {
         for (target_id, relation_type) in rows_data {
             let boost: f64 = match relation_type.as_str() {
                 "deprecates" => -0.6,
+                // A newer memory restates this one with a different
+                // value (see `link_superseded_memories`): keep it
+                // retrievable, but below its replacement.
+                "supersedes" => -0.35,
                 "depends_on" | "implements" | "resolves" | "resolved_by" | "fixed_by" | "fixes" => {
                     0.08
                 }
@@ -1139,7 +1267,7 @@ impl Database {
         let ent_sql = format!(
             "SELECT DISTINCT a.memory_id, b.memory_id FROM memory_entities a \
              JOIN memory_entities b ON a.entity_value = b.entity_value AND a.entity_kind = b.entity_kind AND a.memory_id != b.memory_id \
-             WHERE a.memory_id IN ({0}) AND b.memory_id IN ({0})",
+             WHERE a.entity_kind != 'date' AND a.memory_id IN ({0}) AND b.memory_id IN ({0})",
             placeholders.join(",")
         );
         if let Ok(mut stmt) = self.conn.prepare(&ent_sql) {
@@ -1801,6 +1929,16 @@ impl Database {
                 params![memory.id, entity.kind, entity.value],
             );
         }
+        // Calendar dates named in the text, resolved against the memory's
+        // own day. Not a link entity (two memories sharing a date are not
+        // related); read by the temporal window in `search`.
+        let own_day = crate::temporal::day_of_timestamp(&memory.created_at);
+        for date in crate::temporal::extract_dates(&memory.content, own_day) {
+            let _ = self.conn.execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_kind, entity_value) VALUES (?1, 'date', ?2)",
+                params![memory.id, date.format("%Y-%m-%d").to_string()],
+            );
+        }
 
         // 2. Find related memories via shared entities
         let mut target_ids = std::collections::HashSet::new();
@@ -2207,7 +2345,11 @@ impl Database {
         ).map_err(|e| format!("Insert: {}", e))?;
 
         // Queue embedding for background computation
-        queue_embedding_job(&id, content);
+        queue_embedding_job(
+            &id,
+            content,
+            &Self::embedding_input(kind, canonical_project.as_deref(), &now, content),
+        );
 
         // FTS index (raw content + stemmed projection for FR/EN recall)
         let rowid = self.conn.last_insert_rowid();
@@ -2289,7 +2431,16 @@ impl Database {
                 "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7,embedding=NULL,content_hash=?8 WHERE id=?9",
                 params![new_content, new_kind, tags_json, new_imp, new_exp, metadata_json, now, &new_hash, id],
             ).map_err(|e| format!("Update: {}", e))?;
-            queue_embedding_job(id, new_content);
+            queue_embedding_job(
+                id,
+                new_content,
+                &Self::embedding_input(
+                    new_kind,
+                    existing.project.as_deref(),
+                    &existing.created_at,
+                    new_content,
+                ),
+            );
         } else {
             self.conn.execute(
                 "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7 WHERE id=?8",
@@ -2607,6 +2758,26 @@ impl Database {
         tags: Option<&[String]>,
         watcher_keywords: Option<&[String]>,
     ) -> Result<Vec<SearchResult>, String> {
+        self.search_at(Utc::now(), query, limit, project, kind, tags, watcher_keywords)
+            .map(|(results, _)| results)
+    }
+
+    /// [`Self::search`] plus the confidence verdict, evaluated as if the
+    /// current instant were `now` — temporal phrases in the query
+    /// ("last week") and the recency prior are resolved against it. The
+    /// benchmarks pass the question's own date; callers otherwise use
+    /// `Utc::now()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_at(
+        &self,
+        now: chrono::DateTime<Utc>,
+        query: &str,
+        limit: usize,
+        project: Option<&str>,
+        kind: Option<&str>,
+        tags: Option<&[String]>,
+        watcher_keywords: Option<&[String]>,
+    ) -> Result<(Vec<SearchResult>, SearchConfidence), String> {
         let canonical_project = Self::canonical_project(project);
 
         let telemetry_enabled = crate::telemetry::is_enabled();
@@ -2626,7 +2797,7 @@ impl Database {
 
         let fts_variants = crate::fts::fts5_query_variants(query);
         if fts_variants.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SearchConfidence::none()));
         }
         if let Some(t) = trace.as_mut() {
             t.fts_variants = fts_variants.len();
@@ -2893,7 +3064,22 @@ impl Database {
         // Batch-query knowledge triple counts (avoids N+1)
         let triple_counts = self.batch_triple_counts(&candidate_ids);
 
-        let now_ts = Utc::now().timestamp() as f64;
+        // Temporal grounding: when the query names a period, load the
+        // dates attached to the candidates once and let the window
+        // factor re-weight them. `None` for non-temporal queries.
+        let today = now.date_naive();
+        let query_window = if crate::temporal::is_enabled() {
+            crate::temporal::parse_query_window(query, today)
+        } else {
+            None
+        };
+        let candidate_dates = if query_window.is_some() {
+            self.batch_memory_dates(&candidate_ids)
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        let now_ts = now.timestamp() as f64;
 
         let query_tokens: Vec<String> = query
             .split_whitespace()
@@ -2939,6 +3125,20 @@ impl Database {
                     1.0
                 };
                 score *= recency;
+            }
+
+            // Temporal window: the query asks about a period. Dates come
+            // from the `date` entities extracted at write time plus the
+            // memory's own day. Inside → ×1.25, clearly outside → ×0.85.
+            if let Some(window) = query_window.as_ref() {
+                let mut dates: Vec<chrono::NaiveDate> =
+                    candidate_dates.get(id.as_str()).cloned().unwrap_or_default();
+                if let Some(own_day) = crate::temporal::day_of_timestamp(&mem.created_at) {
+                    if !dates.contains(&own_day) {
+                        dates.push(own_day);
+                    }
+                }
+                score *= crate::temporal::window_factor(window, &dates);
             }
 
             // KG expansion: subtle relevance signal from entity co-occurrence
@@ -3018,23 +3218,44 @@ impl Database {
         });
 
         let mut results: Vec<SearchResult> = Vec::new();
+        // Session fusion needs a wider pool so it has something to
+        // promote. MMR does *not* widen this pool: the graph, cluster and
+        // cross-encoder stages are calibrated on a `limit`-sized pool and
+        // widening it here cost 4–6 points of R@1 on memorypilot-fr-v2.
+        // Instead the RRF ranks just below the pool are kept aside and
+        // appended right before MMR, below every genuine finalist, so a
+        // distinct candidate can still displace a near-duplicate.
         let session_candidate_limit = if crate::session_fusion::should_expand_candidates(query) {
             (limit * 3).clamp(limit, 30)
         } else {
             limit
         };
-        for (id, score) in rrf_scores.into_iter().take(session_candidate_limit) {
+        let mmr_reserve_limit = if crate::diversity::is_enabled() {
+            (limit * crate::diversity::pool_multiplier()).clamp(limit, 24)
+        } else {
+            0
+        };
+        let mut mmr_reserve: Vec<SearchResult> = Vec::new();
+        for (rank, (id, score)) in rrf_scores.into_iter().enumerate() {
+            if rank >= session_candidate_limit.max(mmr_reserve_limit) {
+                break;
+            }
             if let Some(mem) = all_memories.remove(&id) {
                 let mut sources = candidate_sources
                     .remove(&id)
                     .map(|items| items.into_iter().collect::<Vec<_>>())
                     .unwrap_or_default();
                 sources.sort();
-                results.push(SearchResult {
+                let result = SearchResult {
                     memory: mem,
                     score: (score * 10000.0).round() / 10000.0,
                     sources,
-                });
+                };
+                if rank < session_candidate_limit {
+                    results.push(result);
+                } else {
+                    mmr_reserve.push(result);
+                }
             }
         }
 
@@ -3160,8 +3381,64 @@ impl Database {
         }
 
         crate::reranking::rerank_local(query, &mut results);
-        crate::reranking::rerank_cross_encoder_if_enabled(query, &mut results);
+        let cross_score = crate::reranking::rerank_cross_encoder_if_enabled(query, &mut results);
+
+        // Reserve candidates enter below the weakest finalist, in RRF
+        // order; only MMR can lift one into the top-`limit`.
+        if !mmr_reserve.is_empty() {
+            let weakest = results.last().map(|r| r.score).unwrap_or(0.0);
+            let mut reserve_score = weakest * 0.9;
+            for mut reserve in mmr_reserve.drain(..) {
+                if results.iter().any(|r| r.memory.id == reserve.memory.id) {
+                    continue;
+                }
+                reserve.score = (reserve_score * 10000.0).round() / 10000.0;
+                reserve_score *= 0.98;
+                results.push(reserve);
+            }
+        }
+
+        // Finalist vectors: one small IN query (≤ ~34 ids). They feed the
+        // MMR redundancy term and the confidence cosine.
+        let finalist_ids: Vec<&String> = results.iter().map(|r| &r.memory.id).collect();
+        let finalist_vectors = self.batch_memory_vectors(&finalist_ids);
+        let finalist_cosines: Vec<f32> = results
+            .iter()
+            .filter_map(|result| finalist_vectors.get(&result.memory.id))
+            .map(|vector| crate::embedding::cosine_similarity(&query_emb, vector))
+            .collect();
+        let top_cosine = results
+            .first()
+            .and_then(|top| finalist_vectors.get(&top.memory.id))
+            .map(|vector| crate::embedding::cosine_similarity(&query_emb, vector))
+            .unwrap_or(0.0);
+        let peak = if finalist_cosines.len() >= 3 {
+            let others: Vec<f32> = finalist_cosines.iter().skip(1).copied().collect();
+            top_cosine - others.iter().sum::<f32>() / others.len() as f32
+        } else {
+            0.0
+        };
+        let margin = match (results.first(), results.get(1)) {
+            (Some(first), Some(second)) if first.score > 0.0 => {
+                ((first.score - second.score) / first.score).clamp(0.0, 1.0)
+            }
+            (Some(_), None) => 1.0,
+            _ => 0.0,
+        };
+
+        crate::diversity::rerank_mmr(&mut results, &finalist_vectors);
+        // The MMR reserve must not leak into session fusion: fusion only
+        // sees a pool wider than `limit` when the query asked for it.
+        if !crate::session_fusion::should_expand_candidates(query) {
+            results.truncate(limit);
+        }
         results = crate::session_fusion::fuse_sessions(query, results, limit);
+
+        let confidence = if results.is_empty() {
+            SearchConfidence::none()
+        } else {
+            SearchConfidence::assess(top_cosine, peak, cross_score, margin)
+        };
 
         if let Some(mut t) = trace.take() {
             t.timing_ms_fusion = fusion_start.elapsed().as_secs_f64() * 1000.0;
@@ -3181,7 +3458,81 @@ impl Database {
             queue_access_update(res.memory.id.clone());
         }
 
-        Ok(results)
+        Ok((results, confidence))
+    }
+
+    /// Stored vectors of the given memories, decoded. Rows without an
+    /// embedding (still queued) are absent from the map.
+    fn batch_memory_vectors(
+        &self,
+        ids: &[&String],
+    ) -> std::collections::HashMap<String, Vec<f32>> {
+        let mut vectors = std::collections::HashMap::new();
+        if ids.is_empty() || ids.len() > 200 {
+            return vectors;
+        }
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL AND id IN ({})",
+            placeholders.join(",")
+        );
+        let rconn = self.read_conn();
+        let Ok(mut stmt) = rconn.prepare(&sql) else {
+            return vectors;
+        };
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|id| *id as &dyn rusqlite::types::ToSql).collect();
+        let expected_dim = crate::embedding::vector_dim();
+        if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        }) {
+            for (id, blob) in rows.flatten() {
+                let vector = crate::embedding::blob_to_vec(&blob);
+                if vector.len() == expected_dim {
+                    vectors.insert(id, vector);
+                }
+            }
+        }
+        vectors
+    }
+
+    /// `date` entities of the given memories, as calendar days.
+    fn batch_memory_dates(
+        &self,
+        ids: &[&String],
+    ) -> std::collections::HashMap<String, Vec<chrono::NaiveDate>> {
+        let mut dates: std::collections::HashMap<String, Vec<chrono::NaiveDate>> =
+            std::collections::HashMap::new();
+        if ids.is_empty() {
+            return dates;
+        }
+        // Candidate pools are a few hundred ids at most; chunk to stay
+        // under SQLite's default variable limit.
+        for chunk in ids.chunks(400) {
+            let placeholders: Vec<String> =
+                (1..=chunk.len()).map(|i| format!("?{}", i)).collect();
+            let sql = format!(
+                "SELECT memory_id, entity_value FROM memory_entities WHERE entity_kind = 'date' AND memory_id IN ({})",
+                placeholders.join(",")
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                chunk.iter().map(|id| *id as &dyn rusqlite::types::ToSql).collect();
+            let rows: Vec<(String, String)> = match stmt.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                Ok(rows) => rows.flatten().collect(),
+                Err(_) => continue,
+            };
+            for (id, value) in rows {
+                if let Some(day) = crate::temporal::day_of_timestamp(&value) {
+                    dates.entry(id).or_default().push(day);
+                }
+            }
+        }
+        dates
     }
     // ─── LIST ─────────────────────────────────────────
 
@@ -4198,9 +4549,9 @@ impl Database {
 
     fn backfill_embeddings_inner(&self, force: bool) -> Result<usize, String> {
         let sql = if force {
-            "SELECT id, content, content_hash FROM memories"
+            "SELECT id, content, content_hash, kind, project, created_at FROM memories"
         } else {
-            "SELECT id, content, content_hash FROM memories WHERE embedding IS NULL"
+            "SELECT id, content, content_hash, kind, project, created_at FROM memories WHERE embedding IS NULL"
         };
         let mut stmt = self
             .conn
@@ -4209,18 +4560,26 @@ impl Database {
 
         let rows = stmt
             .query_map([], |row| {
+                let kind: String = row.get(3)?;
+                let project: Option<String> = row.get(4)?;
+                let created_at: String = row.get(5)?;
+                let content: String = row.get(1)?;
+                let embed_text =
+                    Self::embedding_input(&kind, project.as_deref(), &created_at, &content);
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
+                    content,
                     row.get::<_, Option<String>>(2)?,
+                    embed_text,
                 ))
             })
             .map_err(|e| format!("Backfill query: {}", e))?;
 
-        let mut to_embed: Vec<(String, String)> = Vec::new();
+        // (id, raw content for the hash, text handed to the encoder)
+        let mut to_embed: Vec<(String, String, String)> = Vec::new();
         let mut skipped = 0usize;
         for r in rows.flatten() {
-            let (id, content, existing_hash) = r;
+            let (id, content, existing_hash, embed_text) = r;
             if !force {
                 let new_hash = content_hash(&content);
                 if existing_hash.as_deref() == Some(&new_hash) {
@@ -4238,7 +4597,7 @@ impl Database {
                     }
                 }
             }
-            to_embed.push((id, content));
+            to_embed.push((id, content, embed_text));
         }
 
         if to_embed.is_empty() {
@@ -4257,10 +4616,10 @@ impl Database {
             skipped
         );
 
-        let texts: Vec<&str> = to_embed.iter().map(|(_, c)| c.as_str()).collect();
+        let texts: Vec<&str> = to_embed.iter().map(|(_, _, t)| t.as_str()).collect();
         let embeddings = crate::embedding::embed_batch(&texts);
         let mut count = 0;
-        for ((id, content), emb) in to_embed.iter().zip(embeddings.iter()) {
+        for ((id, content, _), emb) in to_embed.iter().zip(embeddings.iter()) {
             let blob = crate::embedding::vec_to_blob(emb);
             let hash = content_hash(content);
             let _ = self.conn.execute(

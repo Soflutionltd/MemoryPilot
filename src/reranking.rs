@@ -76,9 +76,15 @@ pub fn rerank_local(query: &str, results: &mut Vec<SearchResult>) {
     }
 }
 
-pub fn rerank_cross_encoder_if_enabled(query: &str, results: &mut Vec<SearchResult>) {
+/// Returns the best raw cross-encoder logit among the reranked window
+/// when the lane ran — a calibrated relevance signal the caller folds
+/// into its confidence verdict — and `None` when it was skipped.
+pub fn rerank_cross_encoder_if_enabled(
+    query: &str,
+    results: &mut Vec<SearchResult>,
+) -> Option<f32> {
     if results.len() <= 1 || !should_run_cross_encoder(query) {
-        return;
+        return None;
     }
 
     // Confidence gate: when the primary lane already separates the top
@@ -97,7 +103,7 @@ pub fn rerank_cross_encoder_if_enabled(query: &str, results: &mut Vec<SearchResu
     // MEMORYPILOT_CROSS_RERANK=1: in that mode they explicitly want
     // every query reranked (typically for ranking ablations).
     if !is_force_enabled() && is_confident_top(results) {
-        return;
+        return None;
     }
 
     let top_k = std::env::var("MEMORYPILOT_CROSS_RERANK_TOP_K")
@@ -130,11 +136,15 @@ pub fn rerank_cross_encoder_if_enabled(query: &str, results: &mut Vec<SearchResu
     };
 
     let Some(scores) = reranked else {
-        return;
+        return None;
     };
     if scores.len() != top_k {
-        return;
+        return None;
     }
+    let best_raw = scores
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
     let reranked: Vec<CrossScore> = scores
         .into_iter()
         .enumerate()
@@ -199,6 +209,7 @@ pub fn rerank_cross_encoder_if_enabled(query: &str, results: &mut Vec<SearchResu
     });
     fused.extend(results.drain(..));
     *results = fused;
+    Some(best_raw)
 }
 
 struct CrossScore {

@@ -270,6 +270,135 @@ impl Database {
         Ok(())
     }
 
+    /// Link every memory that a newer one restates with a different value
+    /// (`supersedes` edge, newer → older). The ranker then keeps the older
+    /// statement retrievable but below its replacement — the local answer
+    /// to "what is my current X?" when the store holds two Xs.
+    ///
+    /// A pair qualifies when both live in the same project, sit within
+    /// [`SUPERSEDE_COSINE`] of each other, share enough words to be about
+    /// the same thing yet not so many that they are the same statement
+    /// (that band belongs to consolidation), and are at least
+    /// [`SUPERSEDE_MIN_GAP_SECS`] apart. Idempotent; returns the number
+    /// of edges written.
+    pub fn link_superseded_memories(&self, project: Option<&str>) -> Result<Value, String> {
+        let candidates = self.supersede_candidates(project)?;
+        let mut by_project: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            by_project
+                .entry(candidate.project.as_str())
+                .or_default()
+                .push(index);
+        }
+
+        let mut pairs: Vec<(usize, usize, f32)> = Vec::new();
+        for members in by_project.values() {
+            for (position, &a) in members.iter().enumerate() {
+                for &b in &members[position + 1..] {
+                    let (older, newer) = if candidates[a].created_at <= candidates[b].created_at {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
+                    if seconds_between(&candidates[older].created_at, &candidates[newer].created_at)
+                        < SUPERSEDE_MIN_GAP_SECS
+                    {
+                        continue;
+                    }
+                    let cosine = crate::embedding::cosine_similarity(
+                        &candidates[a].vector,
+                        &candidates[b].vector,
+                    );
+                    if cosine < SUPERSEDE_COSINE {
+                        continue;
+                    }
+                    let overlap =
+                        Self::similarity(&candidates[a].normalized, &candidates[b].normalized);
+                    if !(SUPERSEDE_MIN_OVERLAP..SUPERSEDE_MAX_OVERLAP).contains(&overlap) {
+                        continue;
+                    }
+                    pairs.push((newer, older, cosine));
+                }
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut written = 0usize;
+        let mut examples = Vec::new();
+        for (newer, older, cosine) in &pairs {
+            let changed = self
+                .conn
+                .execute(
+                    "INSERT INTO memory_links (source_id, target_id, relation_type, confidence, created_at)
+                     VALUES (?1, ?2, 'supersedes', ?3, ?4)
+                     ON CONFLICT(source_id, target_id) DO UPDATE SET relation_type = 'supersedes', confidence = ?3
+                     WHERE memory_links.relation_type IN ('relates_to', 'shares_topic', 'same_agent', 'same_origin')",
+                    params![candidates[*newer].id, candidates[*older].id, *cosine as f64, now],
+                )
+                .map_err(|error| format!("supersede link: {}", error))?;
+            written += changed;
+            if examples.len() < 12 && changed > 0 {
+                examples.push(json!({
+                    "newer": { "id": candidates[*newer].id, "content": snippet(&candidates[*newer].content) },
+                    "older": { "id": candidates[*older].id, "content": snippet(&candidates[*older].content) },
+                    "cosine": ((*cosine as f64) * 1000.0).round() / 1000.0,
+                }));
+            }
+        }
+
+        Ok(json!({
+            "scanned": candidates.len(),
+            "pairs": pairs.len(),
+            "links_written": written,
+            "examples": examples,
+        }))
+    }
+
+    fn supersede_candidates(&self, project: Option<&str>) -> Result<Vec<Candidate>, String> {
+        let canonical_project = Self::canonical_project(project);
+        let mut sql = String::from(
+            "SELECT id, project, kind, tags, importance, access_count, created_at, updated_at, content, embedding
+             FROM memories
+             WHERE embedding IS NOT NULL AND kind NOT IN ('credential') AND tags NOT LIKE '%pinned%'",
+        );
+        let mut params_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(p) = canonical_project.as_deref() {
+            sql.push_str(" AND project = ?1");
+            params_values.push(Box::new(p.to_string()));
+        }
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|error| format!("supersede prepare: {}", error))?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_values.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), |row| {
+                let tags: String = row.get(3)?;
+                let blob: Vec<u8> = row.get(9)?;
+                let content: String = row.get(8)?;
+                Ok(Candidate {
+                    id: row.get(0)?,
+                    project: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    kind: row.get(2)?,
+                    tags: serde_json::from_str(&tags).unwrap_or_default(),
+                    importance: row.get(4)?,
+                    access_count: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    normalized: Self::normalize(&content),
+                    content,
+                    vector: crate::embedding::blob_to_vec(&blob),
+                })
+            })
+            .map_err(|error| format!("supersede query: {}", error))?;
+        let expected_dim = crate::embedding::vector_dim();
+        Ok(rows
+            .flatten()
+            .filter(|candidate| candidate.vector.len() == expected_dim)
+            .collect())
+    }
+
     /// Daily automatic pass at `AUTO_THRESHOLD`, throttled through the
     /// `config` table so it survives restarts. Called from the write path.
     pub(super) fn maybe_consolidate(&self) {
@@ -311,6 +440,43 @@ impl Database {
             }
             Err(error) => eprintln!("[MemoryPilot] consolidation skipped: {}", error),
         }
+        match self.link_superseded_memories(None) {
+            Ok(report) => {
+                let written = report["links_written"].as_u64().unwrap_or(0);
+                if written > 0 {
+                    eprintln!(
+                        "[MemoryPilot] Linked {} superseded memories below their newer restatement.",
+                        written
+                    );
+                }
+            }
+            Err(error) => eprintln!("[MemoryPilot] supersede pass skipped: {}", error),
+        }
+    }
+}
+
+/// Cosine from which two memories are considered to be about the same
+/// thing. Lower than the consolidation threshold on purpose: a changed
+/// value ("Honda Civic" → "Tesla Model 3") moves the vector more than a
+/// restatement does.
+const SUPERSEDE_COSINE: f32 = 0.86;
+/// Word-Jaccard band: enough shared words to be the same subject, not
+/// so many that the pair is one statement said twice.
+const SUPERSEDE_MIN_OVERLAP: f64 = 0.30;
+const SUPERSEDE_MAX_OVERLAP: f64 = 0.85;
+/// Two memories written within this gap are one conversation, not an
+/// update.
+const SUPERSEDE_MIN_GAP_SECS: i64 = 10 * 60;
+
+fn seconds_between(earlier: &str, later: &str) -> i64 {
+    let parse = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|stamp| stamp.timestamp())
+            .ok()
+    };
+    match (parse(earlier), parse(later)) {
+        (Some(a), Some(b)) => b - a,
+        _ => i64::MAX,
     }
 }
 
@@ -394,6 +560,71 @@ mod tests {
 
         let again = db.consolidate_memories(0.95, true, None).unwrap();
         assert_eq!(again["memories_removed"], 0, "idempotent");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn add_at(db: &Database, content: &str, kind: &str, created_at: &str, vector: &[f32]) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut unit = vector.to_vec();
+        let norm = unit.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in &mut unit {
+            *x /= norm;
+        }
+        unit.resize(crate::embedding::vector_dim(), 0.0);
+        let blob = crate::embedding::quantize_to_blob(&unit);
+        db.conn
+            .execute(
+                "INSERT INTO memories (id,content,kind,project,tags,source,importance,embedding,content_hash,created_at,updated_at,access_count)
+                 VALUES (?1,?2,?3,'proj','[]','test',3,?4,?5,?6,?6,0)",
+                params![id, content, kind, blob, crate::db::content_hash(content), created_at],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn links_a_changed_value_below_its_newer_restatement() {
+        let (db, dir) = temp_db();
+        let old_car = add_at(&db, "I drive a Honda Civic to work", "fact", "2026-01-10T09:00:00+00:00", &[1.0, 0.3, 0.0]);
+        let new_car = add_at(&db, "I now drive a Tesla Model 3 to work", "fact", "2026-06-10T09:00:00+00:00", &[1.0, 0.0, 0.3]);
+        // Same conversation, minutes apart: not an update.
+        let same_a = add_at(&db, "Deploy uses the docix Cloudflare project", "fact", "2026-03-01T10:00:00+00:00", &[0.0, 1.0, 0.2]);
+        let same_b = add_at(&db, "Deploy target: docix Cloudflare project only", "fact", "2026-03-01T10:04:00+00:00", &[0.0, 1.0, 0.25]);
+        // Unrelated words, close vector: a translation, not an update.
+        let french = add_at(&db, "Le support répond en moins d'une heure", "fact", "2026-02-01T10:00:00+00:00", &[0.3, 0.3, 1.0]);
+        let english = add_at(&db, "Support replies within one hour", "fact", "2026-04-01T10:00:00+00:00", &[0.3, 0.3, 1.05]);
+
+        let report = db.link_superseded_memories(None).unwrap();
+        assert_eq!(report["links_written"], 1, "{}", report);
+
+        let relation: String = db
+            .conn
+            .query_row(
+                "SELECT relation_type FROM memory_links WHERE source_id=?1 AND target_id=?2",
+                params![new_car, old_car],
+                |row| row.get(0),
+            )
+            .expect("newer supersedes older");
+        assert_eq!(relation, "supersedes");
+        let count = |a: &str, b: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_links WHERE (source_id=?1 AND target_id=?2) OR (source_id=?2 AND target_id=?1)",
+                    params![a, b],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(&same_a, &same_b), 0, "minutes apart is one conversation");
+        assert_eq!(count(&french, &english), 0, "translations share no words");
+
+        let again = db.link_superseded_memories(None).unwrap();
+        assert_eq!(again["links_written"], 0, "idempotent");
+
+        // The ranker demotes the superseded row.
+        let boosts = db.build_link_boosts_for(&[&old_car, &new_car]);
+        assert!(boosts.get(&old_car).copied().unwrap_or(0.0) < 0.0);
+        assert!(boosts.get(&new_car).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

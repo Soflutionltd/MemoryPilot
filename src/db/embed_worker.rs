@@ -10,7 +10,12 @@ const DISK_CACHE_SOFT_CAP: usize = 8_192;
 
 struct EmbedJob {
     id: String,
+    /// Raw memory text — hashed into `content_hash` for dedup.
     content: String,
+    /// What the encoder actually sees: the raw text, or for context-poor
+    /// kinds the same text under a `[project; date]` header (see
+    /// `Database::embedding_input`).
+    embed_text: String,
 }
 
 static EMBED_QUEUE: OnceLock<Mutex<Vec<EmbedJob>>> = OnceLock::new();
@@ -121,11 +126,12 @@ fn embed_ann_index() -> Option<Arc<AnnIndex>> {
         .and_then(|slot| slot.read().ok().and_then(|guard| guard.clone()))
 }
 
-pub(super) fn queue_embedding_job(id: &str, content: &str) {
+pub(super) fn queue_embedding_job(id: &str, content: &str, embed_text: &str) {
     if let Ok(mut queue) = embed_queue().lock() {
         queue.push(EmbedJob {
             id: id.to_string(),
             content: content.to_string(),
+            embed_text: embed_text.to_string(),
         });
     }
     ensure_embed_worker();
@@ -137,7 +143,7 @@ static STARTUP_BACKFILL_QUEUED: OnceLock<()> = OnceLock::new();
 /// once per process. `open_at` runs several times per process (main
 /// handle, watcher, HTTP workers) and each would otherwise re-queue the
 /// same still-NULL rows while the worker is busy on the first copy.
-pub(super) fn queue_startup_backfill(jobs: Vec<(String, String)>) -> bool {
+pub(super) fn queue_startup_backfill(jobs: Vec<(String, String, String)>) -> bool {
     let mut queued = false;
     STARTUP_BACKFILL_QUEUED.get_or_init(|| {
         queue_embedding_jobs(jobs);
@@ -147,15 +153,17 @@ pub(super) fn queue_startup_backfill(jobs: Vec<(String, String)>) -> bool {
 }
 
 /// Queue many memories for background embedding in one lock acquisition.
-fn queue_embedding_jobs(jobs: Vec<(String, String)>) {
+/// Each job is `(id, content, embed_text)`.
+fn queue_embedding_jobs(jobs: Vec<(String, String, String)>) {
     if jobs.is_empty() {
         return;
     }
     if let Ok(mut queue) = embed_queue().lock() {
-        queue.extend(
-            jobs.into_iter()
-                .map(|(id, content)| EmbedJob { id, content }),
-        );
+        queue.extend(jobs.into_iter().map(|(id, content, embed_text)| EmbedJob {
+            id,
+            content,
+            embed_text,
+        }));
     }
     ensure_embed_worker();
 }
@@ -337,7 +345,7 @@ fn embed_worker_loop() {
             continue;
         }
 
-        let texts: Vec<&str> = jobs.iter().map(|job| job.content.as_str()).collect();
+        let texts: Vec<&str> = jobs.iter().map(|job| job.embed_text.as_str()).collect();
         let embeddings = crate::embedding::embed_batch(&texts);
 
         let ann = embed_ann_index();

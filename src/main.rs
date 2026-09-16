@@ -6,6 +6,7 @@ mod code_chunker;
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
 /// (c) SOFLUTION LTD — Apache 2.0 License
 mod db;
+mod diversity;
 mod embedding;
 mod fts;
 mod gc;
@@ -15,7 +16,9 @@ mod http;
 mod onnx_external;
 mod pool;
 mod protocol;
+mod reader;
 mod reranking;
+mod temporal;
 mod tokenizer;
 mod session_capsule;
 mod session_export;
@@ -316,7 +319,11 @@ fn run_benchmark_longmemeval(args: &[String]) {
         .windows(2)
         .find(|w| w[0] == "--min-r5")
         .and_then(|w| parse_percent(&w[1]));
-    match db::Database::benchmark_longmemeval(dataset_path, limit) {
+    let options = db::LongMemEvalOptions {
+        limit,
+        reader: args.iter().any(|a| a == "--reader"),
+    };
+    match db::Database::benchmark_longmemeval(dataset_path, options) {
         Ok(report) => {
             println!(
                 "{}",

@@ -138,6 +138,163 @@ impl ByteLevelBpe {
     }
 }
 
+// ─── Byte-level BPE with explicit merges (GPT-2 / RoBERTa family) ───
+
+/// GPT-2 pre-tokenizer regex. RoBERTa's `tokenizer.json` declares a
+/// `ByteLevel` pre-tokenizer with `use_regex: true`, which means exactly
+/// this pattern.
+const GPT2_PATTERN: &str =
+    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+
+/// RoBERTa's byte-level BPE. Unlike the tiktoken-style vocabularies
+/// above, its ids are frequency-sorted and carry no merge order, so the
+/// merge list is turned into ranks (`256 + position`), tiktoken runs on
+/// those ranks, and a table maps each rank back to the model id.
+/// Reproduces the `tokenizers` crate token-for-token (asserted in tests).
+///
+/// Exposes byte offsets per token: byte-level BPE is lossless, so the
+/// concatenated token bytes *are* the input, which is what lets the
+/// extractive reader map a predicted span back onto the passage.
+pub struct MergeBpe {
+    bpe: tiktoken_rs::CoreBPE,
+    rank_to_id: Vec<u32>,
+    rank_bytes: Vec<Vec<u8>>,
+    bos_id: u32,
+    eos_id: u32,
+    pad_id: u32,
+}
+
+impl MergeBpe {
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            model: Model,
+            added_tokens: Vec<Added>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Model {
+            vocab: HashMap<String, u32>,
+            merges: Vec<serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Added {
+            content: String,
+            id: u32,
+        }
+
+        let reader = BufReader::new(
+            std::fs::File::open(path)
+                .map_err(|error| format!("open {}: {}", path.display(), error))?,
+        );
+        let file: File = serde_json::from_reader(reader)
+            .map_err(|error| format!("parse {}: {}", path.display(), error))?;
+
+        let table = byte_level_decoder();
+        let decode = |token: &str| -> Option<Vec<u8>> {
+            token.chars().map(|ch| table.get(&ch).copied()).collect()
+        };
+
+        let rank_count = 256 + file.model.merges.len();
+        let mut encoder: rustc_hash::FxHashMap<Vec<u8>, u32> = Default::default();
+        encoder.reserve(rank_count);
+        let mut rank_to_id = vec![u32::MAX; rank_count];
+        let mut rank_bytes: Vec<Vec<u8>> = vec![Vec::new(); rank_count];
+
+        // Ranks 0..256: the single bytes, in byte order.
+        for (token, &id) in &file.model.vocab {
+            if let Some(bytes) = decode(token) {
+                if bytes.len() == 1 {
+                    let rank = bytes[0] as usize;
+                    encoder.insert(bytes.clone(), rank as u32);
+                    rank_to_id[rank] = id;
+                    rank_bytes[rank] = bytes;
+                }
+            }
+        }
+        // Ranks 256..: one per merge, in merge order.
+        for (position, merge) in file.model.merges.iter().enumerate() {
+            let merged = match merge {
+                serde_json::Value::String(pair) => pair.replacen(' ', "", 1),
+                serde_json::Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part.as_str())
+                    .collect::<String>(),
+                _ => return Err("tokenizer.json merge entry has an unknown shape".into()),
+            };
+            let id = *file
+                .model
+                .vocab
+                .get(&merged)
+                .ok_or_else(|| format!("merge result {:?} missing from vocab", merged))?;
+            let bytes = decode(&merged)
+                .ok_or_else(|| format!("merge result {:?} is not byte-level encoded", merged))?;
+            let rank = 256 + position;
+            encoder.insert(bytes.clone(), rank as u32);
+            rank_to_id[rank] = id;
+            rank_bytes[rank] = bytes;
+        }
+        if rank_to_id[..256].iter().any(|&id| id == u32::MAX) {
+            return Err("vocab does not cover all 256 byte tokens".into());
+        }
+
+        let special = |name: &str| -> Result<u32, String> {
+            file.added_tokens
+                .iter()
+                .find(|added| added.content == name)
+                .map(|added| added.id)
+                .ok_or_else(|| format!("tokenizer.json has no {} token", name))
+        };
+        let bos_id = special("<s>")?;
+        let eos_id = special("</s>")?;
+        let pad_id = special("<pad>")?;
+
+        let specials: rustc_hash::FxHashMap<String, u32> = Default::default();
+        let bpe = tiktoken_rs::CoreBPE::new(encoder, specials, GPT2_PATTERN)
+            .map_err(|error| format!("BPE init: {}", error))?;
+        Ok(Self {
+            bpe,
+            rank_to_id,
+            rank_bytes,
+            bos_id,
+            eos_id,
+            pad_id,
+        })
+    }
+
+    pub fn pad_id(&self) -> u32 {
+        self.pad_id
+    }
+
+    pub fn bos_id(&self) -> u32 {
+        self.bos_id
+    }
+
+    pub fn eos_id(&self) -> u32 {
+        self.eos_id
+    }
+
+    /// Model ids of `text` (no specials) with, per token, the byte range
+    /// of `text` it covers.
+    pub fn encode_with_offsets(&self, text: &str) -> (Vec<u32>, Vec<(usize, usize)>) {
+        let ranks = self.bpe.encode_ordinary(text);
+        let mut ids = Vec::with_capacity(ranks.len());
+        let mut offsets = Vec::with_capacity(ranks.len());
+        let mut cursor = 0usize;
+        for rank in ranks {
+            let width = self.rank_bytes[rank as usize].len();
+            ids.push(self.rank_to_id[rank as usize]);
+            offsets.push((cursor, cursor + width));
+            cursor += width;
+        }
+        (ids, offsets)
+    }
+
+    /// Model ids of `text`, no specials.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.encode_with_offsets(text).0
+    }
+}
+
 // ─── Unigram / SentencePiece (XLM-R family: mmarco-mMiniLMv2) ───
 
 /// Unigram language-model tokenizer (Viterbi best segmentation), with
@@ -358,6 +515,29 @@ mod tests {
         let ids = ours.encode(&long, 512);
         assert_eq!(ids.len(), 512);
         assert_eq!(*ids.last().unwrap(), ours.encode("x", 8).last().copied().unwrap());
+    }
+
+    #[test]
+    fn merge_bpe_matches_tokenizers_crate_with_offsets() {
+        let path = crate::embedding::hf_file(crate::reader::READER_REPO, "tokenizer.json", false)
+            .expect("roberta tokenizer.json");
+        let ours = MergeBpe::from_file(&path).expect("load");
+        let reference = tokenizers::Tokenizer::from_file(&path).expect("reference");
+        for sample in SAMPLES {
+            let expected = reference.encode(*sample, false).unwrap().get_ids().to_vec();
+            let (ids, offsets) = ours.encode_with_offsets(sample);
+            assert_eq!(ids, expected, "sample {:?}", sample);
+            // Offsets tile the input exactly.
+            let mut cursor = 0;
+            for (start, end) in &offsets {
+                assert_eq!(*start, cursor);
+                cursor = *end;
+            }
+            assert_eq!(cursor, sample.len());
+        }
+        assert_eq!(ours.bos_id(), 0);
+        assert_eq!(ours.eos_id(), 2);
+        assert_eq!(ours.pad_id(), 1);
     }
 
     #[test]

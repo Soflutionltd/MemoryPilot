@@ -111,6 +111,28 @@ v4.5.0 also closes two write-path stability bugs surfaced by that work: the epis
 
 Run-to-run variance is bounded to ±1 pp on R@5 / R@10 thanks to deterministic memory ids, deterministic id-based RRF tie-break, synchronous ANN warm-up, and explicit cross-encoder pre-warm before the first query. This is the metric to watch for any French / multilingual regression.
 
+### v4.6 — beyond single-fact retrieval
+
+v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: multi-session aggregation, temporal reasoning, knowledge updates and abstention. Everything stays local and rule-based or int8 ONNX. Measured on LongMemEval-S@100 (64 single-session + 36 multi-session, plus the 7 abstention questions of that slice) against v4.5.0, same machine, cross-encoder adaptive:
+
+| Metric | v4.5.0 | v4.6.0 |
+|---|---|---|
+| R@5 / R@10 | 99% / 100% | **100%** / 100% |
+| MRR / nDCG@10 | 96.3% / 97.2% | **96.5%** / **97.3%** |
+| Multi-session gold coverage@10 | 93.6% | **94.5%** |
+| Multi-session questions with *all* gold sessions in top-10 | 30/36 | **32/36** |
+| False abstention on answerable questions | — | 4% |
+| Extractive answer (`search_memory … answer=true`), contains-gold | — | 48% (72% single-session; counting questions are out of reach for span extraction) |
+
+`--benchmark-fr` is unchanged within noise (R@1 96.3%, R@5 99.1%, MRR 97.6%).
+
+- **MMR diversity** (`src/diversity.rs`) — the finalists plus the RRF ranks just below them are re-ordered by maximal marginal relevance over their stored vectors (λ = 0.4, redundancy floor 0.55). The top hit never moves, so MRR is untouched; a second, distinct source can displace a restatement of the first. `MEMORYPILOT_MMR=0` disables it.
+- **Temporal grounding** (`src/temporal.rs`) — explicit dates in a memory (`2026-09-01`, `12 septembre 2026`, `September 12`, `hier`…) become `date` entities at ingest; a temporal phrase in the query (`last week`, `il y a deux semaines`, `en mars`, `last Tuesday`) becomes a day window that boosts dated candidates inside it (×1.25) and mildly demotes dated candidates far outside (×0.85). Undated memories are neutral, so a mis-parsed window costs at most the boost. `MEMORYPILOT_TEMPORAL=0` disables it.
+- **Contextual embeddings** — transcript chunks and other context-poor kinds are embedded with a `[date · project]` prefix while the stored content and its hash are left untouched.
+- **Superseding** — the daily consolidation pass links a memory to a newer, near-identical restatement with a changed value (cosine ≥ 0.86, lexical overlap 0.55–0.95, ≥ 1 h apart) and the old one is demoted (−0.35) at search time. Both stay retrievable; `consolidate_memories(apply=true)` reports the links made.
+- **Calibrated confidence** — every search returns `confidence: { top_cosine, peak, cross_score, margin, level, abstain }`. On LongMemEval the abstention haystacks are built from the *same user's* other sessions and no cheap signal separates them from answerable questions (top-1 cosine p50 0.46 vs 0.54, cross-encoder logits overlap fully), so the hard `abstain` is deliberately conservative (cosine < 0.35, 4% false abstention) and `level` carries the graded signal. `MEMORYPILOT_ABSTAIN_COSINE` moves the floor.
+- **Extractive reader** (`src/reader.rs`, opt-in) — `search_memory` with `answer: true` runs `deepset/roberta-base-squad2` (int8 ONNX, 125 MB, English, loaded on demand through the idle pool) over the top-5 passages and returns the literal span or nothing. ~480 ms per question on CPU. It is a benchmarking instrument and a shortcut for literal lookups, not a language model: it abstained on 5/7 LongMemEval abstention questions where the retriever could not. `--benchmark-longmemeval --reader` reports SQuAD-style EM / F1 / contains.
+
 ### Search Quality — Real-World (500 memories, 30 scenarios)
 
 | Metric | MemoryPilot v4.2 | MemPalace v3.1 (raw) | Quantum Memory Graph |
@@ -480,7 +502,11 @@ MemoryPilot --help                   # Show help
 | `MEMORYPILOT_EMBED_THREADS` | `min(4, cores)` | ONNX intra-op threads for the embedder. `MEMORYPILOT_RERANK_THREADS` (default `min(2, cores)`) does the same for the cross-encoder. |
 | `MEMORYPILOT_RERANKER_MODEL` | `mmarco` | `mmarco-mMiniLMv2-L12-H384-v1` int8 (Apache-2.0, ~120 MB resident). Alternatives served the same way (int8, memory-mapped): `jina-v2` (`jina-reranker-v2-base-multilingual`, 280 MB, CC-BY-NC) and `gte-multilingual` (`gte-multilingual-reranker-base`, 341 MB, Apache-2.0) — both measured *lower* on `--benchmark-fr` (MRR 63.5% / 62.1% vs 65.3% before the v4.5 fix) at 2× the latency, hence not the default. Legacy fp32 fastembed models: `jina-v2-multilingual-fp32` (1.1 GB), `bge-v2-m3`, `bge-base`, `jina-v1`. |
 | `MEMORYPILOT_MODEL_IDLE_SECS` | `600` | Idle time after which the embedder and reranker sessions are dropped to free memory (~250 MB). `0` keeps them resident (benchmarks). |
-| `MEMORYPILOT_CONSOLIDATE` | `on` | Daily embedding-based consolidation of near-duplicate ephemeral memories (cosine ≥ 0.95 and word overlap ≥ 0.6, same project, newest kept). `off` disables it; `consolidate_memories` runs it on demand. |
+| `MEMORYPILOT_CONSOLIDATE` | `on` | Daily embedding-based consolidation of near-duplicate ephemeral memories (cosine ≥ 0.95 and word overlap ≥ 0.6, same project, newest kept), followed by the supersede pass (see v4.6). `off` disables it; `consolidate_memories` runs it on demand. |
+| `MEMORYPILOT_MMR` / `MEMORYPILOT_MMR_LAMBDA` | `on` / `0.4` | MMR diversity over the finalists. `0` disables; λ = 1.0 is pure relevance, 0.0 pure diversity. `MEMORYPILOT_MMR_FLOOR` (`0.55`) is the cosine below which two candidates are not considered redundant. |
+| `MEMORYPILOT_TEMPORAL` | `on` | Query-time date window boost/demotion. `0` disables (date entities are still extracted at ingest). |
+| `MEMORYPILOT_ABSTAIN_COSINE` / `MEMORYPILOT_TRUST_CROSS` | `0.35` / `1.0` | Below the cosine floor a search reports `confidence.abstain = true` unless the cross-encoder logit on the top hit reaches the trust value. |
+| `MEMORYPILOT_READER_NULL_MARGIN` | `0` | Extractive reader: the span logit must beat the model's no-answer logit by this much. Negative values answer more often (`−3` → 92/100 answered, 3/7 abstentions still caught on LongMemEval-S@100). |
 | `MEMORYPILOT_EMBED_MODEL` | `jina` | `jina-embeddings-v5-text-nano-retrieval` int8 (768-dim). `jina-q4` = 4-bit variant (140 MB download, ~5× faster queries, −1 pp R@5 / −3 pp MRR on FR). Apache-2.0 alternatives via fastembed: `e5-small` (384-dim), `e5-base`, `e5-large`, `bge-m3` (1024-dim). The database records which model produced its vectors; changing the model drops them and re-embeds everything in the background at next start (BM25 keeps answering meanwhile). |
 
 ## HTTP API
