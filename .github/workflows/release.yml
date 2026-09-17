@@ -108,6 +108,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if ! gh release view "${{ steps.tag.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${{ steps.tag.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --title "MemoryPilot ${{ steps.tag.outputs.tag }}" \
+              --generate-notes
+          fi
           gh release upload "${{ steps.tag.outputs.tag }}" dist/*.tar.gz dist/*.sha256 \
             --repo "${{ github.repository }}" \
             --clobber
