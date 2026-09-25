@@ -19,7 +19,7 @@ serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
+dirs = "7"
 notify = { version = "6", features = ["macos_kqueue"] }
 fastembed = { version = "7.0.1", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
 # Pinned to the exact `ort` release fastembed 7.0.1 links against: two
