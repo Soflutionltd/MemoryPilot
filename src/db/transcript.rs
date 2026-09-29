@@ -106,6 +106,28 @@ impl Database {
         }
     }
 
+    /// Agent process chatter ("Checking…", "Let me…", "Je vais vérifier…"),
+    /// sentences that only make sense in context ("It…", "That leaves…") and
+    /// markdown scaffolding are not durable knowledge. `lowered` must be
+    /// lowercase. User sentences never go through this filter.
+    pub(crate) fn is_agent_narration(lowered: &str) -> bool {
+        const OPENERS: [&str; 58] = [
+            "checking", "let me", "let's", "i'll", "i will", "i'm going", "i am going",
+            "i'm now", "i'm checking", "i'm looking", "i'm holding", "i need to", "i see",
+            "i found", "i've ", "i have ", "i can", "i think", "now i", "now let", "now,",
+            "first,", "next,", "then,", "looking at", "reading", "searching", "running",
+            "okay", "ok,", "ok ", "great", "perfect", "good,", "alright", "sure",
+            "it ", "it's", "this ", "that ", "these ", "those ", "they ", "there ",
+            "je vais", "je regarde", "je vérifie", "je lance", "je relance", "je commence",
+            "maintenant", "d'abord", "ensuite", "voyons", "parfait", "d'accord", "ça ",
+            "cela ",
+        ];
+        if OPENERS.iter().any(|opener| lowered.starts_with(opener)) {
+            return true;
+        }
+        lowered.contains("##") || lowered.starts_with('#') || lowered.contains("](http")
+    }
+
     fn build_transcript_candidate(
         segment: &str,
         role: Option<&str>,
@@ -116,8 +138,11 @@ impl Database {
         scope: &MemoryScope,
     ) -> Option<DistilledTranscriptCandidate> {
         let content = Self::normalized_transcript_segment(segment)?;
-        let lowered = content.to_ascii_lowercase();
+        let lowered = content.to_lowercase();
         if lowered.ends_with('?') {
+            return None;
+        }
+        if role == Some("assistant") && Self::is_agent_narration(&lowered) {
             return None;
         }
 

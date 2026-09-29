@@ -69,12 +69,34 @@ fn read_stdin_json() -> Value {
     serde_json::from_str(&input).unwrap_or_else(|_| json!({}))
 }
 
+/// Cursor sends `workspace_roots`, Claude Code and Codex send `cwd`.
 fn first_workspace_root(payload: &Value) -> Option<String> {
     payload
         .get("workspace_roots")
         .and_then(|v| v.as_array())
         .and_then(|roots| roots.iter().find_map(|r| r.as_str()))
         .map(String::from)
+        .or_else(|| str_field(payload, "cwd"))
+}
+
+/// Cursor: `conversation_id`; Claude Code and Codex: `session_id`.
+fn conversation_id(payload: &Value) -> Option<String> {
+    str_field(payload, "conversation_id").or_else(|| str_field(payload, "session_id"))
+}
+
+/// Which agent called the hook: explicit `--agent`, else inferred from the
+/// payload (only Cursor sends `workspace_roots` / `cursor_version`).
+fn detect_agent(args: &[String], payload: &Value) -> String {
+    if let Some(pos) = args.iter().position(|a| a == "--agent") {
+        if let Some(agent) = args.get(pos + 1) {
+            return agent.to_ascii_lowercase();
+        }
+    }
+    if payload.get("cursor_version").is_some() || payload.get("workspace_roots").is_some() {
+        "cursor".into()
+    } else {
+        "claude".into()
+    }
 }
 
 fn str_field(payload: &Value, key: &str) -> Option<String> {
@@ -85,12 +107,26 @@ fn str_field(payload: &Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Entry point for `--hook <event>`.
-pub fn run_hook(event: &str) {
+/// Entry point for `--hook <event> [--agent cursor|claude|codex]`.
+pub fn run_hook(event: &str, args: &[String]) {
     let payload = read_stdin_json();
+    let agent = detect_agent(args, &payload);
     let output = match event {
-        "session-start" | "sessionStart" => session_start(&payload),
-        "stop" => {
+        "session-start" | "sessionStart" | "SessionStart" => {
+            match session_start_context(&payload) {
+                // Cursor: top-level `additional_context`. Claude Code and
+                // Codex: `hookSpecificOutput.additionalContext`.
+                Some(context) if agent == "cursor" => json!({ "additional_context": context }),
+                Some(context) => json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": context
+                    }
+                }),
+                None => json!({}),
+            }
+        }
+        "stop" | "Stop" => {
             spawn_ingest(&payload);
             json!({})
         }
@@ -102,18 +138,18 @@ pub fn run_hook(event: &str) {
     println!("{}", output);
 }
 
-fn session_start(payload: &Value) -> Value {
+fn session_start_context(payload: &Value) -> Option<String> {
     let working_dir = first_workspace_root(payload);
     let db = match open_db() {
         Ok(db) => db,
         Err(error) => {
             log(&format!("session-start: db open failed: {}", error));
-            return json!({});
+            return None;
         }
     };
     let scope = MemoryScope {
         session_id: str_field(payload, "session_id"),
-        thread_id: str_field(payload, "conversation_id"),
+        thread_id: conversation_id(payload),
         window_id: None,
     };
     let recalled = db.recall(
@@ -132,15 +168,14 @@ fn session_start(payload: &Value) -> Value {
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .unwrap_or_else(|| ctx.to_string());
-            let context = format!(
+            Some(format!(
                 "MemoryPilot (mémoire persistante d'Antoine, chargée automatiquement au démarrage) :\n{}",
                 truncate_chars(&text, MAX_CONTEXT_CHARS)
-            );
-            json!({ "additional_context": context })
+            ))
         }
         Err(error) => {
             log(&format!("session-start: recall failed: {}", error));
-            json!({})
+            None
         }
     }
 }
@@ -150,7 +185,7 @@ fn spawn_ingest(payload: &Value) {
         log("stop: no transcript_path in payload");
         return;
     };
-    let conversation = str_field(payload, "conversation_id").unwrap_or_default();
+    let conversation = conversation_id(payload).unwrap_or_default();
     let root = first_workspace_root(payload).unwrap_or_default();
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -277,28 +312,58 @@ fn ingest_new_lines(transcript: &str, conversation: &str, root: &str) -> Result<
 /// one-line-per-message format the distiller segments on. Tool calls and
 /// non-text blocks are dropped, `<user_query>` wrappers stripped, obvious
 /// secrets redacted.
+///
+/// Only the agent's FINAL answer of each turn is kept: every assistant text
+/// written between tool calls is working narration ("I'm checking…",
+/// "Since he wants…") and polluted the store in production. The last
+/// assistant text before the next user message (or the end of the file,
+/// the stop hook fires once the turn is over) is the answer.
 pub fn cursor_jsonl_to_transcript(jsonl: &str) -> String {
     let mut out = String::new();
+    let mut pending_answer: Option<String> = None;
+    let flush = |out: &mut String, answer: &mut Option<String>| {
+        if let Some(text) = answer.take() {
+            out.push_str("ASSISTANT: ");
+            out.push_str(&text);
+            out.push('\n');
+        }
+    };
     for line in jsonl.lines() {
         let Ok(obj) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        let role = match obj.get("role").and_then(|v| v.as_str()) {
+        // Claude Code marks injected/meta lines (command output, caveats).
+        if obj.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+            || obj.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+        {
+            continue;
+        }
+        // Cursor: {role, message:{content}}. Claude Code: {type, message:{role,
+        // content}}. Codex rollout: {type:"response_item", payload:{type:
+        // "message", role, content}}.
+        let message = obj
+            .get("payload")
+            .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .or_else(|| obj.get("message"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let raw_role = obj
+            .get("role")
+            .and_then(|v| v.as_str())
+            .or_else(|| message.get("role").and_then(|v| v.as_str()));
+        let role = match raw_role {
             Some("user") => "USER",
             Some("assistant") => "ASSISTANT",
             _ => continue,
         };
-        let content = obj
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .cloned()
-            .unwrap_or(Value::Null);
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
         let mut text = String::new();
         match content {
             Value::String(s) => text.push_str(&s),
             Value::Array(blocks) => {
                 for block in blocks {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    let kind = block.get("type").and_then(|v| v.as_str());
+                    if matches!(kind, Some("text") | Some("input_text") | Some("output_text")) {
                         if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
                             if !text.is_empty() {
                                 text.push(' ');
@@ -328,11 +393,17 @@ pub fn cursor_jsonl_to_transcript(jsonl: &str) -> String {
         if flattened.is_empty() {
             continue;
         }
-        out.push_str(role);
-        out.push_str(": ");
-        out.push_str(&redact_secrets(&flattened));
+        let redacted = redact_secrets(&flattened);
+        if role == "ASSISTANT" {
+            pending_answer = Some(redacted);
+            continue;
+        }
+        flush(&mut out, &mut pending_answer);
+        out.push_str("USER: ");
+        out.push_str(&redacted);
         out.push('\n');
     }
+    flush(&mut out, &mut pending_answer);
     out
 }
 
@@ -435,8 +506,109 @@ fn truncate_bytes(text: &str, max: usize) -> String {
     text[start..].to_string()
 }
 
-/// Entry point for `--install-cursor-hooks`.
-pub fn install_cursor_hooks() {
+fn is_memorypilot_command(command: Option<&str>) -> bool {
+    command
+        .map(|c| c.contains("MemoryPilot") && c.contains("--hook"))
+        .unwrap_or(false)
+}
+
+fn read_json_or(path: &Path, default: Value) -> Value {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(default)
+}
+
+fn write_json_with_backup(path: &Path, value: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if path.exists() {
+        let _ = std::fs::copy(path, path.with_extension("json.bak"));
+    }
+    let rendered = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    std::fs::write(path, rendered).map_err(|e| e.to_string())
+}
+
+fn ensure_object<'a>(value: &'a mut Value, key: &str) -> &'a mut serde_json::Map<String, Value> {
+    if !value.get(key).map(|v| v.is_object()).unwrap_or(false) {
+        value[key] = json!({});
+    }
+    value[key].as_object_mut().expect("object")
+}
+
+/// Cursor format: `hooks.<event> = [{command, timeout}]`.
+fn install_cursor(exe: &str, home: &Path) -> Result<PathBuf, String> {
+    let path = home.join(".cursor").join("hooks.json");
+    let mut config = read_json_or(&path, json!({ "version": 1, "hooks": {} }));
+    if config.get("version").is_none() {
+        config["version"] = json!(1);
+    }
+    let hooks = ensure_object(&mut config, "hooks");
+    for (event, arg, timeout) in [
+        ("sessionStart", "session-start", 20),
+        ("stop", "stop", 10),
+    ] {
+        let list = hooks.entry(event).or_insert_with(|| json!([]));
+        if !list.is_array() {
+            *list = json!([]);
+        }
+        let arr = list.as_array_mut().expect("array");
+        arr.retain(|h| !is_memorypilot_command(h.get("command").and_then(|c| c.as_str())));
+        arr.push(json!({
+            "command": format!("\"{}\" --hook {} --agent cursor", exe, arg),
+            "timeout": timeout
+        }));
+    }
+    write_json_with_backup(&path, &config)?;
+    Ok(path)
+}
+
+/// Claude Code and Codex format: `hooks.<Event> = [{matcher, hooks:[{type,
+/// command, timeout}]}]`. Other settings and hooks are preserved.
+fn install_matcher_style(exe: &str, path: &Path, agent: &str) -> Result<PathBuf, String> {
+    let mut config = read_json_or(path, json!({}));
+    if !config.is_object() {
+        config = json!({});
+    }
+    let hooks = ensure_object(&mut config, "hooks");
+    for (event, arg, matcher, timeout) in [
+        ("SessionStart", "session-start", "startup|resume|clear|compact", 20),
+        ("Stop", "stop", "*", 10),
+    ] {
+        let list = hooks.entry(event).or_insert_with(|| json!([]));
+        if !list.is_array() {
+            *list = json!([]);
+        }
+        let groups = list.as_array_mut().expect("array");
+        // Drop our previous entries, then groups left empty.
+        for group in groups.iter_mut() {
+            if let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                inner.retain(|h| !is_memorypilot_command(h.get("command").and_then(|c| c.as_str())));
+            }
+        }
+        groups.retain(|g| {
+            g.get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|h| !h.is_empty())
+                .unwrap_or(true)
+        });
+        groups.push(json!({
+            "matcher": matcher,
+            "hooks": [{
+                "type": "command",
+                "command": format!("\"{}\" --hook {} --agent {}", exe, arg, agent),
+                "timeout": timeout
+            }]
+        }));
+    }
+    write_json_with_backup(path, &config)?;
+    Ok(path.to_path_buf())
+}
+
+/// Entry point for `--install-hooks` (alias `--install-cursor-hooks`):
+/// Cursor always, Claude Code and Codex when their config folder exists.
+pub fn install_hooks() {
     let exe = match std::env::current_exe().and_then(|p| p.canonicalize()) {
         Ok(exe) => exe.to_string_lossy().to_string(),
         Err(error) => {
@@ -448,58 +620,27 @@ pub fn install_cursor_hooks() {
         eprintln!("Cannot find home directory");
         std::process::exit(1);
     };
-    let path = home.join(".cursor").join("hooks.json");
-    let mut config: Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({ "version": 1, "hooks": {} }));
-    if config.get("version").is_none() {
-        config["version"] = json!(1);
+    let mut results = vec![("Cursor", install_cursor(&exe, &home))];
+    if home.join(".claude").is_dir() {
+        let path = home.join(".claude").join("settings.json");
+        results.push(("Claude Code", install_matcher_style(&exe, &path, "claude")));
     }
-    if !config.get("hooks").map(|h| h.is_object()).unwrap_or(false) {
-        config["hooks"] = json!({});
+    if home.join(".codex").is_dir() {
+        let path = home.join(".codex").join("hooks.json");
+        results.push(("Codex", install_matcher_style(&exe, &path, "codex")));
     }
-    let entries = [
-        (
-            "sessionStart",
-            json!({ "command": format!("\"{}\" --hook session-start", exe), "timeout": 20 }),
-        ),
-        (
-            "stop",
-            json!({ "command": format!("\"{}\" --hook stop", exe), "timeout": 10 }),
-        ),
-    ];
-    for (event, entry) in entries {
-        let list = config["hooks"]
-            .as_object_mut()
-            .expect("hooks is an object")
-            .entry(event)
-            .or_insert_with(|| json!([]));
-        if !list.is_array() {
-            *list = json!([]);
+    let mut failed = false;
+    for (agent, result) in results {
+        match result {
+            Ok(path) => println!("{} hooks installed in {}", agent, path.display()),
+            Err(error) => {
+                failed = true;
+                eprintln!("{} hooks failed: {}", agent, error);
+            }
         }
-        let arr = list.as_array_mut().expect("array");
-        // Replace any previous MemoryPilot entry, keep the user's other hooks.
-        arr.retain(|h| {
-            !h.get("command")
-                .and_then(|c| c.as_str())
-                .map(|c| c.contains("MemoryPilot") && c.contains("--hook"))
-                .unwrap_or(false)
-        });
-        arr.push(entry);
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if path.exists() {
-        let _ = std::fs::copy(&path, path.with_extension("json.bak"));
-    }
-    match std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()) {
-        Ok(()) => println!("Cursor hooks installed in {}", path.display()),
-        Err(error) => {
-            eprintln!("Cannot write {}: {}", path.display(), error);
-            std::process::exit(1);
-        }
+    if failed {
+        std::process::exit(1);
     }
 }
 
@@ -510,7 +651,8 @@ mod tests {
     #[test]
     fn converts_cursor_jsonl() {
         let jsonl = r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nOn garde Postgres pour la prod.\n</user_query>"}]}}
-{"role":"assistant","message":{"content":[{"type":"text","text":"D'accord.\nJe note."},{"type":"tool_use","name":"x"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"I'm checking the config first."},{"type":"tool_use","name":"x"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"D'accord.\nJe note."}]}}
 not json
 {"role":"tool","message":{"content":"ignored"}}
 {"role":"user","message":{"content":[{"type":"text","text":"<mcp_meta_tools>\nDo not call mcp_auth in parallel.\n</mcp_meta_tools>"}]}}"#;
@@ -528,6 +670,38 @@ not json
         assert!(!out.contains("GB53REVO"));
         assert!(out.contains("ok"));
         assert_eq!(redact_secrets("MemoryPilot est un serveur MCP"), "MemoryPilot est un serveur MCP");
+    }
+
+    #[test]
+    fn converts_claude_code_and_codex_jsonl() {
+        let jsonl = r#"{"type":"user","message":{"role":"user","content":"On passe sur Resend pour les emails."}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"Caveat: ignored"}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"x"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Noté."},{"type":"tool_use","name":"Bash"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Codex ok."}]}}"#;
+        assert_eq!(
+            cursor_jsonl_to_transcript(jsonl),
+            // "Noté." is mid-turn narration: only the turn's last answer stays.
+            "USER: On passe sur Resend pour les emails.\nASSISTANT: Codex ok.\n"
+        );
+    }
+
+    #[test]
+    fn agent_narration_is_filtered() {
+        use crate::db::Database;
+        assert!(Database::is_agent_narration("checking licenses confirms no gpl in the runtime."));
+        assert!(Database::is_agent_narration("that leaves 4 remaining high-severity issues."));
+        assert!(Database::is_agent_narration("je vais vérifier le build maintenant."));
+        assert!(!Database::is_agent_narration("better-auth 1.7 keeps identical string keys, so 2fa data stays readable."));
+        assert!(!Database::is_agent_narration("le déploiement passe par launchctl kickstart."));
+    }
+
+    #[test]
+    fn detects_agent_from_payload() {
+        assert_eq!(detect_agent(&[], &json!({"workspace_roots": ["/x"]})), "cursor");
+        assert_eq!(detect_agent(&[], &json!({"cwd": "/x"})), "claude");
+        let args = vec!["--agent".to_string(), "codex".to_string()];
+        assert_eq!(detect_agent(&args, &json!({})), "codex");
     }
 
     #[test]

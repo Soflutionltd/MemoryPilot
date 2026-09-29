@@ -748,7 +748,10 @@ impl Database {
             slug.pop();
         }
 
-        if slug.is_empty() {
+        // "global", "__global__", "none"… are how callers spell "no project":
+        // they must land in the NULL (global) scope, not in a project of
+        // that name. normalize_project_identities() migrates old rows.
+        if slug.is_empty() || matches!(slug.as_str(), "global" | "none" | "null") {
             None
         } else {
             Some(slug)

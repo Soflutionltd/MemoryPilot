@@ -57,15 +57,18 @@ fn main() {
         return;
     }
     if let Some(pos) = args.iter().position(|a| a == "--hook") {
-        hooks::run_hook(args.get(pos + 1).map(String::as_str).unwrap_or(""));
+        hooks::run_hook(args.get(pos + 1).map(String::as_str).unwrap_or(""), &args);
         return;
     }
     if args.iter().any(|a| a == "--hook-ingest") {
         hooks::run_ingest(&args);
         return;
     }
-    if args.iter().any(|a| a == "--install-cursor-hooks") {
-        hooks::install_cursor_hooks();
+    if args
+        .iter()
+        .any(|a| a == "--install-hooks" || a == "--install-cursor-hooks")
+    {
+        hooks::install_hooks();
         return;
     }
     if args.iter().any(|a| a == "--migrate") {
@@ -908,7 +911,7 @@ fn print_help() {
         "  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)"
     );
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
-    println!("  MemoryPilot --install-cursor-hooks   (sessionStart recall + stop auto-ingest)");
+    println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop auto-ingest");
     println!("  MemoryPilot --hook session-start|stop  (called by Cursor, JSON on stdin)");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");

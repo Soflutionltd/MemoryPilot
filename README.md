@@ -151,7 +151,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 
 **vs the best memory servers on the market:**
 
-| Feature | MemoryPilot v4.2 | MemPalace v3.3.3 | agentmemory v0.9 | Mem0 | Zep / Graphiti |
+| Feature | MemoryPilot v4.7 | MemPalace v3.3.3 | agentmemory v0.9 | Mem0 | Zep / Graphiti |
 |---------|-----------------|----------------|------------------|------|----------------|
 | LongMemEval R@5 | **99.1%** | 98.4% | 95.2% | 94.4% | 63.8% |
 | LongMemEval MRR | **94.9%** | not published | 88.2% | not published | not published |
@@ -185,7 +185,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
 | MCP tools | 41 tools | 29 tools | **51 tools** | N/A | Limited MCP server |
-| Hooks / event capture | Cursor hooks: `sessionStart` auto-recall + `stop` auto-ingest (incremental, distilled, secrets redacted) + file watcher | No | **12 named hooks** (SessionStart, UserPromptSubmit, PreToolUse...) | No | No |
+| Hooks / event capture | SessionStart auto-recall + Stop auto-ingest for **Cursor, Claude Code and Codex** (incremental, distilled, agent narration filtered, secrets redacted) + file watcher | No | **12 named hooks** (Claude Code, Cursor, Codex, Copilot CLI…) | No | No |
 | Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |
 | Language | Rust (single binary, zero deps) | Python (pip install) | TypeScript / Node (npm install) | SaaS | Python + Neo4j |
 | Startup | 1-2 ms (`open_at`) / synchronous warm via `open_at_warm` | ~5 ms | Node boot + iii-engine init | N/A (cloud) | Heavy (Neo4j boot) |
@@ -193,7 +193,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | Storage | SQLite WAL + FTS5 + 16-conn read pool | ChromaDB | SQLite + iii-engine | Cloud DB | Neo4j + Postgres |
 | Concurrency | EmbedPool (4) + RerankPool (1, tunable) + 16 read conns + debounced cleanup | Single-threaded | Node event loop | Single-threaded | Neo4j-bound |
 | External LLM dependency | **None** | None | None (local embeddings) | OpenAI required | LLM required for ingestion |
-| GitHub stars (May 2026) | nascent | nascent | **11 083** | 53k | — |
+| GitHub stars (Sept 2026) | nascent | nascent | **~28.9k** | 53k | — |
 
 ## The 9 Pillars
 
@@ -425,16 +425,22 @@ MemoryPilot --backfill-force
 | `delete_memory` | Delete by ID (cascades to entities and links). |
 | `list_memories` | List with project/kind filters and pagination. |
 
-#### Cursor hooks (automatic memory, zero agent effort)
+#### Agent hooks (automatic memory, zero agent effort)
 
 ```bash
-MemoryPilot --install-cursor-hooks
+MemoryPilot --install-hooks
 ```
 
-Merges two entries into `~/.cursor/hooks.json` (existing hooks are kept, a `.bak` is written):
+Installs two hooks in every agent found (existing settings and hooks are kept, a `.bak` is written):
 
-- `sessionStart` runs `MemoryPilot --hook session-start` and injects the compact recall of the opened project as `additional_context`.
-- `stop` runs `MemoryPilot --hook stop`, answers `{}` immediately and distills, in a detached process, only the transcript lines added since the previous turn. Only what the user typed inside `<user_query>` is kept from user messages (Cursor injects its own system blocks as user messages), and obvious secrets (API keys, JWTs, IBANs) are redacted before storage.
+| Agent | File | Session start output |
+|---|---|---|
+| Cursor | `~/.cursor/hooks.json` | `additional_context` |
+| Claude Code | `~/.claude/settings.json` | `hookSpecificOutput.additionalContext` |
+| Codex | `~/.codex/hooks.json` | `hookSpecificOutput.additionalContext` |
+
+- **Session start** runs `MemoryPilot --hook session-start --agent <agent>` and injects the compact recall of the opened project.
+- **Stop** runs `MemoryPilot --hook stop --agent <agent>`, answers `{}` immediately and distills, in a detached process, only the transcript lines added since the previous turn. From user messages only what the user typed is kept (Cursor `<user_query>`, Claude Code meta lines skipped), agent narration ("Checking…", "Let me…", "Je vais…") is filtered out, and obvious secrets (API keys, JWTs, IBANs) are redacted before storage.
 
 State: `~/.MemoryPilot/cursor-hooks-state.json`. Log: `~/.MemoryPilot/cursor-hooks.log`. Set `MEMORYPILOT_DB=/path/copy.db` to test against a copy.
 
