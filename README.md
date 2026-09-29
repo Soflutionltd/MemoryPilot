@@ -185,7 +185,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
 | MCP tools | 41 tools | 29 tools | **51 tools** | N/A | Limited MCP server |
-| Hooks / event capture | File watcher + auto-linter (Rust-only) | No | **12 named hooks** (SessionStart, UserPromptSubmit, PreToolUse...) | No | No |
+| Hooks / event capture | Cursor hooks: `sessionStart` auto-recall + `stop` auto-ingest (incremental, distilled, secrets redacted) + file watcher | No | **12 named hooks** (SessionStart, UserPromptSubmit, PreToolUse...) | No | No |
 | Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |
 | Language | Rust (single binary, zero deps) | Python (pip install) | TypeScript / Node (npm install) | SaaS | Python + Neo4j |
 | Startup | 1-2 ms (`open_at`) / synchronous warm via `open_at_warm` | ~5 ms | Node boot + iii-engine init | N/A (cloud) | Heavy (Neo4j boot) |
@@ -425,7 +425,20 @@ MemoryPilot --backfill-force
 | `delete_memory` | Delete by ID (cascades to entities and links). |
 | `list_memories` | List with project/kind filters and pagination. |
 
-### Knowledge Graph
+#### Cursor hooks (automatic memory, zero agent effort)
+
+```bash
+MemoryPilot --install-cursor-hooks
+```
+
+Merges two entries into `~/.cursor/hooks.json` (existing hooks are kept, a `.bak` is written):
+
+- `sessionStart` runs `MemoryPilot --hook session-start` and injects the compact recall of the opened project as `additional_context`.
+- `stop` runs `MemoryPilot --hook stop`, answers `{}` immediately and distills, in a detached process, only the transcript lines added since the previous turn. Only what the user typed inside `<user_query>` is kept from user messages (Cursor injects its own system blocks as user messages), and obvious secrets (API keys, JWTs, IBANs) are redacted before storage.
+
+State: `~/.MemoryPilot/cursor-hooks-state.json`. Log: `~/.MemoryPilot/cursor-hooks.log`. Set `MEMORYPILOT_DB=/path/copy.db` to test against a copy.
+
+## Knowledge Graph
 
 | Tool | Description |
 |------|-------------|

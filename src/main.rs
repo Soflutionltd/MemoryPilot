@@ -11,6 +11,7 @@ mod embedding;
 mod fts;
 mod gc;
 mod graph;
+mod hooks;
 #[cfg(feature = "http")]
 mod http;
 mod onnx_external;
@@ -53,6 +54,18 @@ fn main() {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--hook") {
+        hooks::run_hook(args.get(pos + 1).map(String::as_str).unwrap_or(""));
+        return;
+    }
+    if args.iter().any(|a| a == "--hook-ingest") {
+        hooks::run_ingest(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--install-cursor-hooks") {
+        hooks::install_cursor_hooks();
         return;
     }
     if args.iter().any(|a| a == "--migrate") {
@@ -895,6 +908,8 @@ fn print_help() {
         "  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)"
     );
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
+    println!("  MemoryPilot --install-cursor-hooks   (sessionStart recall + stop auto-ingest)");
+    println!("  MemoryPilot --hook session-start|stop  (called by Cursor, JSON on stdin)");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");
