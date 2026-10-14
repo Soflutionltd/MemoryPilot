@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/v4.2-latest-green" alt="v4.2"/>
+  <img src="https://img.shields.io/badge/v4.10-latest-green" alt="v4.10"/>
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF_+_cross--encoder-blueviolet" alt="Hybrid RRF + cross-encoder"/>
   <img src="https://img.shields.io/badge/embeddings-jina--embeddings--v5--nano_(768--dim,_int8)-blue" alt="jina-embeddings-v5-text-nano-retrieval"/>
@@ -323,7 +323,7 @@ If no pre-built binary is available for your platform, it falls back to `cargo b
 
 ```bash
 # Via Cargo, pinned to a release tag — works anywhere Rust runs:
-cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.2.0 --features http --bin MemoryPilot
+cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.10.0 --bin MemoryPilot
 
 # Local clone + auto-config (same installer, run from inside the repo):
 git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && ./install.sh
