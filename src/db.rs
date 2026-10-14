@@ -31,6 +31,8 @@ mod schema;
 mod skills;
 #[path = "db/profile.rs"]
 mod profile;
+#[path = "db/vault.rs"]
+mod vault;
 #[path = "db/transcript.rs"]
 mod transcript;
 
@@ -5541,10 +5543,13 @@ fn row_to_memory(row: &rusqlite::Row) -> Memory {
     let tags_str: String = row.get(4).unwrap_or_default();
     let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
     let meta_str: Option<String> = row.get(8).unwrap_or(None);
-    let metadata = meta_str.and_then(|s| serde_json::from_str(&s).ok());
+    let metadata: Option<serde_json::Value> = meta_str.and_then(|s| serde_json::from_str(&s).ok());
+    let raw_content: String = row.get(1).unwrap_or_default();
+    // Sealed credentials are decrypted transparently (see db/vault.rs).
+    let content = vault::unseal_content(&raw_content, metadata.as_ref()).unwrap_or(raw_content);
     Memory {
         id: row.get(0).unwrap_or_default(),
-        content: row.get(1).unwrap_or_default(),
+        content,
         kind: row.get(2).unwrap_or_default(),
         project: row.get(3).unwrap_or(None),
         tags,

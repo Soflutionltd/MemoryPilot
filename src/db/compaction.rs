@@ -36,6 +36,7 @@ pub(super) fn maybe_auto_compact(db: &Database) {
     maybe_compact(db);
     db.maybe_consolidate();
     db.maybe_extract_skills();
+    let _ = db.seal_credentials();
 }
 
 /// Throttled, best-effort hierarchical episodic rollup. Runs at most once

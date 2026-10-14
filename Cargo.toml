@@ -45,6 +45,8 @@ tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-swift = "0.7.2"
 rust-stemmers = "1.2.0"
 usearch = "2"
+chacha20poly1305 = "0.10"
+base64 = "0.22"
 
 [features]
 default = []

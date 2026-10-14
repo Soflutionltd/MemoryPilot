@@ -140,6 +140,10 @@ fn run_mcp_server() {
         }
     };
     tools::init_tools_profile(&db);
+    match db.seal_credentials() {
+        Ok(n) if n > 0 => eprintln!("[MemoryPilot] Sealed {} credential(s) at rest.", n),
+        _ => {}
+    }
     let db_arc = std::sync::Arc::new(db);
 
     let stdin = io::stdin();
