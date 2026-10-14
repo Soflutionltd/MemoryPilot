@@ -245,6 +245,12 @@ fn run_http_server(port: u16) {
             std::process::exit(1);
         }
     };
+    tools::init_tools_profile(&db);
+    let _ = db.seal_credentials();
+    let reveal = std::env::var("MEMORYPILOT_HTTP_SECRETS")
+        .map(|v| v == "on" || v == "1")
+        .unwrap_or(false);
+    db::set_secret_reveal(reveal);
     let db_arc = std::sync::Arc::new(db);
     http::start_http_server(db_arc, port);
 }

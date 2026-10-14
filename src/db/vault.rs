@@ -118,9 +118,16 @@ pub(crate) fn decrypt(encoded: &str) -> Option<String> {
     String::from_utf8(plain).ok()
 }
 
+static REVEAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Remote (HTTP) mode keeps credentials masked unless explicitly allowed.
+pub(crate) fn set_reveal(on: bool) {
+    REVEAL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Transparent read path: sealed row → original text.
 pub(crate) fn unseal_content(content: &str, metadata: Option<&serde_json::Value>) -> Option<String> {
-    if !content.starts_with(SEAL_PREFIX) {
+    if !content.starts_with(SEAL_PREFIX) || !REVEAL.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let enc = metadata?.get("enc")?.as_str()?;

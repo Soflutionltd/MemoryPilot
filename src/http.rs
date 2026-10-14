@@ -6,8 +6,86 @@
 #[cfg(feature = "http")]
 use std::sync::Arc;
 
+/// Access token: MEMORYPILOT_HTTP_TOKEN, else ~/.MemoryPilot/http.token
+/// (created on first start, 64 hex chars, mode 600). Every endpoint except
+/// /health requires it, as `Authorization: Bearer <token>` or in the path
+/// (`/mcp/<token>`, for clients such as claude.ai custom connectors that
+/// cannot send headers). Mandatory: behind a tunnel every request looks
+/// like it comes from localhost.
+#[cfg(feature = "http")]
+fn load_or_create_token() -> Result<String, String> {
+    if let Ok(t) = std::env::var("MEMORYPILOT_HTTP_TOKEN") {
+        if t.trim().len() >= 24 {
+            return Ok(t.trim().to_string());
+        }
+        return Err("MEMORYPILOT_HTTP_TOKEN must be at least 24 characters".into());
+    }
+    let path = dirs::home_dir()
+        .ok_or("No home")?
+        .join(".MemoryPilot")
+        .join("http.token");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        if t.trim().len() >= 24 {
+            return Ok(t.trim().to_string());
+        }
+    }
+    use chacha20poly1305::aead::{KeyInit, OsRng};
+    let bytes = chacha20poly1305::XChaCha20Poly1305::generate_key(&mut OsRng);
+    let token: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(&path, &token).map_err(|e| format!("write token: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    eprintln!("[MemoryPilot] New HTTP access token written to {}", path.display());
+    Ok(token)
+}
+
+#[cfg(feature = "http")]
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Returns the route with the token stripped, or None if unauthorized.
+#[cfg(feature = "http")]
+fn authorize(request: &tiny_http::Request, token: &str) -> Option<String> {
+    let url = request.url();
+    let path = url.split('?').next().unwrap_or(url);
+    if path == "/health" {
+        return Some(path.to_string());
+    }
+    let bearer = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .and_then(|h| h.value.as_str().strip_prefix("Bearer ").map(|t| t.trim().to_string()));
+    if let Some(b) = bearer {
+        if constant_time_eq(&b, token) {
+            return Some(path.to_string());
+        }
+    }
+    // /mcp/<token> or /tools/call/<token>
+    let (route, last) = path.rsplit_once('/')?;
+    if !route.is_empty() && constant_time_eq(last, token) {
+        return Some(route.to_string());
+    }
+    None
+}
+
 #[cfg(feature = "http")]
 pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
+    let token = match load_or_create_token() {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            eprintln!("[MemoryPilot] HTTP server not started: {}", e);
+            return;
+        }
+    };
     let mut actual_port = port;
     let mut server_result = None;
     for attempt in 0..10u16 {
@@ -51,6 +129,7 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
     let mut handles = Vec::new();
     for i in 0..num_workers {
         let srv = Arc::clone(&server);
+        let token = Arc::clone(&token);
         handles.push(std::thread::spawn(move || {
             let local_db = match crate::db::Database::open() {
                 Ok(d) => d,
@@ -61,7 +140,16 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
                 let origin = request.headers().iter()
                     .find(|h| h.field.equiv("Origin"))
                     .map(|h| h.value.as_str().to_string());
-                let response = match (request.method(), url.as_str()) {
+                let _ = &url;
+                let Some(route) = authorize(&request, &token) else {
+                    let _ = request.respond(
+                        tiny_http::Response::from_string(r#"{"error":"unauthorized"}"#)
+                            .with_status_code(401)
+                            .with_header(content_type_json()),
+                    );
+                    continue;
+                };
+                let response = match (request.method(), route.as_str()) {
                     (&tiny_http::Method::Get, "/health") => handle_health(),
                     (&tiny_http::Method::Post, "/tools/call") => handle_tool_call(&local_db, &mut request),
                     (&tiny_http::Method::Post, "/mcp") => handle_mcp_post(&local_db, &mut request),
@@ -194,7 +282,10 @@ fn handle_mcp_request(
         "initialize" => crate::protocol::JsonRpcResponse::success(
             req.id.clone(),
             json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": match req.params.get("protocolVersion").and_then(|v| v.as_str()) {
+                    Some(v @ ("2024-11-05" | "2025-03-26" | "2025-06-18")) => v,
+                    _ => "2025-03-26",
+                },
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": { "name": "MemoryPilot", "version": env!("CARGO_PKG_VERSION") },
                 "instructions": "CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials."
@@ -303,7 +394,7 @@ fn add_cors_headers(
                 .unwrap(),
         )
         .with_header(
-            "Access-Control-Allow-Headers: Content-Type, MCP-Protocol-Version, MCP-Session-Id"
+            "Access-Control-Allow-Headers: Content-Type, Authorization, MCP-Protocol-Version, MCP-Session-Id"
                 .parse::<tiny_http::Header>()
                 .unwrap(),
         )

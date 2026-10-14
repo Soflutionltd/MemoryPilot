@@ -35,6 +35,12 @@ mod profile;
 mod vault;
 #[path = "db/conflicts.rs"]
 mod conflicts;
+
+/// Whether sealed credentials are decrypted on read (default yes; the
+/// HTTP server turns it off unless MEMORYPILOT_HTTP_SECRETS=on).
+pub fn set_secret_reveal(on: bool) {
+    vault::set_reveal(on);
+}
 #[path = "db/transcript.rs"]
 mod transcript;
 
