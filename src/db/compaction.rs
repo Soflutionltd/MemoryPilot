@@ -35,6 +35,7 @@ pub(super) fn maybe_auto_compact(db: &Database) {
     maybe_roll_up_episodes(db);
     maybe_compact(db);
     db.maybe_consolidate();
+    db.maybe_extract_skills();
 }
 
 /// Throttled, best-effort hierarchical episodic rollup. Runs at most once

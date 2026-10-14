@@ -153,6 +153,7 @@ pub fn gc_score(importance: i32, age_days: i64, kind: &str, _config: &GcConfig) 
         "decision" => 0.3,   // Decisions are important context
         "preference" => 0.2, // Preferences should persist
         "pattern" => 0.2,    // Patterns are reusable
+        "skill" => 0.1,      // Skills are curated procedures
         "fact" => 0.4,       // Facts may become outdated
         "credential" => 0.1, // Credentials should persist
         _ => 0.5,

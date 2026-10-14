@@ -17,6 +17,7 @@ const VALID_KINDS: &[&str] = &[
     "milestone",
     "architecture",
     "problem",
+    "skill",
 ];
 
 pub fn tool_definitions() -> Value {
@@ -549,6 +550,47 @@ pub fn tool_definitions() -> Value {
             "name": "rebuild_episodes",
             "description": "Force a hierarchical episodic rollup now (raw memories → hourly → daily → long-term). Idempotent; normally runs automatically in the background.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "get_user_profile",
+            "description": "TOP OF THE MEMORY PYRAMID — cross-project user profile (<1200 tokens): durable preferences, active projects, recurring tech, learned skills, recent key decisions. Use at the start of a new conversation, before project-specific context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_tokens": { "type": ["integer","null"], "description": "Budget, default 1200" }
+                }
+            }
+        },
+        {
+            "name": "extract_skills",
+            "description": "Mine recurring procedures (commands, steps, pitfalls seen several times) into reusable 'skill' memories. Local, no LLM. Runs daily automatically; call to refresh now. apply=false for a dry run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "apply": { "type": ["boolean","null"], "description": "Write the skills (default true)" },
+                    "project": { "type": ["string","null"], "description": "Limit to one project" }
+                }
+            }
+        },
+        {
+            "name": "list_skills",
+            "description": "List learned skills (procedures: how to build, deploy, sign, migrate...) with title, project and how often they were seen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": ["string","null"] },
+                    "limit": { "type": ["integer","null"], "description": "Default 50" }
+                }
+            }
+        },
+        {
+            "name": "get_skill",
+            "description": "Full skill card (when to use, ordered steps, pitfalls) plus excerpts of the memories it was learned from.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
         }
     ]})
 }
@@ -602,6 +644,10 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "get_episode" => handle_get_episode(db, args),
         "list_episodes" => handle_list_episodes(db, args),
         "rebuild_episodes" => handle_rebuild_episodes(db),
+        "get_user_profile" => handle_get_user_profile(db, args),
+        "extract_skills" => handle_extract_skills(db, args),
+        "list_skills" => handle_list_skills(db, args),
+        "get_skill" => handle_get_skill(db, args),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
 }
@@ -1811,6 +1857,43 @@ fn handle_list_episodes(db: &Database, args: &Value) -> Value {
 fn handle_rebuild_episodes(db: &Database) -> Value {
     match db.roll_up_episodes() {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_get_user_profile(db: &Database, args: &Value) -> Value {
+    let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as usize);
+    match db.get_user_profile(max_tokens) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_extract_skills(db: &Database, args: &Value) -> Value {
+    let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(true);
+    let project = args.get("project").and_then(|v| v.as_str());
+    match db.extract_skills(apply, project) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_list_skills(db: &Database, args: &Value) -> Value {
+    let project = args.get("project").and_then(|v| v.as_str());
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    match db.list_skills(project, limit) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_get_skill(db: &Database, args: &Value) -> Value {
+    let Some(id) = args.get("id").and_then(|v| v.as_str()) else {
+        return tool_error("id required");
+    };
+    match db.get_skill(id) {
+        Ok(Some(skill)) => tool_result(&serde_json::to_string_pretty(&skill).unwrap()),
+        Ok(None) => tool_error(&format!("Skill not found: {}", id)),
         Err(e) => tool_error(&e),
     }
 }

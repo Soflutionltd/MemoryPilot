@@ -27,6 +27,10 @@ mod episodic;
 mod export;
 #[path = "db/schema.rs"]
 mod schema;
+#[path = "db/skills.rs"]
+mod skills;
+#[path = "db/profile.rs"]
+mod profile;
 #[path = "db/transcript.rs"]
 mod transcript;
 
@@ -1051,6 +1055,7 @@ impl Database {
         let kind_bias = match memory.kind.as_str() {
             "preference" => 3,
             "pattern" => 2,
+            "skill" => 2,
             "decision" => 1,
             _ => 0,
         };
@@ -2726,7 +2731,7 @@ impl Database {
         if intent.technical
             && matches!(
                 memory.kind.as_str(),
-                "architecture" | "decision" | "bug" | "snippet" | "pattern"
+                "architecture" | "decision" | "bug" | "snippet" | "pattern" | "skill"
             )
         {
             factor *= 1.07;
@@ -4655,6 +4660,7 @@ impl Database {
             "preference" => "PREF",
             "bug" => "BUG",
             "pattern" => "PAT",
+            "skill" => "SKILL",
             "credential" => "CRED",
             "snippet" => "SNIP",
             "todo" => "TODO",
