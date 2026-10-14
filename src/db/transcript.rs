@@ -9,6 +9,92 @@ struct DistilledTranscriptCandidate {
     item: BulkItem,
 }
 
+
+/// Long fenced code blocks and agent self-narration are the bulk of a raw
+/// transcript but almost never what a later recall needs (the distilled
+/// memories keep the decisions; the repo keeps the code). They are trimmed
+/// before chunking: a code block keeps its first ~220 characters plus a
+/// marker, narration sentences ("Let me check…", "Je vais regarder…") are
+/// dropped. Line structure ("user:" / "assistant:") is preserved.
+/// `MEMORYPILOT_TRANSCRIPT_COMPACT=off` disables it.
+pub(crate) fn compact_raw_transcript(content: &str) -> String {
+    if std::env::var("MEMORYPILOT_TRANSCRIPT_COMPACT")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
+        .unwrap_or(false)
+    {
+        return content.to_string();
+    }
+    const CODE_KEEP: usize = 220;
+    const CODE_MAX: usize = 420;
+
+    // 1. Fenced code blocks (may span lines).
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("```") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 3..];
+        let (block, tail, closed) = match after.find("```") {
+            Some(end) => (&rest[start..start + 3 + end + 3], &after[end + 3..], true),
+            None => (&rest[start..], "", false),
+        };
+        let chars = block.chars().count();
+        if chars > CODE_MAX {
+            let kept: String = block.chars().take(CODE_KEEP).collect();
+            out.push_str(kept.trim_end());
+            out.push_str(&format!(" … [code omis : {} caractères]", chars - CODE_KEEP));
+            if closed {
+                out.push_str(" ```");
+            }
+        } else {
+            out.push_str(block);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+
+    // 2. Agent narration sentences, line by line.
+    const NARRATION: &[&str] = &[
+        "let me ", "now i ", "now let", "i'm going to", "i am going to", "i'm realizing",
+        "i'm thinking", "i'll ", "i will ", "i need to ", "i should ", "okay, so", "okay, let",
+        "alright", "let's check", "let's see", "let's look", "je vais ", "voyons", "maintenant je",
+    ];
+    let mut result = String::with_capacity(out.len());
+    for (index, line) in out.split('\n').enumerate() {
+        if index > 0 {
+            result.push('\n');
+        }
+        let mut kept: Vec<&str> = Vec::new();
+        let mut start = 0;
+        let bytes = line.as_bytes();
+        for i in 0..bytes.len() {
+            let end_of_sentence = matches!(bytes[i], b'.' | b'!' | b'?')
+                && (i + 1 == bytes.len() || bytes[i + 1] == b' ');
+            if end_of_sentence || i + 1 == bytes.len() {
+                let sentence = &line[start..=i];
+                let trimmed = sentence.trim_start();
+                // Keep the role prefix ("assistant: Let me...") but drop the narration after it.
+                let (prefix, body) = match trimmed.find(": ") {
+                    Some(p) if p <= 10 && trimmed[..p].chars().all(|c| c.is_ascii_alphabetic()) => {
+                        (&trimmed[..p + 2], &trimmed[p + 2..])
+                    }
+                    _ => ("", trimmed),
+                };
+                let lower = body.trim_start().to_lowercase();
+                if NARRATION.iter().any(|n| lower.starts_with(n)) && !body.contains('`') {
+                    if !prefix.is_empty() {
+                        kept.push(prefix.trim_end());
+                    }
+                } else {
+                    kept.push(sentence.trim());
+                }
+                start = i + 1;
+            }
+        }
+        result.push_str(&kept.join(" "));
+    }
+    result
+}
+
 impl Database {
     fn split_transcript_chunks(content: &str, chunk_size: usize) -> Vec<String> {
         crate::splitter::split_memory_text(content, chunk_size)
@@ -440,7 +526,8 @@ impl Database {
         distill: bool,
     ) -> Result<TranscriptAddReport, String> {
         let transcript_id = Uuid::new_v4().to_string();
-        let chunks = Self::split_transcript_chunks(content, 2000);
+        let compacted = compact_raw_transcript(content);
+        let chunks = Self::split_transcript_chunks(&compacted, 2000);
 
         let transcript_items = chunks
             .iter()
@@ -541,5 +628,39 @@ impl Database {
             distilled_merged,
             distilled_skipped,
         })
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::compact_raw_transcript;
+
+    #[test]
+    fn long_code_block_is_trimmed_short_one_kept() {
+        let long = format!("Voici : ```rust {} ``` fin.", "let x = 1; ".repeat(80));
+        let out = compact_raw_transcript(&long);
+        assert!(out.contains("[code omis"));
+        assert!(out.len() < long.len() / 2);
+        let short = "Commande : ```npm run build``` ok.";
+        assert_eq!(compact_raw_transcript(short), short);
+    }
+
+    #[test]
+    fn narration_dropped_facts_kept() {
+        let text = "assistant: Let me check the build. The build uses `cargo build --release`. Je vais regarder les logs. Le binaire est dans target/release.";
+        let out = compact_raw_transcript(text);
+        assert!(!out.contains("Let me check"));
+        assert!(!out.contains("Je vais regarder"));
+        assert!(out.contains("cargo build --release"));
+        assert!(out.contains("Le binaire est dans target/release."));
+        assert!(out.starts_with("assistant:"));
+    }
+
+    #[test]
+    fn line_structure_preserved() {
+        let text = "user: Salut.\nassistant: Let me look. Voici la réponse.";
+        let out = compact_raw_transcript(text);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.lines().nth(1).unwrap().contains("Voici la réponse."));
     }
 }
