@@ -662,6 +662,18 @@ fn all_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "archive_transcripts",
+            "description": "Archive old raw transcripts: move their chunks to ~/.MemoryPilot/archive/*.jsonl (re-importable) and out of the live index. distill=true first extracts rule-based memories. Dry run unless apply=true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "min_age_days": { "type": ["integer","null"], "description": "Only transcripts older than this (default 120, min 30)" },
+                    "distill": { "type": ["boolean","null"], "description": "Extract memories before archiving (default false)" },
+                    "apply": { "type": ["boolean","null"] }
+                }
+            }
+        },
+        {
             "name": "get_user_profile",
             "description": "TOP OF THE MEMORY PYRAMID — cross-project user profile (<1200 tokens): durable preferences, active projects, recurring tech, learned skills, recent key decisions. Use at the start of a new conversation, before project-specific context.",
             "inputSchema": {
@@ -755,6 +767,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "list_episodes" => handle_list_episodes(db, args),
         "rebuild_episodes" => handle_rebuild_episodes(db),
         "get_user_profile" => handle_get_user_profile(db, args),
+        "archive_transcripts" => handle_archive_transcripts(db, args),
         "memory_admin" => handle_memory_admin(db, args),
         "extract_skills" => handle_extract_skills(db, args),
         "list_skills" => handle_list_skills(db, args),
@@ -2015,6 +2028,16 @@ fn handle_get_skill(db: &Database, args: &Value) -> Value {
     match db.get_skill(id) {
         Ok(Some(skill)) => tool_result(&serde_json::to_string_pretty(&skill).unwrap()),
         Ok(None) => tool_error(&format!("Skill not found: {}", id)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_archive_transcripts(db: &Database, args: &Value) -> Value {
+    let min_age = args.get("min_age_days").and_then(|v| v.as_i64()).unwrap_or(120);
+    let distill = args.get("distill").and_then(|v| v.as_bool()).unwrap_or(false);
+    let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+    match db.archive_transcripts(min_age, distill, apply) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
     }
 }

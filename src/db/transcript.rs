@@ -631,6 +631,137 @@ impl Database {
     }
 }
 
+impl Database {
+    /// Archive old raw transcripts. The raw chunks are written to a JSONL
+    /// file under `~/.MemoryPilot/archive/` (nothing is lost, re-importable)
+    /// and removed from the live index, where they are noise for recall.
+    /// Optional `distill` first extracts rule-based memories (off by default:
+    /// on long agent logs the heuristics mostly pick up tool chatter).
+    /// Dry run by default.
+    pub fn archive_transcripts(
+        &self,
+        min_age_days: i64,
+        distill: bool,
+        apply: bool,
+    ) -> Result<serde_json::Value, String> {
+        let age = min_age_days.max(30);
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(age)).to_rfc3339();
+        type Row = (String, String, Option<String>, String, String, i64, Option<String>, String);
+        let rows: Vec<Row> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, content, project, tags, source, importance, metadata, created_at
+                     FROM memories
+                     WHERE kind = 'transcript' AND created_at < ?1
+                       AND tags NOT LIKE '%pinned%'
+                     ORDER BY created_at",
+                )
+                .map_err(|e| format!("archive prepare: {}", e))?;
+            let rows = stmt
+                .query_map(rusqlite::params![cutoff], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                })
+                .map_err(|e| format!("archive query: {}", e))?;
+            rows.flatten().collect()
+        };
+
+        let mut groups: std::collections::BTreeMap<String, Vec<(i64, usize)>> =
+            std::collections::BTreeMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            let meta: serde_json::Value = row
+                .6
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let tid = meta
+                .get("transcript_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| row.0.clone());
+            let index = meta.get("chunk_index").and_then(|v| v.as_i64()).unwrap_or(0);
+            groups.entry(tid).or_default().push((index, i));
+        }
+
+        let chars: usize = rows.iter().map(|r| r.1.len()).sum();
+        let mut distilled = 0usize;
+        let mut added = 0usize;
+        if distill {
+            for (tid, parts) in groups.iter_mut() {
+                parts.sort_by_key(|p| p.0);
+                let first = &rows[parts[0].1];
+                let tags: Vec<String> = serde_json::from_str::<Vec<String>>(&first.3)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| t != "pinned")
+                    .collect();
+                let text = parts.iter().map(|p| rows[p.1].1.as_str()).collect::<Vec<_>>().join(" ");
+                let items = Self::distill_transcript_memories(
+                    &text,
+                    first.2.as_deref(),
+                    &tags,
+                    "transcript-archive",
+                    tid,
+                    &MemoryScope::default(),
+                );
+                distilled += items.len();
+                if apply && !items.is_empty() {
+                    added += self.add_memories_bulk(&items)?.0.len();
+                }
+            }
+        }
+
+        let mut archive_file: Option<String> = None;
+        if apply && !rows.is_empty() {
+            let dir = dirs::home_dir()
+                .ok_or("No home")?
+                .join(".MemoryPilot")
+                .join("archive");
+            std::fs::create_dir_all(&dir).map_err(|e| format!("archive dir: {}", e))?;
+            let path = dir.join(format!(
+                "transcripts-{}.jsonl",
+                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            ));
+            let mut out = String::new();
+            for r in &rows {
+                out.push_str(
+                    &serde_json::json!({
+                        "id": r.0, "content": r.1, "project": r.2, "tags": r.3,
+                        "source": r.4, "importance": r.5, "metadata": r.6, "created_at": r.7,
+                    })
+                    .to_string(),
+                );
+                out.push('\n');
+            }
+            std::fs::write(&path, out).map_err(|e| format!("archive write: {}", e))?;
+            for r in &rows {
+                self.delete_memory(&r.0)?;
+            }
+            archive_file = Some(path.display().to_string());
+        }
+
+        Ok(serde_json::json!({
+            "applied": apply,
+            "older_than_days": age,
+            "transcripts": groups.len(),
+            "chunks": rows.len(),
+            "chars": chars,
+            "distilled_candidates": distilled,
+            "distilled_added": added,
+            "archive_file": archive_file,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod compact_tests {
     use super::compact_raw_transcript;
