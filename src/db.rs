@@ -33,6 +33,8 @@ mod skills;
 mod profile;
 #[path = "db/vault.rs"]
 mod vault;
+#[path = "db/conflicts.rs"]
+mod conflicts;
 #[path = "db/transcript.rs"]
 mod transcript;
 

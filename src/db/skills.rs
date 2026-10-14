@@ -577,6 +577,25 @@ fn keywords(members: &[&Candidate], title: &str) -> Vec<String> {
     words.into_iter().take(6).map(|(word, _)| word).collect()
 }
 
+/// Laplace-smoothed success rate (0.5 with no feedback).
+fn reliability(meta: &Value) -> f64 {
+    let used = meta.get("used").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
+    let failed = meta.get("failed").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
+    ((used + 1.0) / (used + failed + 2.0) * 100.0).round() / 100.0
+}
+
+fn feedback_importance(meta: &Value) -> i32 {
+    let used = meta.get("used").and_then(|v| v.as_i64()).unwrap_or(0);
+    let failed = meta.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
+    if failed >= 2 && failed > used {
+        2
+    } else if used >= 3 && used >= 2 * failed {
+        5
+    } else {
+        4
+    }
+}
+
 impl Database {
     fn skill_candidates(&self, project: Option<&str>) -> Result<Vec<Candidate>, String> {
         let kinds = SOURCE_KINDS
@@ -903,6 +922,21 @@ impl Database {
                     .as_ref()
                     .map(|m| m.content == draft.content)
                     .unwrap_or(false);
+                // Keep usage feedback (rate_skill) across re-extractions.
+                let mut metadata = metadata.clone();
+                let mut importance = 4;
+                if let Some(prev) = current.as_ref().and_then(|m| m.metadata.as_ref()) {
+                    for key in ["used", "failed", "last_used", "last_note"] {
+                        if let Some(v) = prev.get(key) {
+                            metadata[key] = v.clone();
+                        }
+                    }
+                    importance = feedback_importance(prev);
+                }
+                let mut tags = tags.clone();
+                if importance <= 2 {
+                    tags.push("unreliable".to_string());
+                }
                 action = if same { "unchanged" } else { "update" };
                 if apply && !same {
                     self.update_memory_full(
@@ -910,7 +944,7 @@ impl Database {
                         Some(&draft.content),
                         Some(SKILL_KIND),
                         Some(&tags),
-                        Some(4),
+                        Some(importance),
                         None,
                         Some(&metadata),
                     )?;
@@ -992,10 +1026,61 @@ impl Database {
                     "occurrences": meta.get("occurrences"),
                     "last_seen": meta.get("last_seen"),
                     "auto": meta.get("auto").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "used": meta.get("used").and_then(|v| v.as_i64()).unwrap_or(0),
+                    "failed": meta.get("failed").and_then(|v| v.as_i64()).unwrap_or(0),
+                    "reliability": reliability(&meta),
                 })
             })
             .collect();
+        let mut items = items;
+        items.sort_by(|a, b| {
+            let key = |v: &Value| {
+                (
+                    v["reliability"].as_f64().unwrap_or(0.5),
+                    v["occurrences"].as_i64().unwrap_or(0),
+                )
+            };
+            key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(json!({ "total": total, "skills": items }))
+    }
+
+    /// Usage feedback: the agent followed this skill and it worked (or not).
+    /// Counters live in metadata and survive re-extraction; reliability
+    /// orders `list_skills`, and repeated failures demote the skill
+    /// (importance 2, tag `unreliable`) so recall stops pushing it.
+    pub fn rate_skill(&self, id: &str, success: bool, note: Option<&str>) -> Result<Value, String> {
+        let Some(memory) = self.get_memory(id)? else {
+            return Err(format!("Skill not found: {}", id));
+        };
+        if memory.kind != SKILL_KIND {
+            return Err(format!("Memory {} is a '{}', not a skill", id, memory.kind));
+        }
+        let mut meta = memory.metadata.clone().unwrap_or_else(|| json!({}));
+        if !meta.is_object() {
+            meta = json!({});
+        }
+        let key = if success { "used" } else { "failed" };
+        let count = meta.get(key).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+        meta[key] = json!(count);
+        meta["last_used"] = json!(chrono::Utc::now().to_rfc3339());
+        if let Some(n) = note.filter(|n| !n.trim().is_empty()) {
+            meta["last_note"] = json!(clip(n, 300));
+        }
+        let importance = feedback_importance(&meta);
+        let mut tags: Vec<String> = memory.tags.iter().filter(|t| t.as_str() != "unreliable").cloned().collect();
+        if importance <= 2 {
+            tags.push("unreliable".to_string());
+        }
+        self.update_memory_full(id, None, None, Some(&tags), Some(importance), None, Some(&meta))?;
+        Ok(json!({
+            "id": id,
+            "used": meta.get("used").and_then(|v| v.as_i64()).unwrap_or(0),
+            "failed": meta.get("failed").and_then(|v| v.as_i64()).unwrap_or(0),
+            "reliability": reliability(&meta),
+            "importance": importance,
+            "unreliable": importance <= 2,
+        }))
     }
 
     /// Full skill card plus short excerpts of the memories it came from.

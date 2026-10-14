@@ -44,6 +44,7 @@ const CORE_TOOLS: &[&str] = &[
     "recall_episode",
     "list_skills",
     "get_skill",
+    "rate_skill",
 ];
 
 pub fn init_tools_profile(db: &Database) {
@@ -695,6 +696,32 @@ fn all_tool_definitions() -> Value {
             }
         },
         {
+            "name": "rate_skill",
+            "description": "After following a skill: report whether it worked. Builds reliability; skills that keep failing are demoted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "success": { "type": "boolean" },
+                    "note": { "type": ["string","null"], "description": "What went wrong or changed (optional)" }
+                },
+                "required": ["id", "success"]
+            }
+        },
+        {
+            "name": "find_conflicts",
+            "description": "Report likely contradictions: same-project memories about the same thing that disagree (negation on one side, different values, newer one says it changed). Read-only; the user decides which to keep.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": ["string","null"] },
+                    "threshold": { "type": ["number","null"], "description": "Min cosine, default 0.82" },
+                    "limit": { "type": ["integer","null"], "description": "Default 30" },
+                    "all_kinds": { "type": ["boolean","null"], "description": "Also milestones/bugs/todos (default: durable kinds only)" }
+                }
+            }
+        },
+        {
             "name": "list_skills",
             "description": "List learned skills (procedures: how to build, deploy, sign, migrate...) with title, project and how often they were seen.",
             "inputSchema": {
@@ -771,6 +798,8 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "memory_admin" => handle_memory_admin(db, args),
         "extract_skills" => handle_extract_skills(db, args),
         "list_skills" => handle_list_skills(db, args),
+        "rate_skill" => handle_rate_skill(db, args),
+        "find_conflicts" => handle_find_conflicts(db, args),
         "get_skill" => handle_get_skill(db, args),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
@@ -2037,6 +2066,31 @@ fn handle_archive_transcripts(db: &Database, args: &Value) -> Value {
     let distill = args.get("distill").and_then(|v| v.as_bool()).unwrap_or(false);
     let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
     match db.archive_transcripts(min_age, distill, apply) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_rate_skill(db: &Database, args: &Value) -> Value {
+    let Some(id) = args.get("id").and_then(|v| v.as_str()) else {
+        return tool_error("id required");
+    };
+    let Some(success) = args.get("success").and_then(|v| v.as_bool()) else {
+        return tool_error("success (true/false) required");
+    };
+    let note = args.get("note").and_then(|v| v.as_str());
+    match db.rate_skill(id, success, note) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_find_conflicts(db: &Database, args: &Value) -> Value {
+    let project = args.get("project").and_then(|v| v.as_str());
+    let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.82) as f32;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as usize;
+    let all_kinds = args.get("all_kinds").and_then(|v| v.as_bool()).unwrap_or(false);
+    match db.find_conflicts(project, threshold, limit, all_kinds) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
     }
