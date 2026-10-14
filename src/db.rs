@@ -4924,8 +4924,16 @@ impl Database {
             None => true,
             Some(own) if own == current => true,
             Some(_) => {
+                // The other project's memory must be ABOUT the current one:
+                // named in its opening (the subject) or mentioned repeatedly,
+                // not a passing reference at the end.
                 let needle = current.to_lowercase();
-                needle.len() >= 3 && memory.content.to_lowercase().contains(&needle)
+                if needle.len() < 3 {
+                    return false;
+                }
+                let lower = memory.content.to_lowercase();
+                let head: String = lower.chars().take(200).collect();
+                head.contains(&needle) || lower.matches(needle.as_str()).count() >= 2
             }
         }
     }
@@ -5000,7 +5008,30 @@ impl Database {
             }};
         }
 
-        // 1. Critical memories first, but keep them project-safe and hint-aware.
+        // 1. Hint-based search first: the memories that answer the current task
+        // claim their place (and budget) before the generic critical ones.
+        let hint_results: Vec<SearchResult> = if let Some(h) = hints {
+            if !h.trim().is_empty() {
+                crate::reranking::with_forced_rerank(|| self.search(h, 10, proj_ref, None, None, None))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|result| result.memory.kind != "transcript")
+                    // Project isolation: when the project is known, a memory
+                    // from ANOTHER project only gets in if it explicitly
+                    // mentions the current one (shared infra, sister apps).
+                    // Global memories (no project) stay eligible.
+                    .filter(|result| Self::recall_project_compatible(&result.memory, proj_ref))
+                    .filter(|result| Self::should_include_in_context(&result.memory, mode))
+                    .filter(|r| budget_check!(&r.memory.id, &r.memory.content))
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        // 2. Critical memories next, but keep them project-safe and hint-aware.
         let critical: Vec<Memory> = {
             let has_contextual_hint = !hint_terms.is_empty();
             let mut stmt = self.conn.prepare(
@@ -5091,28 +5122,6 @@ impl Database {
                 .filter(|m| budget_check!(&m.id, &m.content))
                 .collect();
             result
-        };
-
-        // 2. Hint-based search (most relevant to current task)
-        let hint_results: Vec<SearchResult> = if let Some(h) = hints {
-            if !h.trim().is_empty() {
-                self.search(h, 10, proj_ref, None, None, None)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|result| result.memory.kind != "transcript")
-                    // Project isolation: when the project is known, a memory
-                    // from ANOTHER project only gets in if it explicitly
-                    // mentions the current one (shared infra, sister apps).
-                    // Global memories (no project) stay eligible.
-                    .filter(|result| Self::recall_project_compatible(&result.memory, proj_ref))
-                    .filter(|result| Self::should_include_in_context(&result.memory, mode))
-                    .filter(|r| budget_check!(&r.memory.id, &r.memory.content))
-                    .collect()
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
         };
 
         // 3. Scope memories from the same session / thread / window

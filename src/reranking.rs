@@ -423,8 +423,27 @@ fn is_confident_top(results: &[SearchResult]) -> bool {
     gap / top >= ratio
 }
 
+thread_local! {
+    static FORCE_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the cross-encoder forced on for every search it makes
+/// (unless MEMORYPILOT_CROSS_RERANK=off). Used by `recall`, which runs
+/// once per conversation: precision of the first result matters more
+/// there than the ~0.2 s the rerank costs.
+pub fn with_forced_rerank<T>(f: impl FnOnce() -> T) -> T {
+    let previous = FORCE_SCOPE.with(|c| c.replace(true));
+    let out = f();
+    FORCE_SCOPE.with(|c| c.set(previous));
+    out
+}
+
+fn forced_scope() -> bool {
+    FORCE_SCOPE.with(|c| c.get())
+}
+
 fn is_force_enabled() -> bool {
-    matches!(
+    forced_scope() || matches!(
         std::env::var("MEMORYPILOT_CROSS_RERANK").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("always") | Ok("fastembed") | Ok("onnx")
     )
@@ -455,6 +474,7 @@ fn should_run_cross_encoder(query: &str) -> bool {
             true
         }
         Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE" | "off") => false,
+        _ if forced_scope() => true,
         // Default + explicit "adaptive": run only when the query
         // looks hard or non-English (where the multilingual cross
         // encoder shines).
