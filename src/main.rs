@@ -139,6 +139,7 @@ fn run_mcp_server() {
             std::process::exit(1);
         }
     };
+    tools::init_tools_profile(&db);
     let db_arc = std::sync::Arc::new(db);
 
     let stdin = io::stdin();

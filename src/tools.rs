@@ -20,7 +20,117 @@ const VALID_KINDS: &[&str] = &[
     "skill",
 ];
 
+// ─── Tool profile ────────────────────────────────────────────────────────
+// Every conversation loads the full tool list into the model's context
+// (51 tools ≈ 24 KB ≈ 6 000 tokens). The "core" profile exposes the tools
+// used day to day and routes everything else through `memory_admin`, so
+// nothing is lost. `MEMORYPILOT_TOOLS=full` or set_config tools_profile=full
+// restores the full list.
+static TOOLS_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const CORE_TOOLS: &[&str] = &[
+    "recall",
+    "add_memory",
+    "add_memories",
+    "search_memory",
+    "get_memory",
+    "update_memory",
+    "delete_memory",
+    "list_projects",
+    "get_project_brain",
+    "get_user_profile",
+    "remember_working",
+    "recall_working",
+    "recall_episode",
+    "list_skills",
+    "get_skill",
+];
+
+pub fn init_tools_profile(db: &Database) {
+    let env_full = std::env::var("MEMORYPILOT_TOOLS")
+        .map(|v| v.trim().eq_ignore_ascii_case("full"))
+        .unwrap_or(false);
+    let cfg_full = db
+        .get_config("tools_profile")
+        .map(|v| v.trim().eq_ignore_ascii_case("full"))
+        .unwrap_or(false);
+    TOOLS_FULL.store(env_full || cfg_full, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn first_sentence(text: &str, max: usize) -> String {
+    let cut = text.find(". ").map(|i| i + 1).unwrap_or(text.len());
+    let s: String = text[..cut].chars().take(max).collect();
+    s.trim_end_matches('.').to_string()
+}
+
 pub fn tool_definitions() -> Value {
+    let all = all_tool_definitions();
+    if TOOLS_FULL.load(std::sync::atomic::Ordering::Relaxed) {
+        return all;
+    }
+    let tools = all["tools"].as_array().cloned().unwrap_or_default();
+    let mut core = Vec::new();
+    let mut admin_lines = Vec::new();
+    let mut admin_names = Vec::new();
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("").to_string();
+        if CORE_TOOLS.contains(&name.as_str()) {
+            core.push(tool);
+        } else {
+            let desc = first_sentence(tool["description"].as_str().unwrap_or(""), 90);
+            admin_lines.push(format!("{}: {}", name, desc));
+            admin_names.push(name);
+        }
+    }
+    admin_names.push("help".to_string());
+    core.push(json!({
+        "name": "memory_admin",
+        "description": format!(
+            "Less frequent MemoryPilot actions. Call with action + args (same arguments as the action's own schema; action='help' with args={{\"name\": \"<action>\"}} returns that schema). Actions: {}",
+            admin_lines.join(" | ")
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": admin_names },
+                "args": { "type": ["object","null"], "description": "Arguments of the action" }
+            },
+            "required": ["action"]
+        }
+    }));
+    json!({ "tools": core })
+}
+
+fn handle_memory_admin(db: &Database, args: &Value) -> Value {
+    let Some(action) = args.get("action").and_then(|v| v.as_str()) else {
+        return tool_error("action required");
+    };
+    let inner = args
+        .get("args")
+        .cloned()
+        .filter(|v| v.is_object())
+        .unwrap_or(json!({}));
+    if action == "help" {
+        let wanted = inner.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let all = all_tool_definitions();
+        let found = all["tools"].as_array().and_then(|tools| {
+            tools
+                .iter()
+                .find(|t| t["name"].as_str() == Some(wanted))
+                .cloned()
+        });
+        return match found {
+            Some(tool) => tool_result(&serde_json::to_string_pretty(&tool).unwrap()),
+            None => tool_error(&format!("Unknown action: {}", wanted)),
+        };
+    }
+    if action == "memory_admin" {
+        return tool_error("memory_admin cannot call itself");
+    }
+    handle_tool_call(db, action, &inner)
+}
+
+fn all_tool_definitions() -> Value {
     json!({ "tools": [
         {
             "name": "recall",
@@ -645,6 +755,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "list_episodes" => handle_list_episodes(db, args),
         "rebuild_episodes" => handle_rebuild_episodes(db),
         "get_user_profile" => handle_get_user_profile(db, args),
+        "memory_admin" => handle_memory_admin(db, args),
         "extract_skills" => handle_extract_skills(db, args),
         "list_skills" => handle_list_skills(db, args),
         "get_skill" => handle_get_skill(db, args),
@@ -1393,7 +1504,12 @@ fn handle_export_session(db: &Database, args: &Value) -> Value {
 }
 
 fn handle_set_config(db: &Database, args: &Value) -> Value {
-    const ALLOWED_KEYS: &[&str] = &["global_prompt_path", "auto_lint", "compact_default"];
+    const ALLOWED_KEYS: &[&str] = &[
+        "global_prompt_path",
+        "auto_lint",
+        "compact_default",
+        "tools_profile",
+    ];
     let key = match args.get("key").and_then(|v| v.as_str()) {
         Some(k) => k,
         _ => return tool_error("key required"),
@@ -1431,7 +1547,12 @@ fn handle_set_config(db: &Database, args: &Value) -> Value {
         }
     }
     match db.set_config(key, value) {
-        Ok(()) => tool_result(&format!("Config '{}' = '{}'", key, value)),
+        Ok(()) => {
+            if key == "tools_profile" {
+                init_tools_profile(db);
+            }
+            tool_result(&format!("Config '{}' = '{}'", key, value))
+        }
         Err(e) => tool_error(&e),
     }
 }
