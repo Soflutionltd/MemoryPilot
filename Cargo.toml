@@ -1,6 +1,6 @@
 [package]
 name = "memory-pilot"
-version = "4.8.0"
+version = "4.9.0"
 edition = "2021"
 authors = ["SOFLUTION LTD"]
 description = "God-Tier MCP memory server — Hybrid search (BM25 + jina-embeddings-v5 RRF + cross-encoder rerank), hierarchical episodic memory, 100+ languages, Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server."
@@ -48,8 +48,11 @@ usearch = "2"
 chacha20poly1305 = "0.10"
 base64 = "0.22"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
 [features]
-default = []
+default = ["http"]
 http = ["tiny_http"]
 
 [profile.release]

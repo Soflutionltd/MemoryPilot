@@ -279,6 +279,16 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## What's new in v4.9
+
+- **Project isolation in recall**: memories from another project only surface when they name the current one (cross-project leak 55% → 18%, hit rates unchanged).
+- **Lean tool list**: 17 core tools (~13 KB of schema per conversation instead of ~24 KB); everything else through `memory_admin`. `MEMORYPILOT_TOOLS=full` restores the full list.
+- **Credentials encrypted at rest**: XChaCha20-Poly1305, key in the macOS Keychain (key file elsewhere), transparent decryption locally, masked over HTTP.
+- **`archive_transcripts`**: old raw transcripts move to `~/.MemoryPilot/archive/*.jsonl` and out of the live index.
+- **`find_conflicts`**: report of same-project memories that contradict each other.
+- **`rate_skill`**: usage feedback on learned skills; reliable ones rank first, failing ones are demoted.
+- **Remote access**: `--http` now requires a token (`~/.MemoryPilot/http.token`), as `Authorization: Bearer` or `/mcp/<token>`. `scripts/remote-access.sh` sets up a LaunchAgent and a Cloudflare tunnel so claude.ai, the iPhone app or another PC can use the same memory.
+
 ## Install
 
 ### Homebrew (macOS / Linux)

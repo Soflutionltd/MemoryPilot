@@ -9,8 +9,8 @@
 //! tools behave exactly as before (safe mode still hides credentials).
 //!
 //! The 256-bit key lives in the macOS login Keychain (service
-//! "MemoryPilot", account "credentials-key"), created on first use with
-//! /usr/bin/security. On other systems it falls back to a 0600 key file
+//! "MemoryPilot", account "credentials-key-v2"), created on first use through the
+//! Keychain Services API. On other systems it falls back to a 0600 key file
 //! next to the database. If no key can be obtained, nothing is sealed
 //! (never lose data because of a missing key).
 
@@ -26,7 +26,7 @@ use super::{queue_embedding_job, Database};
 
 pub(crate) const SEAL_PREFIX: &str = "🔒 ";
 const KEYCHAIN_SERVICE: &str = "MemoryPilot";
-const KEYCHAIN_ACCOUNT: &str = "credentials-key";
+const KEYCHAIN_ACCOUNT: &str = "credentials-key-v2";
 
 static KEY: OnceLock<Option<[u8; 32]>> = OnceLock::new();
 
@@ -37,42 +37,21 @@ fn decode_key(text: &str) -> Option<[u8; 32]> {
 
 #[cfg(target_os = "macos")]
 fn load_or_create_key() -> Option<[u8; 32]> {
-    use std::process::Command;
+    // Keychain Services API directly: the key never appears on a command
+    // line (visible to `ps`) as it would with /usr/bin/security -w.
+    use security_framework::passwords::{get_generic_password, set_generic_password};
     if std::env::var("MEMORYPILOT_VAULT").map(|v| v == "off").unwrap_or(false) {
         return None;
     }
-    let found = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"])
-        .output()
-        .ok()?;
-    if found.status.success() {
-        return decode_key(&String::from_utf8_lossy(&found.stdout));
+    if let Ok(found) = get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        return decode_key(&String::from_utf8_lossy(&found));
     }
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let encoded = B64.encode(key);
-    let added = Command::new("/usr/bin/security")
-        .args([
-            "add-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-            "-l",
-            "MemoryPilot credentials key",
-            "-w",
-            &encoded,
-        ])
-        .status()
-        .ok()?;
-    if !added.success() {
-        return None;
-    }
+    set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, encoded.as_bytes()).ok()?;
     // Read back: only trust a key the Keychain actually returns.
-    let check = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"])
-        .output()
-        .ok()?;
-    decode_key(&String::from_utf8_lossy(&check.stdout))
+    let check = get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).ok()?;
+    decode_key(&String::from_utf8_lossy(&check))
 }
 
 #[cfg(not(target_os = "macos"))]
