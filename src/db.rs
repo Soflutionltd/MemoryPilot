@@ -35,6 +35,8 @@ mod profile;
 mod vault;
 #[path = "db/conflicts.rs"]
 mod conflicts;
+#[path = "db/supersede.rs"]
+mod supersede;
 
 /// Whether sealed credentials are decrypted on read (default yes; the
 /// HTTP server turns it off unless MEMORYPILOT_HTTP_SECRETS=on).
@@ -874,7 +876,8 @@ impl Database {
     }
 
     fn should_include_in_context(memory: &Memory, mode: RecallMode) -> bool {
-        mode.includes_credentials() || memory.kind != "credential"
+        (mode.includes_credentials() || memory.kind != "credential")
+            && !supersede::is_superseded(&memory.tags)
     }
 
     fn metadata_object(
@@ -3415,6 +3418,10 @@ impl Database {
                 results.push(reserve);
             }
         }
+
+        // Superseded memories (replaced by a newer one) stay readable by id
+        // but never surface in search.
+        results.retain(|r| !supersede::is_superseded(&r.memory.tags));
 
         // Finalist vectors: one small IN query (≤ ~34 ids). They feed the
         // MMR redundancy term and the confidence cosine.

@@ -144,6 +144,11 @@ fn run_mcp_server() {
         Ok(n) if n > 0 => eprintln!("[MemoryPilot] Sealed {} credential(s) at rest.", n),
         _ => {}
     }
+    if let Ok((removed, added)) = db.repair_fts() {
+        if removed + added > 0 {
+            eprintln!("[MemoryPilot] FTS index repaired ({} orphan rows removed, {} missing added).", removed, added);
+        }
+    }
     let db_arc = std::sync::Arc::new(db);
 
     let stdin = io::stdin();

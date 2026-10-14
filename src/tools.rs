@@ -709,6 +709,32 @@ fn all_tool_definitions() -> Value {
             }
         },
         {
+            "name": "supersede_outdated",
+            "description": "Hide memories replaced by a newer one (explicit change, or newer status of the same thing): tagged 'superseded', kept readable by id, excluded from recall/search. Runs every 6 h automatically; apply=false for a dry run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": ["string","null"] },
+                    "apply": { "type": ["boolean","null"], "description": "Default false" },
+                    "limit": { "type": ["integer","null"], "description": "Pairs shown, default 30" }
+                }
+            }
+        },
+        {
+            "name": "unsupersede",
+            "description": "Undo a supersession: the memory is visible again and won't be superseded by the same rule pass.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "repair_index",
+            "description": "Resynchronise the full-text index with the memories table (orphan and missing rows). Also runs at startup.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "find_conflicts",
             "description": "Report likely contradictions: same-project memories about the same thing that disagree (negation on one side, different values, newer one says it changed). Read-only; the user decides which to keep.",
             "inputSchema": {
@@ -800,6 +826,12 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "list_skills" => handle_list_skills(db, args),
         "rate_skill" => handle_rate_skill(db, args),
         "find_conflicts" => handle_find_conflicts(db, args),
+        "supersede_outdated" => handle_supersede(db, args),
+        "unsupersede" => handle_unsupersede(db, args),
+        "repair_index" => match db.repair_fts() {
+            Ok((removed, added)) => tool_result(&format!("FTS index: {} orphan rows removed, {} missing rows added.", removed, added)),
+            Err(e) => tool_error(&e),
+        },
         "get_skill" => handle_get_skill(db, args),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
@@ -2092,6 +2124,27 @@ fn handle_find_conflicts(db: &Database, args: &Value) -> Value {
     let all_kinds = args.get("all_kinds").and_then(|v| v.as_bool()).unwrap_or(false);
     match db.find_conflicts(project, threshold, limit, all_kinds) {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_supersede(db: &Database, args: &Value) -> Value {
+    let project = args.get("project").and_then(|v| v.as_str());
+    let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as usize;
+    match db.supersede_outdated(project, apply, limit) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_unsupersede(db: &Database, args: &Value) -> Value {
+    let Some(id) = args.get("id").and_then(|v| v.as_str()) else {
+        return tool_error("id required");
+    };
+    match db.unsupersede(id) {
+        Ok(true) => tool_result(&format!("{} is visible again.", id)),
+        Ok(false) => tool_error(&format!("{} is not superseded.", id)),
         Err(e) => tool_error(&e),
     }
 }

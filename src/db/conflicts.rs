@@ -81,7 +81,7 @@ struct Item {
     vector: Vec<f32>,
 }
 
-fn lower_padded(text: &str) -> String {
+pub(super) fn lower_padded(text: &str) -> String {
     format!(
         " {} ",
         text.to_lowercase()
@@ -99,7 +99,7 @@ fn has_change_marker(lower: &str) -> bool {
 
 /// Value-like tokens: numbers (ports, versions, sizes, prices), ignoring
 /// dates, years and single digits which differ for unrelated reasons.
-fn values(text: &str) -> HashSet<String> {
+pub(super) fn values(text: &str) -> HashSet<String> {
     text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '"' | '\'' | '`'))
         .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
         .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
@@ -128,7 +128,7 @@ fn values(text: &str) -> HashSet<String> {
         .collect()
 }
 
-fn clip(text: &str, max: usize) -> String {
+pub(super) fn clip(text: &str, max: usize) -> String {
     let t: String = text.chars().take(max).collect();
     if text.chars().count() > max {
         format!("{}…", t)
