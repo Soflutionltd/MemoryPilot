@@ -279,6 +279,12 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## What's new in v4.10
+
+- **Outdated memories hidden automatically**: when a newer memory says "X instead of Y" about an older one, or is a newer status of the same thing, the older one is tagged `superseded` (kept, readable by id, `unsupersede` to undo) and no longer surfaces in recall or search.
+- **Better recall**: the memories matching the current task come first and are always reranked by the cross-encoder. Recall golden set: top-1 73% → 82%, top-5 91% → 100%, cross-project leak 9% → 0%.
+- **Index repair** at startup (`repair_index`), and `MemoryPilot --seal-backup FILE...` to encrypt credentials inside old backups.
+
 ## What's new in v4.9
 
 - **Project isolation in recall**: memories from another project only surface when they name the current one (cross-project leak 55% → 18%, hit rates unchanged).

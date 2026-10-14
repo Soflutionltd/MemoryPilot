@@ -266,6 +266,82 @@ impl Database {
     }
 }
 
+/// Seal the credentials of a standalone SQLite file (an old backup)
+/// without migrating its schema, then VACUUM so no clear page remains.
+pub(crate) fn seal_file(path: &std::path::Path) -> Result<usize, String> {
+    if key().is_none() {
+        return Err("no encryption key available".into());
+    }
+    let conn = rusqlite::Connection::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let columns: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)").map_err(|e| e.to_string())?;
+        let cols = stmt.query_map([], |r| r.get::<_, String>(1)).map_err(|e| e.to_string())?;
+        cols.flatten().collect()
+    };
+    if !columns.iter().any(|c| c == "content") {
+        return Err("not a MemoryPilot database".into());
+    }
+    let has = |name: &str| columns.iter().any(|c| c == name);
+    let has_fts: bool = conn
+        .query_row("SELECT count(*) FROM sqlite_master WHERE name='memories_fts'", [], |r| r.get::<_, i64>(0))
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    let rows: Vec<(i64, String, Option<String>, String, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT rowid, content, metadata, tags, project FROM memories WHERE kind = 'credential'")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .map_err(|e| e.to_string())?;
+        rows.flatten().collect()
+    };
+    let mut sealed = 0usize;
+    for (rowid, content, metadata, tags, project) in rows {
+        if content.starts_with(SEAL_PREFIX) {
+            continue;
+        }
+        let Some(enc) = encrypt(&content) else { continue };
+        if decrypt(&enc).as_deref() != Some(content.as_str()) {
+            continue;
+        }
+        let mut meta: serde_json::Value = metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !meta.is_object() {
+            meta = serde_json::json!({ "previous_metadata": meta });
+        }
+        meta["enc"] = serde_json::Value::String(enc);
+        meta["sealed"] = serde_json::Value::Bool(true);
+        let label = masked_label(&content);
+        let meta_json = serde_json::to_string(&meta).unwrap_or_default();
+        conn.execute(
+            "UPDATE memories SET content=?1, metadata=?2 WHERE rowid=?3",
+            params![label, meta_json, rowid],
+        )
+        .map_err(|e| format!("seal update: {}", e))?;
+        if has("embedding") {
+            let _ = conn.execute("UPDATE memories SET embedding=NULL WHERE rowid=?1", params![rowid]);
+        }
+        if has("content_hash") {
+            let _ = conn.execute(
+                "UPDATE memories SET content_hash=?1 WHERE rowid=?2",
+                params![super::content_hash(&label), rowid],
+            );
+        }
+        if has_fts {
+            let _ = conn.execute("DELETE FROM memories_fts WHERE rowid=?1", params![rowid]);
+            let _ = conn.execute(
+                "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,'credential',?4)",
+                params![rowid, Database::fts_index_content(&label), tags, project.unwrap_or_default()],
+            );
+        }
+        sealed += 1;
+    }
+    conn.execute_batch("VACUUM;").map_err(|e| format!("vacuum: {}", e))?;
+    Ok(sealed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

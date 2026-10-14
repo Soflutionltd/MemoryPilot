@@ -43,6 +43,11 @@ mod supersede;
 pub fn set_secret_reveal(on: bool) {
     vault::set_reveal(on);
 }
+
+/// Seal the credentials of an old backup file in place (no schema change).
+pub fn seal_backup_file(path: &std::path::Path) -> Result<usize, String> {
+    vault::seal_file(path)
+}
 #[path = "db/transcript.rs"]
 mod transcript;
 

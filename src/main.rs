@@ -111,6 +111,19 @@ fn main() {
         run_benchmark_concurrency(&args);
         return;
     }
+    if let Some(pos) = args.iter().position(|a| a == "--seal-backup") {
+        let mut failed = false;
+        for path in args.iter().skip(pos + 1).filter(|a| !a.starts_with("--")) {
+            match db::seal_backup_file(std::path::Path::new(path)) {
+                Ok(n) => println!("✓ {}: {} credential(s) sealed", path, n),
+                Err(e) => {
+                    eprintln!("✗ {}: {}", path, e);
+                    failed = true;
+                }
+            }
+        }
+        std::process::exit(if failed { 1 } else { 0 });
+    }
     #[cfg(feature = "http")]
     {
         if let Some(pos) = args.iter().position(|a| a == "--http") {
@@ -926,6 +939,7 @@ fn print_help() {
     println!(
         "  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)"
     );
+    println!("  MemoryPilot --seal-backup FILE...  Encrypt credentials inside old backup files");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop auto-ingest");
     println!("  MemoryPilot --hook session-start|stop  (called by Cursor, JSON on stdin)");
