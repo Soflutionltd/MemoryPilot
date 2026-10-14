@@ -4907,6 +4907,19 @@ impl Database {
 
     /// One-shot context loader for new conversations.
     /// Combines: project context, global prompt, critical memories, and optional hint search.
+    /// Whether a memory may appear in a recall scoped to `project`.
+    fn recall_project_compatible(memory: &Memory, project: Option<&str>) -> bool {
+        let Some(current) = project else { return true };
+        match memory.project.as_deref() {
+            None => true,
+            Some(own) if own == current => true,
+            Some(_) => {
+                let needle = current.to_lowercase();
+                needle.len() >= 3 && memory.content.to_lowercase().contains(&needle)
+            }
+        }
+    }
+
     pub fn recall(
         &self,
         project: Option<&str>,
@@ -5077,6 +5090,11 @@ impl Database {
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|result| result.memory.kind != "transcript")
+                    // Project isolation: when the project is known, a memory
+                    // from ANOTHER project only gets in if it explicitly
+                    // mentions the current one (shared infra, sister apps).
+                    // Global memories (no project) stay eligible.
+                    .filter(|result| Self::recall_project_compatible(&result.memory, proj_ref))
                     .filter(|result| Self::should_include_in_context(&result.memory, mode))
                     .filter(|r| budget_check!(&r.memory.id, &r.memory.content))
                     .collect()
