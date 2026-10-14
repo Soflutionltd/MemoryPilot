@@ -74,7 +74,22 @@ fn load_or_create_key() -> Option<[u8; 32]> {
 }
 
 fn key() -> Option<&'static [u8; 32]> {
-    KEY.get_or_init(load_or_create_key).as_ref()
+    // Tests never touch the Keychain: an unsigned test binary reading the
+    // item would make macOS show an access prompt and block.
+    #[cfg(test)]
+    {
+        KEY.get_or_init(|| {
+            let generated = XChaCha20Poly1305::generate_key(&mut OsRng);
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&generated);
+            Some(key)
+        })
+        .as_ref()
+    }
+    #[cfg(not(test))]
+    {
+        KEY.get_or_init(load_or_create_key).as_ref()
+    }
 }
 
 fn encrypt(plain: &str) -> Option<String> {
@@ -254,6 +269,12 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let sealed = encrypt("password: Hx9!kLm2pQ").unwrap();
+        assert_eq!(decrypt(&sealed).as_deref(), Some("password: Hx9!kLm2pQ"));
+    }
 
     #[test]
     fn masks_secrets_keeps_labels_and_emails() {
