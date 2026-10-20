@@ -107,10 +107,23 @@ fn str_field(payload: &Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Cursor also runs the hooks declared in `~/.claude/settings.json`
+/// (third-party imports, on by default) next to its own `~/.cursor/hooks.json`:
+/// the Claude Code entry must stand down there, or every Cursor conversation
+/// gets the recall twice and is ingested twice.
+fn is_cursor_running_foreign_hook(agent: &str, payload: &Value) -> bool {
+    agent != "cursor"
+        && (payload.get("cursor_version").is_some() || payload.get("workspace_roots").is_some())
+}
+
 /// Entry point for `--hook <event> [--agent cursor|claude|codex]`.
 pub fn run_hook(event: &str, args: &[String]) {
     let payload = read_stdin_json();
     let agent = detect_agent(args, &payload);
+    if is_cursor_running_foreign_hook(&agent, &payload) {
+        println!("{}", json!({}));
+        return;
+    }
     let output = match event {
         "session-start" | "sessionStart" | "SessionStart" => {
             match session_start_context(&payload) {
@@ -702,6 +715,14 @@ not json
         assert_eq!(detect_agent(&[], &json!({"cwd": "/x"})), "claude");
         let args = vec!["--agent".to_string(), "codex".to_string()];
         assert_eq!(detect_agent(&args, &json!({})), "codex");
+    }
+
+    #[test]
+    fn claude_hook_stands_down_inside_cursor() {
+        let cursor_payload = json!({"cursor_version": "3.20.1", "workspace_roots": ["/x"]});
+        assert!(is_cursor_running_foreign_hook("claude", &cursor_payload));
+        assert!(!is_cursor_running_foreign_hook("cursor", &cursor_payload));
+        assert!(!is_cursor_running_foreign_hook("claude", &json!({"session_id": "s", "cwd": "/x"})));
     }
 
     #[test]
