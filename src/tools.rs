@@ -1091,13 +1091,34 @@ fn handle_add(db: &Database, args: &Value) -> Value {
     }
 }
 fn handle_add_bulk(db: &Database, args: &Value) -> Value {
-    let items: Vec<BulkItem> = match args
+    let raw_items: Vec<Value> = args
+        .get("memories")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut items: Vec<BulkItem> = match args
         .get("memories")
         .and_then(|v| serde_json::from_value::<Vec<BulkItem>>(v.clone()).ok())
     {
         Some(items) if !items.is_empty() => items,
         _ => return tool_error("memories array is required and cannot be empty"),
     };
+    // Same auto-classification as add_memory when kind or importance is omitted.
+    for (item, raw) in items.iter_mut().zip(raw_items.iter()) {
+        let (auto_imp, auto_kind, auto_ttl) = crate::gc::auto_classify(&item.content);
+        if raw.get("kind").and_then(|v| v.as_str()).is_none() {
+            item.kind = auto_kind.to_string();
+            if item.expires_at.is_none() {
+                item.expires_at = auto_ttl.map(|days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339());
+            }
+        }
+        if item.importance.is_none() {
+            item.importance = Some(auto_imp);
+        }
+        if !VALID_KINDS.contains(&item.kind.as_str()) {
+            return tool_error(&format!("Invalid kind '{}'. Valid: {:?}", item.kind, VALID_KINDS));
+        }
+    }
     match db.add_memories_bulk(&items) {
         Ok((added, merged, skipped)) => tool_result(&format!(
             "Bulk complete: {} added, {} merged (dedup), {} skipped. Total processed: {}.",
