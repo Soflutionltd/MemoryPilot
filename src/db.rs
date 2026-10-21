@@ -48,6 +48,8 @@ pub fn set_secret_reveal(on: bool) {
 pub fn seal_backup_file(path: &std::path::Path) -> Result<usize, String> {
     vault::seal_file(path)
 }
+
+pub(crate) use vault::contains_secret_value;
 #[path = "db/transcript.rs"]
 mod transcript;
 
@@ -2322,6 +2324,9 @@ impl Database {
         metadata: Option<&serde_json::Value>,
         scope: &MemoryScope,
     ) -> Result<(Memory, bool), String> {
+        // A secret value is sealed and hidden from safe recall whatever kind the caller chose.
+        let forced_credential = kind != "credential" && vault::contains_secret_value(content);
+        let kind = if forced_credential { "credential" } else { kind };
         let canonical_project = Self::canonical_project(project);
         let scoped_metadata = Self::apply_scope_to_metadata(metadata, scope);
         // Check for near-duplicate
@@ -2344,7 +2349,7 @@ impl Database {
             let updated = self.update_memory_full(
                 &existing.id,
                 Some(new_content),
-                None,
+                forced_credential.then_some("credential"),
                 Some(&merged_tags),
                 Some(new_importance),
                 expires_at,
@@ -2405,6 +2410,10 @@ impl Database {
             access_count: 0,
         };
         let _ = self.rebuild_links(&mem);
+        // Seal now: the server runs for days, a credential must not wait for a restart in clear.
+        if kind == "credential" {
+            self.seal_credentials()?;
+        }
 
         // Auto-compaction: trigger GC when memory count exceeds threshold
         self.maybe_auto_compact();
@@ -2434,7 +2443,18 @@ impl Database {
         };
         let now = Utc::now().to_rfc3339();
         let new_content = content.unwrap_or(&existing.content);
-        let new_kind = kind.unwrap_or(&existing.kind);
+        let requested_kind = kind.unwrap_or(&existing.kind);
+        let new_kind = if requested_kind != "credential" && vault::contains_secret_value(new_content) {
+            "credential"
+        } else {
+            requested_kind
+        };
+        if existing.kind == "credential" && new_kind != "credential" && existing.content.starts_with(vault::SEAL_PREFIX) {
+            return Err(format!(
+                "Memory {} is a sealed credential that cannot be decrypted here: reclassifying it would lose the secret",
+                id
+            ));
+        }
         let new_tags = tags
             .map(|t| t.to_vec())
             .unwrap_or_else(|| existing.tags.clone());
@@ -2445,12 +2465,21 @@ impl Database {
         } else {
             existing.expires_at.clone()
         };
-        let new_metadata = metadata.cloned().or_else(|| existing.metadata.clone());
+        let mut new_metadata = metadata.cloned().or_else(|| existing.metadata.clone());
+        if new_kind != "credential" {
+            // No longer a credential: drop the ciphertext of the old secret.
+            if let Some(object) = new_metadata.as_mut().and_then(|m| m.as_object_mut()) {
+                object.remove("enc");
+                object.remove("sealed");
+            }
+        }
         let metadata_json = new_metadata
             .as_ref()
             .map(|value| serde_json::to_string(value).unwrap_or_default());
         let new_hash = content_hash(new_content);
-        let content_changed = content.is_some() && new_content != existing.content;
+        // Leaving the vault swaps the stored masked label for the clear text: hash and embedding must follow.
+        let leaves_vault = existing.kind == "credential" && new_kind != "credential";
+        let content_changed = (content.is_some() && new_content != existing.content) || leaves_vault;
 
         if content_changed {
             self.conn.execute(
@@ -2506,6 +2535,10 @@ impl Database {
             access_count: existing.access_count,
         };
         let _ = self.rebuild_links(&mem);
+        // Reads decrypt credentials, so any rewrite just stored the secret in clear: seal again.
+        if new_kind == "credential" {
+            self.seal_credentials()?;
+        }
         Ok(Some(mem))
     }
 
@@ -5868,6 +5901,43 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&project_root);
         cleanup_db_files(&path);
+    }
+
+    #[test]
+    fn secret_values_are_sealed_at_once_and_stay_sealed_after_update() {
+        let path = temp_db_path("seal-on-write");
+        {
+            let db = Database::open_at(&path).expect("db");
+            let tags: Vec<String> = Vec::new();
+            let secret = "Hx9!kLm2pQ";
+            let (mem, _) = db
+                .add_memory(
+                    &format!("Compte démo : demo@example.com / password: {}", secret),
+                    "fact",
+                    Some("demo"),
+                    &tags,
+                    "test",
+                    3,
+                    None,
+                    None,
+                    &MemoryScope::default(),
+                )
+                .expect("add");
+            assert_eq!(mem.kind, "credential");
+            let stored = |db: &Database| -> String {
+                db.conn
+                    .query_row("SELECT content FROM memories WHERE id=?1", params![mem.id], |r| r.get(0))
+                    .expect("row")
+            };
+            assert!(stored(&db).starts_with(super::vault::SEAL_PREFIX));
+            assert!(!stored(&db).contains(secret));
+
+            db.update_memory_full(&mem.id, None, None, Some(&["compte".to_string()]), Some(4), None, None)
+                .expect("update");
+            assert!(!stored(&db).contains(secret), "an update must not write the secret back in clear");
+            assert!(db.get_memory(&mem.id).expect("get").expect("mem").content.contains(secret));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

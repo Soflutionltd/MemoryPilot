@@ -124,6 +124,36 @@ fn main() {
         }
         std::process::exit(if failed { 1 } else { 0 });
     }
+    if args.iter().any(|a| a == "--repair-credentials") {
+        let apply = args.iter().any(|a| a == "--apply");
+        let db = match db::Database::open() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("DB error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        match db.repair_credentials(apply) {
+            Ok(report) => {
+                for (id, kind, label) in &report.reclassified {
+                    let preview: String = label.chars().take(90).collect();
+                    println!("{} → {}  {}", &id[..8.min(id.len())], kind, preview);
+                }
+                println!(
+                    "{} : {} credential(s) sans valeur secrète reclassé(s), {} libellé(s) re-masqué(s), {} non déchiffrable(s).",
+                    if apply { "Appliqué" } else { "À blanc (--apply pour écrire)" },
+                    report.reclassified.len(),
+                    report.relabelled,
+                    report.undecryptable
+                );
+            }
+            Err(e) => {
+                eprintln!("✗ {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     #[cfg(feature = "http")]
     {
         if let Some(pos) = args.iter().position(|a| a == "--http") {
@@ -940,6 +970,7 @@ fn print_help() {
         "  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)"
     );
     println!("  MemoryPilot --seal-backup FILE...  Encrypt credentials inside old backup files");
+    println!("  MemoryPilot --repair-credentials [--apply]  Re-mask leaking labels, reclassify credentials holding no secret");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop auto-ingest");
     println!("  MemoryPilot --hook session-start|stop  (called by Cursor, JSON on stdin)");
