@@ -231,116 +231,16 @@ pub fn capsule_summary(contents: &[String], kinds: &[String], project: Option<&s
 /// Returns (importance 1-5, inferred_kind, suggested_ttl_days).
 pub fn auto_classify(content: &str) -> (i32, &'static str, Option<i64>) {
     let lower = content.to_lowercase();
-    let corpus = crate::graph::analyze_corpus(content, None);
+    let any = |terms: &[&str]| terms.iter().any(|term| has_term(&lower, term));
 
-    // Credential/secret detection (importance 5, no TTL)
-    if lower.contains("api_key")
-        || lower.contains("api key")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || lower.contains("token")
-        || lower.contains("credential")
-        || lower.contains("private_key")
-    {
+    // Only an actual secret value makes a credential: a credential is hidden from
+    // safe recall, so "secrets go to 1Password" or "90k tokens" must stay visible.
+    if crate::db::contains_secret_value(content) {
         return (5, "credential", None);
     }
 
-    // Architecture/decision (importance 4-5)
-    if lower.contains("architecture")
-        || lower.contains("we decided")
-        || lower.contains("on a décidé")
-        || lower.contains("stack")
-        || lower.contains("migration")
-        || lower.contains("breaking change")
-    {
-        return (5, "architecture", None);
-    }
-    if lower.contains("decided")
-        || lower.contains("decision")
-        || lower.contains("décision")
-        || lower.contains("convention")
-        || lower.contains("approach")
-        || lower.contains("design pattern")
-    {
-        return (4, "decision", None);
-    }
-
-    // Preference (importance 4)
-    if lower.contains("prefer")
-        || lower.contains("always use")
-        || lower.contains("never use")
-        || lower.contains("préfère")
-        || lower.contains("toujours utiliser")
-        || lower.contains("jamais utiliser")
-        || lower.contains("i like")
-        || lower.contains("j'aime")
-    {
-        return (4, "preference", None);
-    }
-
-    // Pattern (importance 3-4)
-    if lower.contains("pattern")
-        || lower.contains("best practice")
-        || lower.contains("convention")
-        || lower.contains("rule")
-        || lower.contains("standard")
-        || lower.contains("guideline")
-    {
-        return (4, "pattern", None);
-    }
-
-    // Bug (importance 3, TTL 90 days — bugs get fixed)
-    if lower.contains("bug")
-        || lower.contains("error")
-        || lower.contains("fix")
-        || lower.contains("crash")
-        || lower.contains("broken")
-        || lower.contains("erreur")
-        || lower.contains("exception")
-        || lower.contains("stack trace")
-    {
-        return (3, "bug", Some(90));
-    }
-
-    // Todo (importance 2, TTL 30 days)
-    if lower.contains("todo")
-        || lower.contains("à faire")
-        || lower.contains("task")
-        || lower.contains("implement")
-        || lower.contains("need to")
-        || lower.contains("il faut")
-        || lower.contains("should add")
-    {
-        return (2, "todo", Some(30));
-    }
-
-    // Snippet (importance 2)
-    if lower.contains("```")
-        || lower.contains("fn ")
-        || lower.contains("function ")
-        || lower.contains("class ")
-        || lower.contains("import ")
-        || lower.contains("const ")
-        || lower.contains("export ")
-    {
-        return (2, "snippet", None);
-    }
-
-    // Milestone (importance 4)
-    if lower.contains("shipped")
-        || lower.contains("deployed")
-        || lower.contains("launched")
-        || lower.contains("released")
-        || lower.contains("milestone")
-        || lower.contains("livré")
-        || lower.contains("déployé")
-        || lower.contains("v1")
-        || lower.contains("v2")
-    {
-        return (4, "milestone", None);
-    }
-
     // Conversation chunks are useful for retrieval, but should not crowd durable facts.
+    let corpus = crate::graph::analyze_corpus(content, None);
     if corpus.origin == "ai_transcript"
         || lower.trim_start().starts_with("user:")
         || lower.trim_start().starts_with("assistant:")
@@ -348,8 +248,134 @@ pub fn auto_classify(content: &str) -> (i32, &'static str, Option<i64>) {
         return (2, "transcript", Some(180));
     }
 
+    let mentions_stack = has_term(&lower, "stack") && !lower.contains("stack trace");
+    if mentions_stack
+        || any(&["architecture", "we decided", "on a décidé", "migration", "migrations", "breaking change"])
+    {
+        return (5, "architecture", None);
+    }
+
+    // Resource identifiers are what later sessions look up most.
+    if any(&[
+        "project id", "project_id", "project ref", "app id", "bundle id", "team id", "account id",
+        "price id", "bucket", "namespace", "database id", "client id", "org id", "organization id",
+    ]) {
+        return (5, "fact", None);
+    }
+
+    if any(&[
+        "decided", "decision", "décision", "décidé", "décidée", "convention", "approach", "design pattern",
+        "choix", "tranché",
+    ]) {
+        return (4, "decision", None);
+    }
+
+    if any(&[
+        "prefer", "prefers", "always use", "never use", "préfère", "préférence", "toujours utiliser",
+        "jamais utiliser", "i like", "j'aime",
+    ]) {
+        return (4, "preference", None);
+    }
+
+    if any(&[
+        "pattern", "patterns", "best practice", "rule", "rules", "règle", "règles", "standard", "guideline",
+        "guidelines",
+    ]) {
+        return (4, "pattern", None);
+    }
+
+    // Bug (importance 3, TTL 90 days — bugs get fixed)
+    if any(&[
+        "bug", "bugs", "error", "errors", "erreur", "erreurs", "fix", "fixed", "fixes", "corrigé", "corrigée",
+        "correctif", "crash", "crashes", "plantage", "broken", "exception", "stack trace", "régression",
+    ]) {
+        return (3, "bug", Some(90));
+    }
+
+    // Todo (importance 2, TTL 30 days)
+    if any(&["todo", "à faire", "task", "tasks", "implement", "need to", "il faut", "should add", "reste à"]) {
+        return (2, "todo", Some(30));
+    }
+
+    if looks_like_code(content) {
+        return (2, "snippet", None);
+    }
+
+    if any(&[
+        "shipped", "deployed", "launched", "released", "milestone", "livré", "livrée", "déployé", "déployée",
+        "mis en production", "mise en production", "v1", "v2",
+    ]) {
+        return (4, "milestone", None);
+    }
+
     // Default: fact, importance 3
     (3, "fact", None)
+}
+
+/// `term` appears as whole words ("fix" in "a fix", not in "prefix").
+fn has_term(text: &str, term: &str) -> bool {
+    let is_boundary = |c: Option<char>| !matches!(c, Some(c) if c.is_alphanumeric() || c == '_');
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(term) {
+        let at = start + pos;
+        let end = at + term.len();
+        if is_boundary(text[..at].chars().next_back()) && is_boundary(text[end..].chars().next()) {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// Code fence, or a line that starts like a declaration and carries code punctuation.
+/// Prose such as "export FEC du mois" or "import bancaire" is not code.
+fn looks_like_code(content: &str) -> bool {
+    if content.contains("```") {
+        return true;
+    }
+    const STARTS: &[&str] = &[
+        "fn ", "pub fn ", "async fn ", "function ", "class ", "import ", "export ", "const ", "let ", "def ",
+        "struct ", "impl ", "interface ", "type ",
+    ];
+    content.lines().map(str::trim_start).any(|line| {
+        STARTS.iter().any(|s| line.starts_with(s)) && line.contains(['(', '{', '=', ';'])
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_classify;
+
+    #[test]
+    fn mentions_of_secrets_are_not_credentials() {
+        for content in [
+            "Docix : secrets Cloudflare pour la prod, référence 1Password via op-sof, jamais de secret dans git.",
+            "Le catalogue MCP coûte ~90k tokens par tour.",
+            "Clé Anthropic du banc : op://Soflution/yquxzdeotwopqmgf5iyzpoqgry/credential",
+        ] {
+            assert_ne!(auto_classify(content).1, "credential", "{}", content);
+        }
+        assert_eq!(auto_classify("Compte test : demo@example.com / password: Hx9!kLm2pQ").1, "credential");
+    }
+
+    #[test]
+    fn keywords_match_whole_words_only() {
+        assert_ne!(auto_classify("Le préfixe re_ et le suffixe sont normalisés avec un prefix commun.").1, "bug");
+        assert_ne!(auto_classify("Sortie de la v10.2 du moteur OCR").1, "milestone");
+        assert_eq!(auto_classify("Crash au lancement : stack trace dans Sentry.").1, "bug");
+        assert_eq!(auto_classify("Stack Docix : SvelteKit 2, Supabase, Cloudflare Pages.").1, "architecture");
+    }
+
+    #[test]
+    fn prose_about_exports_is_not_a_snippet() {
+        assert_ne!(auto_classify("Export FEC du mois envoyé au comptable, import bancaire Powens OK.").1, "snippet");
+        assert_eq!(auto_classify("const total = lines.reduce((a, b) => a + b, 0);").1, "snippet");
+    }
+
+    #[test]
+    fn identifiers_are_important_facts() {
+        assert_eq!(auto_classify("Sociomator iOS : App ID 6758438203, Bundle ID com.soflution.pubflow").0, 5);
+    }
 }
 
 /// Common English/French stopwords to skip during keyword extraction.
