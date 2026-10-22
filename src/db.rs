@@ -4198,7 +4198,7 @@ impl Database {
         let memories: Vec<(String, String, String, i32)> = if let Some(proj) =
             canonical_project.as_deref()
         {
-            let mut stmt = self.conn.prepare("SELECT id, content, kind, importance FROM memories WHERE project = ?1 ORDER BY created_at DESC LIMIT 500")
+            let mut stmt = self.conn.prepare("SELECT id, content, kind, importance FROM memories WHERE project = ?1 AND kind != 'credential' ORDER BY created_at DESC LIMIT 500")
                 .map_err(|e| format!("Dedupe prepare: {}", e))?;
             let result: Vec<(String, String, String, i32)> = stmt
                 .query_map(params![proj], |r| {
@@ -4214,7 +4214,7 @@ impl Database {
                 .collect();
             result
         } else {
-            let mut stmt = self.conn.prepare("SELECT id, content, kind, importance FROM memories ORDER BY created_at DESC LIMIT 500")
+            let mut stmt = self.conn.prepare("SELECT id, content, kind, importance FROM memories WHERE kind != 'credential' ORDER BY created_at DESC LIMIT 500")
                 .map_err(|e| format!("Dedupe prepare: {}", e))?;
             let result: Vec<(String, String, String, i32)> = stmt
                 .query_map([], |r| {
