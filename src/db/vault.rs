@@ -5,8 +5,12 @@
 //!   - `content`  = "🔒 " + a masked label (secrets replaced by ••••), so
 //!     search, FTS and embeddings still find "login admin La Villart";
 //!   - `metadata.enc` = base64(nonce ‖ XChaCha20-Poly1305(original)).
-//! Reads go through `row_to_memory`, which transparently decrypts, so
-//! tools behave exactly as before (safe mode still hides credentials).
+//!
+//! Reads never decrypt: every tool sees the masked label, and a serialized
+//! credential carries a `secret` pointer (where the value lives, how to ask
+//! for it) instead of the value. `reveal_secret` is the only way out, after
+//! the user confirms in a native dialog; each request is audited without
+//! the value. `MEMORYPILOT_SECRETS=reveal` restores transparent decryption.
 //!
 //! The 256-bit key lives in the macOS login Keychain (service
 //! "MemoryPilot", account "credentials-key-v2"), created on first use through the
@@ -14,6 +18,7 @@
 //! next to the database. If no key can be obtained, nothing is sealed
 //! (never lose data because of a missing key).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -22,7 +27,7 @@ use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::params;
 
-use super::{queue_embedding_job, Database};
+use super::{queue_embedding_job, Database, Memory};
 
 pub(crate) const SEAL_PREFIX: &str = "🔒 ";
 const KEYCHAIN_SERVICE: &str = "MemoryPilot";
@@ -112,21 +117,280 @@ pub(crate) fn decrypt(encoded: &str) -> Option<String> {
     String::from_utf8(plain).ok()
 }
 
-static REVEAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static REVEAL: AtomicBool = AtomicBool::new(false);
+static REMOTE: AtomicBool = AtomicBool::new(false);
 
-/// Remote (HTTP) mode keeps credentials masked unless explicitly allowed.
+/// Transparent decryption on read (off by default).
 pub(crate) fn set_reveal(on: bool) {
-    REVEAL.store(on, std::sync::atomic::Ordering::Relaxed);
+    REVEAL.store(on, Ordering::Relaxed);
 }
 
-/// Transparent read path: sealed row → original text.
-pub(crate) fn unseal_content(content: &str, metadata: Option<&serde_json::Value>) -> Option<String> {
-    if !content.starts_with(SEAL_PREFIX) || !REVEAL.load(std::sync::atomic::Ordering::Relaxed) {
+/// The HTTP server: nobody sits in front of the machine to confirm a reveal.
+pub(crate) fn set_remote(on: bool) {
+    REMOTE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn reveal_enabled() -> bool {
+    REVEAL.load(Ordering::Relaxed)
+}
+
+/// What a read returns for a stored credential: the masked label unless
+/// transparent decryption was explicitly turned on.
+pub(crate) fn read_content(kind: &str, raw: String, metadata: Option<&serde_json::Value>) -> String {
+    if kind != "credential" {
+        return raw;
+    }
+    if reveal_enabled() {
+        return unseal(&raw, metadata).unwrap_or(raw);
+    }
+    if raw.starts_with(SEAL_PREFIX) {
+        raw
+    } else {
+        masked_label(&raw)
+    }
+}
+
+/// Sealed row → original text, whatever the read mode.
+pub(crate) fn unseal(content: &str, metadata: Option<&serde_json::Value>) -> Option<String> {
+    if !content.starts_with(SEAL_PREFIX) {
         return None;
     }
-    let enc = metadata?.get("enc")?.as_str()?;
-    decrypt(enc)
+    decrypt(metadata?.get("enc")?.as_str()?)
 }
+
+/// Metadata as shown to clients: the ciphertext stays inside.
+fn public_metadata(metadata: &serde_json::Value) -> serde_json::Value {
+    let mut shown = metadata.clone();
+    if let Some(object) = shown.as_object_mut() {
+        object.remove("enc");
+    }
+    shown
+}
+
+/// Where the value of a credential lives, from what its label says.
+fn secret_location(label: &str, metadata: Option<&serde_json::Value>) -> String {
+    if let Some(location) = metadata.and_then(|m| m.get("location")).and_then(|v| v.as_str()) {
+        return location.to_string();
+    }
+    if let Some(reference) = label.split_whitespace().find(|token| token.starts_with("op://")) {
+        return reference.trim_end_matches(['.', ',', ';', ')']).to_string();
+    }
+    if label.to_lowercase().contains("1password") {
+        return "1Password (see the label)".into();
+    }
+    if metadata.and_then(|m| m.get("sealed")).and_then(|v| v.as_bool()) == Some(true) {
+        "MemoryPilot vault (encrypted)".into()
+    } else {
+        "MemoryPilot (not encrypted: no vault key)".into()
+    }
+}
+
+fn secret_pointer(id: &str, label: &str, metadata: Option<&serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "where": secret_location(label, metadata),
+        "reveal": { "tool": "memory_admin", "action": "reveal_secret", "args": { "id": id, "reason": "why the value is needed" } },
+        "note": "Search, recall and get never return the value. Use the location when you can; reveal_secret asks the user to confirm on screen.",
+    })
+}
+
+/// The credentials among some memories, as pointers (recall lists carry no id).
+pub(crate) fn secret_references<'a>(memories: impl Iterator<Item = &'a Memory>) -> Option<serde_json::Value> {
+    let mut seen = std::collections::HashSet::new();
+    let items: Vec<serde_json::Value> = memories
+        .filter(|memory| memory.kind == "credential" && !reveal_enabled() && seen.insert(memory.id.clone()))
+        .map(|memory| {
+            let label = if memory.content.starts_with(SEAL_PREFIX) {
+                memory.content.clone()
+            } else {
+                masked_label(&memory.content)
+            };
+            serde_json::json!({ "id": memory.id, "where": secret_location(&label, memory.metadata.as_ref()), "label": label })
+        })
+        .collect();
+    (!items.is_empty()).then(|| {
+        serde_json::json!({
+            "items": items,
+            "reveal": "memory_admin reveal_secret {id, reason}: the user confirms on screen. Prefer the location.",
+        })
+    })
+}
+
+impl serde::Serialize for Memory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let masked = self.kind == "credential" && !reveal_enabled();
+        let content = if masked && !self.content.starts_with(SEAL_PREFIX) {
+            std::borrow::Cow::Owned(masked_label(&self.content))
+        } else {
+            std::borrow::Cow::Borrowed(self.content.as_str())
+        };
+        let mut state = serializer.serialize_struct("Memory", 14)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("content", content.as_ref())?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("project", &self.project)?;
+        state.serialize_field("tags", &self.tags)?;
+        state.serialize_field("source", &self.source)?;
+        state.serialize_field("importance", &self.importance)?;
+        match &self.expires_at {
+            Some(expires_at) => state.serialize_field("expires_at", expires_at)?,
+            None => state.skip_field("expires_at")?,
+        }
+        state.serialize_field("created_at", &self.created_at)?;
+        state.serialize_field("updated_at", &self.updated_at)?;
+        match &self.metadata {
+            Some(metadata) => state.serialize_field("metadata", &public_metadata(metadata))?,
+            None => state.skip_field("metadata")?,
+        }
+        if masked {
+            state.serialize_field("secret", &secret_pointer(&self.id, &content, self.metadata.as_ref()))?;
+        } else {
+            state.skip_field("secret")?;
+        }
+        match &self.last_accessed_at {
+            Some(at) => state.serialize_field("last_accessed_at", at)?,
+            None => state.skip_field("last_accessed_at")?,
+        }
+        state.serialize_field("access_count", &self.access_count)?;
+        state.end()
+    }
+}
+
+/// How a reveal is confirmed: `dialog` (default on macOS) asks the user in a
+/// native dialog an agent cannot click; `none` trusts the caller (audit only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealConfirm {
+    Dialog,
+    None,
+}
+
+impl RevealConfirm {
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var("MEMORYPILOT_REVEAL_CONFIRM").ok().as_deref().map(str::trim) {
+            None | Some("") | Some("dialog") => Ok(Self::Dialog),
+            Some("none") => Ok(Self::None),
+            Some(other) => Err(format!("MEMORYPILOT_REVEAL_CONFIRM={} is not valid: use dialog or none", other)),
+        }
+    }
+}
+
+const DIALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(target_os = "macos")]
+fn ask_user(message: &str) -> Result<bool, String> {
+    let osascript = std::path::Path::new("/usr/bin/osascript");
+    if !osascript.exists() {
+        return Err("osascript not found: no way to ask for confirmation".into());
+    }
+    // The text goes through argv, never into the script: no AppleScript injection.
+    let mut command = std::process::Command::new(osascript);
+    command.args([
+        "-e",
+        "on run argv",
+        "-e",
+        "display dialog (item 1 of argv) with title \"MemoryPilot\" buttons {\"Refuser\", \"Révéler\"} default button \"Refuser\" cancel button \"Refuser\" with icon caution giving up after 55",
+        "-e",
+        "end run",
+        "--",
+        message,
+    ]);
+    let answer = crate::connectors::run_with_timeout(command, None, DIALOG_TIMEOUT).unwrap_or_default();
+    Ok(answer.contains("button returned:Révéler") && !answer.contains("gave up:true"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ask_user(_message: &str) -> Result<bool, String> {
+    Err("no confirmation dialog on this system: set MEMORYPILOT_REVEAL_CONFIRM=none to allow reveals with audit only".into())
+}
+
+fn audit(memory: &Memory, reason: &str, outcome: &str) {
+    let Some(dir) = dirs::home_dir().map(|home| home.join(".MemoryPilot").join("logs")) else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let line = serde_json::json!({
+        "at": chrono::Utc::now().to_rfc3339(),
+        "id": memory.id,
+        "project": memory.project,
+        "label": memory.content,
+        "reason": reason,
+        "outcome": outcome,
+    });
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("reveal-audit.log")) {
+        let _ = writeln!(file, "{}", line);
+    }
+}
+
+impl Database {
+    /// Clear text of a credential, read straight from the row (no confirmation:
+    /// callers are internal, `reveal_secret` is the tool entry point).
+    pub(crate) fn credential_clear_text(&self, id: &str) -> Result<Option<String>, String> {
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT content, metadata FROM memories WHERE id=?1 AND kind='credential'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let Some((content, metadata)) = row else {
+            return Ok(None);
+        };
+        if !content.starts_with(SEAL_PREFIX) {
+            return Ok(Some(content));
+        }
+        let metadata: Option<serde_json::Value> = metadata.and_then(|m| serde_json::from_str(&m).ok());
+        unseal(&content, metadata.as_ref())
+            .map(Some)
+            .ok_or_else(|| format!("Credential {} cannot be decrypted with this machine's key", id))
+    }
+
+    /// The value of a credential, after the user said yes. Every request is
+    /// written to ~/.MemoryPilot/logs/reveal-audit.log, without the value.
+    pub fn reveal_secret(&self, id: &str, reason: &str, confirm: RevealConfirm) -> Result<(Memory, String), String> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err("reason required: say why the value is needed".into());
+        }
+        let memory = self.get_memory(id)?.ok_or_else(|| format!("Not found: {}", id))?;
+        if memory.kind != "credential" {
+            return Err(format!("{} is a {}, not a credential: get_memory returns it in full", id, memory.kind));
+        }
+        if REMOTE.load(Ordering::Relaxed) && !reveal_enabled() {
+            audit(&memory, reason, "refused_remote");
+            return Err("Reveals are off on the HTTP server (MEMORYPILOT_HTTP_SECRETS=on allows them)".into());
+        }
+        if confirm == RevealConfirm::Dialog {
+            let label = memory.content.trim_start_matches(SEAL_PREFIX);
+            let message = format!(
+                "Un agent demande la valeur de ce secret :\n\n{}\n\nProjet : {}\nMotif : {}",
+                label.chars().take(200).collect::<String>(),
+                memory.project.as_deref().unwrap_or("aucun"),
+                reason.chars().take(300).collect::<String>(),
+            );
+            match ask_user(&message) {
+                Ok(true) => {}
+                Ok(false) => {
+                    audit(&memory, reason, "refused");
+                    return Err("The user did not confirm (refused or no answer within 55 s)".into());
+                }
+                Err(error) => {
+                    audit(&memory, reason, "no_dialog");
+                    return Err(error);
+                }
+            }
+        }
+        let value = self
+            .credential_clear_text(id)?
+            .ok_or_else(|| format!("Not found: {}", id))?;
+        audit(&memory, reason, if confirm == RevealConfirm::Dialog { "revealed" } else { "revealed_unconfirmed" });
+        Ok((memory, value))
+    }
+}
+
 
 const SECRET_KEYWORDS: &[&str] = &[
     "password", "passwd", "pwd", "mdp", "pass", "passe", "token", "secret", "key", "clé", "cle",
@@ -368,15 +632,15 @@ impl Database {
         let mut report = CredentialRepair::default();
         for id in ids {
             let Some(memory) = self.get_memory(&id)? else { continue };
-            if memory.content.starts_with(SEAL_PREFIX) {
+            let Ok(Some(clear)) = self.credential_clear_text(&id) else {
                 report.undecryptable += 1;
                 continue;
-            }
-            if !contains_secret_value(&memory.content) {
-                let kind = crate::gc::auto_classify(&memory.content).1;
-                report.reclassified.push((id.clone(), kind.to_string(), masked_label(&memory.content)));
+            };
+            if !contains_secret_value(&clear) {
+                let kind = crate::gc::auto_classify(&clear).1;
+                report.reclassified.push((id.clone(), kind.to_string(), masked_label(&clear)));
                 if apply {
-                    self.update_memory_full(&id, None, Some(kind), None, None, None, None)?;
+                    self.update_memory_full(&id, Some(&clear), Some(kind), None, None, None, None)?;
                 }
                 continue;
             }
@@ -384,7 +648,7 @@ impl Database {
                 .conn
                 .query_row("SELECT content FROM memories WHERE id=?1", params![id], |r| r.get(0))
                 .map_err(|e| format!("repair read: {}", e))?;
-            let label = masked_label(&memory.content);
+            let label = masked_label(&clear);
             if stored != label {
                 report.relabelled += 1;
                 if apply {
@@ -511,6 +775,57 @@ pub(crate) fn seal_file(path: &std::path::Path) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn credential(content: &str, metadata: Option<serde_json::Value>) -> Memory {
+        Memory {
+            id: "c1".into(),
+            content: content.into(),
+            kind: "credential".into(),
+            project: Some("demo".into()),
+            tags: Vec::new(),
+            source: "test".into(),
+            importance: 5,
+            expires_at: None,
+            created_at: "2026-10-22T10:00:00+00:00".into(),
+            updated_at: "2026-10-22T10:00:00+00:00".into(),
+            metadata,
+            last_accessed_at: None,
+            access_count: 0,
+        }
+    }
+
+    #[test]
+    fn serialized_credentials_are_masked_with_a_pointer() {
+        // Unsealed (no key) and sealed credentials alike.
+        let clear = serde_json::to_value(credential("Admin demo : password: Hx9!kLm2pQ op://Soflution/demo", None)).unwrap();
+        assert!(!clear.to_string().contains("Hx9!kLm2pQ"));
+        assert_eq!(clear["secret"]["where"], "op://Soflution/demo");
+        assert_eq!(clear["secret"]["reveal"]["action"], "reveal_secret");
+
+        let sealed = serde_json::to_value(credential(
+            &masked_label("Admin demo : password: Hx9!kLm2pQ"),
+            Some(serde_json::json!({ "enc": encrypt("Admin demo : password: Hx9!kLm2pQ").unwrap(), "sealed": true, "location": "1Password, Demo" })),
+        ))
+        .unwrap();
+        assert!(sealed["metadata"].get("enc").is_none(), "the ciphertext stays inside");
+        assert_eq!(sealed["metadata"]["sealed"], true);
+        assert_eq!(sealed["secret"]["where"], "1Password, Demo");
+
+        let mut fact = credential("Planify uses SvelteKit", None);
+        fact.kind = "fact".into();
+        assert!(serde_json::to_value(fact).unwrap().get("secret").is_none());
+    }
+
+    #[test]
+    fn reads_return_the_label_and_unseal_needs_the_ciphertext() {
+        let plain = "password: Hx9!kLm2pQ";
+        let label = masked_label(plain);
+        let metadata = serde_json::json!({ "enc": encrypt(plain).unwrap() });
+        assert_eq!(read_content("credential", label.clone(), Some(&metadata)), label);
+        assert!(!read_content("credential", plain.into(), None).contains("Hx9!kLm2pQ"));
+        assert_eq!(read_content("fact", plain.into(), None), plain);
+        assert_eq!(unseal(&label, Some(&metadata)).as_deref(), Some(plain));
+    }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {

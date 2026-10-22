@@ -1,4 +1,4 @@
-use crate::db::{BulkItem, Database, MemoryScope, RecallMode};
+use crate::db::{BulkItem, Database, MemoryScope, RecallMode, RevealConfirm};
 use crate::protocol::{tool_error, tool_result};
 /// MCP Tool definitions and handlers for MemoryPilot v2.1.
 use serde_json::{json, Value};
@@ -307,7 +307,7 @@ fn all_tool_definitions() -> Value {
         },
         {
             "name": "update_memory",
-            "description": "Update memory content, kind, tags, importance, or expiration.",
+            "description": "Update memory content, kind, tags, importance, expiration, or where a credential's value lives.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -316,7 +316,8 @@ fn all_tool_definitions() -> Value {
                     "kind": { "type": ["string","null"] },
                     "tags": { "type": ["array","null"], "items": { "type": "string" } },
                     "importance": { "type": ["integer","null"], "minimum": 1, "maximum": 5 },
-                    "expires_at": { "type": ["string","null"] }
+                    "expires_at": { "type": ["string","null"] },
+                    "location": { "type": ["string","null"], "description": "Where the value of a credential lives, e.g. \"1Password, Soflution Admin\" or an op:// reference" }
                 },
                 "required": ["id"]
             }
@@ -764,6 +765,18 @@ fn all_tool_definitions() -> Value {
             }
         },
         {
+            "name": "reveal_secret",
+            "description": "Return the value of a credential memory. Search, recall and get only show its masked label and where the value lives: prefer that location (1Password via op-sof). The user confirms each reveal in a dialog on their screen; every request is audited without the value. Use the value for the task at hand only, never write it to files, commits, logs or memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "reason": { "type": "string", "description": "Why the value is needed, shown to the user" }
+                },
+                "required": ["id", "reason"]
+            }
+        },
+        {
             "name": "repair_index",
             "description": "Resynchronise the full-text index with the memories table (orphan and missing rows). Also runs at startup.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -865,6 +878,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "verify_memory" => handle_verify_memory(db, args),
         "project_facts" => handle_project_facts(db, args),
         "resolve_memory" => handle_resolve_memory(db, args),
+        "reveal_secret" => handle_reveal_secret(db, args),
         "repair_index" => match db.repair_fts() {
             Ok((removed, added)) => tool_result(&format!("FTS index: {} orphan rows removed, {} missing rows added.", removed, added)),
             Err(e) => tool_error(&e),
@@ -1481,6 +1495,23 @@ fn handle_update(db: &Database, args: &Value) -> Value {
         .and_then(|v| v.as_i64())
         .map(|i| i as i32);
     let expires_at = args.get("expires_at").and_then(|v| v.as_str());
+    let metadata = match args.get("location").and_then(|v| v.as_str()).map(str::trim) {
+        Some(location) if !location.is_empty() => match db.get_memory(id) {
+            Ok(Some(memory)) => {
+                let mut metadata = memory.metadata.unwrap_or_else(|| json!({}));
+                match metadata.as_object_mut() {
+                    Some(object) => {
+                        object.insert("location".into(), json!(location));
+                    }
+                    None => metadata = json!({ "previous_metadata": metadata, "location": location }),
+                }
+                Some(metadata)
+            }
+            Ok(None) => return tool_error(&format!("Not found: {}", id)),
+            Err(e) => return tool_error(&e),
+        },
+        _ => None,
+    };
     match db.update_memory_full(
         id,
         content,
@@ -1488,7 +1519,7 @@ fn handle_update(db: &Database, args: &Value) -> Value {
         tags.as_deref(),
         importance,
         expires_at,
-        None,
+        metadata.as_ref(),
     ) {
         Ok(Some(mem)) => tool_result(&serde_json::to_string_pretty(&mem).unwrap()),
         Ok(None) => tool_error(&format!("Not found: {}", id)),
@@ -2250,6 +2281,29 @@ fn handle_resolve_memory(db: &Database, args: &Value) -> Value {
     match db.set_memory_status(id, status, commit, note) {
         Ok(Some(memory)) => tool_result(&format!("{} is now {}.", memory.id, status)),
         Ok(None) => tool_error(&format!("Not found: {}", id)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_reveal_secret(db: &Database, args: &Value) -> Value {
+    let Some(id) = args.get("id").and_then(|v| v.as_str()) else {
+        return tool_error("id required");
+    };
+    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    let confirm = match RevealConfirm::from_env() {
+        Ok(confirm) => confirm,
+        Err(e) => return tool_error(&e),
+    };
+    match db.reveal_secret(id, reason, confirm) {
+        Ok((memory, value)) => {
+            let output = json!({
+                "id": memory.id,
+                "label": memory.content,
+                "value": value,
+                "warning": "For this task only: never write it to files, commits, logs or memories.",
+            });
+            tool_result(&serde_json::to_string_pretty(&output).unwrap())
+        }
         Err(e) => tool_error(&e),
     }
 }

@@ -186,6 +186,7 @@ fn run_mcp_server() {
         }
     };
     tools::init_tools_profile(&db);
+    db::set_secret_reveal(std::env::var("MEMORYPILOT_SECRETS").is_ok_and(|v| v.trim() == "reveal"));
     match db.seal_credentials() {
         Ok(n) if n > 0 => eprintln!("[MemoryPilot] Sealed {} credential(s) at rest.", n),
         _ => {}
@@ -302,6 +303,7 @@ fn run_http_server(port: u16) {
         .map(|v| v == "on" || v == "1")
         .unwrap_or(false);
     db::set_secret_reveal(reveal);
+    db::set_remote_server(true);
     let db_arc = std::sync::Arc::new(db);
     http::start_http_server(db_arc, port);
 }

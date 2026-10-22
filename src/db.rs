@@ -40,11 +40,18 @@ mod supersede;
 #[path = "db/verification.rs"]
 mod verification;
 
-/// Whether sealed credentials are decrypted on read (default yes; the
-/// HTTP server turns it off unless MEMORYPILOT_HTTP_SECRETS=on).
+/// Whether sealed credentials are decrypted on read (default no:
+/// `MEMORYPILOT_SECRETS=reveal`, or `MEMORYPILOT_HTTP_SECRETS=on` over HTTP).
 pub fn set_secret_reveal(on: bool) {
     vault::set_reveal(on);
 }
+
+/// The HTTP server: reveal_secret is refused unless reveal is on.
+pub fn set_remote_server(on: bool) {
+    vault::set_remote(on);
+}
+
+pub use vault::RevealConfirm;
 
 /// Seal the credentials of an old backup file in place (no schema change).
 pub fn seal_backup_file(path: &std::path::Path) -> Result<usize, String> {
@@ -129,7 +136,8 @@ struct QueryIntent {
     technical: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Serialized by hand (db/vault.rs): credentials go out masked, with a pointer.
+#[derive(Debug, Clone, Deserialize)]
 pub struct Memory {
     pub id: String,
     pub content: String,
@@ -2334,10 +2342,13 @@ impl Database {
         // Check for near-duplicate
         if let Some(existing) = self.find_duplicate(content, canonical_project.as_deref())? {
             // Merge: update content if newer is longer, bump updated_at
+            // A credential is read masked: keeping it means not rewriting it.
             let new_content = if content.len() > existing.content.len() {
-                content
+                Some(content)
+            } else if existing.kind == "credential" {
+                None
             } else {
-                &existing.content
+                Some(existing.content.as_str())
             };
             let new_importance = importance.max(existing.importance);
             let mut merged_tags: Vec<String> = existing.tags.clone();
@@ -2350,7 +2361,7 @@ impl Database {
                 Self::merge_metadata(existing.metadata.as_ref(), scoped_metadata.as_ref());
             let updated = self.update_memory_full(
                 &existing.id,
-                Some(new_content),
+                new_content,
                 forced_credential.then_some("credential"),
                 Some(&merged_tags),
                 Some(new_importance),
@@ -2439,24 +2450,49 @@ impl Database {
         expires_at: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> Result<Option<Memory>, String> {
-        let existing = match self.get_memory(id)? {
+        let mut existing = match self.get_memory(id)? {
             Some(m) => m,
             None => return Ok(None),
         };
+        if existing.kind == "credential" {
+            // Reads are masked: work on what is stored, never on the masked copy.
+            existing.content = self
+                .conn
+                .query_row("SELECT content FROM memories WHERE id=?1", params![id], |r| r.get(0))
+                .map_err(|e| format!("Update read: {}", e))?;
+        }
+        let sealed = existing.kind == "credential" && existing.content.starts_with(vault::SEAL_PREFIX);
+        if let (Some(text), true) = (content, existing.kind == "credential") {
+            let masked = text.contains("••••");
+            // Sealed: a 🔒 label edit keeps the ciphertext. Not sealed: the stored text is the secret.
+            let loses_secret = if sealed {
+                masked && !text.starts_with(vault::SEAL_PREFIX)
+            } else {
+                masked || text.starts_with(vault::SEAL_PREFIX)
+            };
+            if loses_secret {
+                return Err(format!(
+                    "Memory {} is a credential and this text is its masked copy (••••): saving it would replace the secret with the mask. Send the full text with the real values{}.",
+                    id,
+                    if sealed { ", or keep the 🔒 prefix to edit the label only" } else { "" }
+                ));
+            }
+        }
         let now = Utc::now().to_rfc3339();
-        let new_content = content.unwrap_or(&existing.content);
         let requested_kind = kind.unwrap_or(&existing.kind);
+        if existing.kind == "credential" && requested_kind != "credential" && content.is_none() {
+            // Reads would then return the value: that is a reveal without confirmation.
+            return Err(format!(
+                "Memory {} is a credential: changing its kind alone would expose its value. Send the new text with it (reveal_secret first if needed, the user confirms).",
+                id
+            ));
+        }
+        let new_content = content.unwrap_or(existing.content.as_str());
         let new_kind = if requested_kind != "credential" && vault::contains_secret_value(new_content) {
             "credential"
         } else {
             requested_kind
         };
-        if existing.kind == "credential" && new_kind != "credential" && existing.content.starts_with(vault::SEAL_PREFIX) {
-            return Err(format!(
-                "Memory {} is a sealed credential that cannot be decrypted here: reclassifying it would lose the secret",
-                id
-            ));
-        }
         let new_tags = tags
             .map(|t| t.to_vec())
             .unwrap_or_else(|| existing.tags.clone());
@@ -2468,6 +2504,22 @@ impl Database {
             existing.expires_at.clone()
         };
         let mut new_metadata = metadata.cloned().or_else(|| existing.metadata.clone());
+        if new_kind == "credential" && metadata.is_some() {
+            // Replacing the metadata must not drop the ciphertext of the secret.
+            if let Some(old) = existing.metadata.as_ref().and_then(|m| m.as_object()) {
+                let target = new_metadata.get_or_insert_with(|| serde_json::json!({}));
+                if !target.is_object() {
+                    *target = serde_json::json!({ "previous_metadata": target.clone() });
+                }
+                if let Some(object) = target.as_object_mut() {
+                    for key in ["enc", "sealed"] {
+                        if let Some(value) = old.get(key) {
+                            object.insert(key.into(), value.clone());
+                        }
+                    }
+                }
+            }
+        }
         if new_kind != "credential" {
             // No longer a credential: drop the ciphertext of the old secret.
             if let Some(object) = new_metadata.as_mut().and_then(|m| m.as_object_mut()) {
@@ -2537,7 +2589,7 @@ impl Database {
             access_count: existing.access_count,
         };
         let _ = self.rebuild_links(&mem);
-        // Reads decrypt credentials, so any rewrite just stored the secret in clear: seal again.
+        // A credential rewritten with its real values is stored in clear: seal it now.
         if new_kind == "credential" {
             self.seal_credentials()?;
         }
@@ -5371,6 +5423,18 @@ impl Database {
             }
         }
 
+        let secrets = vault::secret_references(
+            hint_results
+                .iter()
+                .map(|r| &r.memory)
+                .chain(&critical)
+                .chain(&pinned_memories)
+                .chain(&scope_memories)
+                .chain(&proj_memories)
+                .chain(&prefs)
+                .chain(&patterns)
+                .chain(&decisions),
+        );
         if compact {
             let mut lines = Vec::new();
             lines.push(format!(
@@ -5425,6 +5489,13 @@ impl Database {
                 let gp_short = crate::text::preview(gp, 500);
                 lines.push(format!("--- global_prompt ---\n{}", gp_short));
             }
+            if let Some(listed) = secrets.as_ref().and_then(|s| s["items"].as_array()) {
+                let refs: Vec<String> = listed
+                    .iter()
+                    .map(|item| format!("{} → {} (reveal_secret id={})", item["label"].as_str().unwrap_or(""), item["where"].as_str().unwrap_or(""), item["id"].as_str().unwrap_or("")))
+                    .collect();
+                lines.push(format!("--- secrets (values never shown) ---\n{}", refs.join("\n")));
+            }
             return Ok(serde_json::json!({
                 "status": "recalled",
                 "mode": mode.as_str(),
@@ -5461,6 +5532,9 @@ impl Database {
             "decisions": decisions.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
             "global_prompt": global_prompt.as_deref().unwrap_or(""),
         });
+        if let (Some(secrets), Some(object)) = (secrets, response.as_object_mut()) {
+            object.insert("secrets".into(), secrets);
+        }
 
         if explain {
             response.as_object_mut().map(|object| {
@@ -5644,12 +5718,13 @@ fn row_to_memory(row: &rusqlite::Row) -> Memory {
     let meta_str: Option<String> = row.get(8).unwrap_or(None);
     let metadata: Option<serde_json::Value> = meta_str.and_then(|s| serde_json::from_str(&s).ok());
     let raw_content: String = row.get(1).unwrap_or_default();
-    // Sealed credentials are decrypted transparently (see db/vault.rs).
-    let content = vault::unseal_content(&raw_content, metadata.as_ref()).unwrap_or(raw_content);
+    let kind: String = row.get(2).unwrap_or_default();
+    // Credentials are read masked (see db/vault.rs).
+    let content = vault::read_content(&kind, raw_content, metadata.as_ref());
     Memory {
         id: row.get(0).unwrap_or_default(),
         content,
-        kind: row.get(2).unwrap_or_default(),
+        kind,
         project: row.get(3).unwrap_or(None),
         tags,
         source: row.get(5).unwrap_or_default(),
@@ -5972,7 +6047,25 @@ mod tests {
             db.update_memory_full(&mem.id, None, None, Some(&["compte".to_string()]), Some(4), None, None)
                 .expect("update");
             assert!(!stored(&db).contains(secret), "an update must not write the secret back in clear");
-            assert!(db.get_memory(&mem.id).expect("get").expect("mem").content.contains(secret));
+            assert!(!db.get_memory(&mem.id).expect("get").expect("mem").content.contains(secret), "reads stay masked");
+            let reveal = |db: &Database| db.reveal_secret(&mem.id, "test", super::RevealConfirm::None).expect("reveal").1;
+            assert!(reveal(&db).contains(secret));
+
+            // Replacing the metadata keeps the ciphertext.
+            db.update_memory_full(&mem.id, None, None, None, None, None, Some(&serde_json::json!({ "location": "1Password, Démo" })))
+                .expect("metadata update");
+            assert!(reveal(&db).contains(secret), "a metadata update must not lose the secret");
+            // Editing the label (🔒 kept) keeps the secret.
+            let label = format!("{}Compte démo, rotation prévue : demo@example.com / password: ••••", super::vault::SEAL_PREFIX);
+            db.update_memory_full(&mem.id, Some(&label), None, None, None, None, None).expect("label edit");
+            assert!(reveal(&db).contains(secret));
+            // Writing the masked text back without the 🔒 would replace the secret by the mask.
+            let masked_back = "Compte démo : demo@example.com / password: ••••";
+            assert!(db.update_memory_full(&mem.id, Some(masked_back), None, None, None, None, None).is_err());
+            assert!(reveal(&db).contains(secret));
+            // Changing the kind alone would let reads return the value.
+            assert!(db.update_memory_full(&mem.id, None, Some("fact"), None, None, None, None).is_err());
+            assert!(!db.get_memory(&mem.id).expect("get").expect("mem").content.contains(secret));
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -6037,7 +6130,8 @@ mod tests {
             let safe_text = serde_json::to_string(&safe).expect("safe json");
             let full_text = serde_json::to_string(&full).expect("full json");
             assert!(!safe_text.contains("sk_live_secret"));
-            assert!(full_text.contains("sk_live_secret"));
+            assert!(!full_text.contains("sk_live_secret"), "full mode shows the credential, never its value");
+            assert!(full_text.contains("reveal_secret"), "full mode points to the value");
         }
         cleanup_db_files(&path);
     }
