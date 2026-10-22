@@ -147,20 +147,21 @@ pub fn run_with_timeout(
         .env("GH_PROMPT_DISABLED", "1")
         .env("NO_COLOR", "1");
     let mut child = command.spawn().ok()?;
-    if let Some(input) = stdin {
-        let mut pipe = child.stdin.take()?;
-        if pipe.write_all(input.as_bytes()).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-    }
+    // Read and write at the same time: a child that answers while it reads
+    // would block on a full stdout pipe while we block on its full stdin.
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut text = String::new();
         let _ = stdout.read_to_string(&mut text);
         text
     });
+    if let Some(input) = stdin {
+        let mut pipe = child.stdin.take()?;
+        let input = input.to_string();
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(input.as_bytes());
+        });
+    }
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -719,6 +720,13 @@ pub fn closed_references(data: &Value, text: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_input_and_output_do_not_deadlock() {
+        let input = "x".repeat(2_000_000);
+        let output = run_with_timeout(Command::new("cat"), Some(&input), Duration::from_secs(10)).expect("cat output");
+        assert_eq!(output.len(), input.len());
+    }
 
     /// Needs a logged-in `gh`: `cargo test live_github -- --ignored --nocapture`.
     #[test]
