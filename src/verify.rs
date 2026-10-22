@@ -224,7 +224,7 @@ pub fn parse_subject(subject: &str) -> (Option<String>, Option<String>) {
     (Some(kind.to_string()), scope)
 }
 
-fn git(repo: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)

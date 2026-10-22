@@ -156,6 +156,10 @@ pub fn project_facts(repo: &Path) -> Option<Arc<ProjectFacts>> {
         key.push('|');
         key.push_str(&modified(&path));
     }
+    for refs in [".git/packed-refs", ".git/refs/tags"] {
+        key.push('|');
+        key.push_str(&modified(&repo.join(refs)));
+    }
     if let Ok(guard) = cache().lock() {
         if let Some((cached_key, facts)) = guard.get(repo) {
             if *cached_key == key {
@@ -236,6 +240,9 @@ fn compute(repo: &Path, snapshot: &RepoSnapshot, manifests: &[&String]) -> Proje
     if !migrations.is_empty() {
         full.insert("supabase_migrations".into(), json!(migrations));
     }
+    if let Some(release) = release(repo, &snapshot.files) {
+        full.insert("release".into(), release);
+    }
     let routes: Vec<Value> = sveltekit_dirs
         .iter()
         .filter_map(|dir| sveltekit_routes(&snapshot.files, dir))
@@ -250,6 +257,31 @@ fn compute(repo: &Path, snapshot: &RepoSnapshot, manifests: &[&String]) -> Proje
         compact,
         dependencies,
     }
+}
+
+/// Latest tag and the commits since it, plus release-please versions.
+fn release(repo: &Path, files: &[String]) -> Option<Value> {
+    let mut release = Map::new();
+    if let Some(tag) = verify::git(repo, &["describe", "--tags", "--abbrev=0"]) {
+        let tag = tag.trim().to_string();
+        let range = format!("{tag}..HEAD");
+        if let Some(count) = verify::git(repo, &["rev-list", "--count", &range]) {
+            release.insert(
+                "commits_since_tag".into(),
+                json!(count.trim().parse::<u64>().ok()),
+            );
+        }
+        release.insert("latest_tag".into(), json!(tag));
+    }
+    if files.iter().any(|f| f == ".release-please-manifest.json") {
+        if let Some(manifest) = std::fs::read_to_string(repo.join(".release-please-manifest.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        {
+            release.insert("release_please".into(), manifest);
+        }
+    }
+    (!release.is_empty()).then_some(Value::Object(release))
 }
 
 fn record(dependencies: &mut Vec<Dependency>, file: &str, name: &str, version: &str) {
@@ -757,6 +789,17 @@ fn compact(full: &Value, dependencies: &[Dependency]) -> Value {
             })
             .collect();
         compact.insert("routes".into(), json!(lines));
+    }
+    if let Some(release) = full.get("release") {
+        if let Some(tag) = release["latest_tag"].as_str() {
+            compact.insert(
+                "release".into(),
+                json!(format!(
+                    "{} ({} commits since)",
+                    tag, release["commits_since_tag"]
+                )),
+            );
+        }
     }
     if let Some(last) = full.get("last_commit") {
         compact.insert(
