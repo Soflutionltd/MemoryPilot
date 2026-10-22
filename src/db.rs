@@ -4898,8 +4898,12 @@ impl Database {
         }
 
         let mut recent_content = Vec::new();
-        if let Ok(mut stmt) = self.conn.prepare("SELECT content FROM memories WHERE project = ?1 AND updated_at > datetime('now','-7 days') ORDER BY updated_at DESC LIMIT 10") {
-            if let Ok(rows) = stmt.query_map(params![&canonical_project], |r| r.get::<_, String>(0)) {
+        if let Ok(mut stmt) = self.conn.prepare("SELECT content, kind, metadata FROM memories WHERE project = ?1 AND updated_at > datetime('now','-7 days') ORDER BY updated_at DESC LIMIT 10") {
+            if let Ok(rows) = stmt.query_map(params![&canonical_project], |r| {
+                let metadata: Option<String> = r.get(2)?;
+                let metadata: Option<serde_json::Value> = metadata.and_then(|m| serde_json::from_str(&m).ok());
+                Ok(vault::read_content(&r.get::<_, String>(1)?, r.get(0)?, metadata.as_ref()))
+            }) {
                 for content in rows.flatten() {
                     if current_chars + content.len() > max_chars { break; }
                     current_chars += content.len();
