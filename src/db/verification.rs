@@ -171,6 +171,9 @@ impl Database {
     /// nothing to report (no repository, nothing cited changed). With
     /// `detail`, always answers and lists more commits.
     pub fn verification(&self, memory: &Memory, detail: bool) -> Option<Value> {
+        if !detail && !self.verification_enabled() {
+            return None;
+        }
         if SKIP_KINDS.contains(&memory.kind.as_str()) {
             return detail
                 .then(|| json!({ "status": "not_applicable", "reason": "kind not verified" }));
