@@ -682,6 +682,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_older_framework_version_than_the_repository_is_contradicted() {
+        let (fixture, db, project) = fixture("contradicted");
+        commit_file(
+            &fixture.repo,
+            "package.json",
+            r#"{"name":"demo","devDependencies":{"tailwindcss":"^4.1.0","svelte":"^5.2.0"}}"#,
+            "feat(web): tailwind 4",
+            "2026-10-02T10:00:00+00:00",
+        );
+        let stale = add(
+            &db,
+            &project,
+            "Le site utilise Tailwind 3 et Svelte 5.",
+            "fact",
+            "2026-10-03T09:00:00+00:00",
+        );
+        let plan = add(
+            &db,
+            &project,
+            "Ne pas passer à Tailwind 5 avant la sortie stable.",
+            "decision",
+            "2026-10-03T09:00:00+00:00",
+        );
+        let history = add(
+            &db,
+            &project,
+            "Passage à Tailwind 3 terminé.",
+            "milestone",
+            "2026-10-03T09:00:00+00:00",
+        );
+
+        let verification = db
+            .verification(&db.get_memory(&stale).unwrap().unwrap(), false)
+            .expect("reported");
+        assert_eq!(verification["status"], "contradicted");
+        assert_eq!(verification["claims"][0]["repo"], "tailwindcss ^4.1.0");
+        assert!(db
+            .verification(&db.get_memory(&plan).unwrap().unwrap(), false)
+            .is_none());
+        assert!(db
+            .verification(&db.get_memory(&history).unwrap().unwrap(), false)
+            .is_none());
+
+        let facts = db.project_facts(&project).expect("facts");
+        assert_eq!(
+            facts["packages"][0]["dependencies"]["tailwindcss"],
+            "^4.1.0"
+        );
+        assert_eq!(
+            db.compact_project_facts(&project).unwrap()["stack"][0],
+            "svelte ^5.2.0"
+        );
+    }
+
     fn memory(kind: &str, content: &str) -> crate::db::Memory {
         crate::db::Memory {
             id: "m".into(),
