@@ -48,8 +48,16 @@ fn load_or_create_key() -> Option<[u8; 32]> {
     if std::env::var("MEMORYPILOT_VAULT").map(|v| v == "off").unwrap_or(false) {
         return None;
     }
-    if let Ok(found) = get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
-        return decode_key(&String::from_utf8_lossy(&found));
+    // errSecItemNotFound: the only case where a new key may be created. A
+    // refused or failed read must never replace the key that sealed the data.
+    const ITEM_NOT_FOUND: i32 = -25300;
+    match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        Ok(found) => return decode_key(&String::from_utf8_lossy(&found)),
+        Err(error) if error.code() == ITEM_NOT_FOUND => {}
+        Err(error) => {
+            eprintln!("[MemoryPilot] Vault: Keychain read failed ({}), key left untouched.", error.code());
+            return None;
+        }
     }
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let encoded = B64.encode(key);
@@ -65,8 +73,9 @@ fn load_or_create_key() -> Option<[u8; 32]> {
         return None;
     }
     let path = dirs::home_dir()?.join(".MemoryPilot").join("credentials.key");
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        return decode_key(&text);
+    if path.exists() {
+        // Never replace an existing key file, even an unreadable one.
+        return decode_key(&std::fs::read_to_string(&path).ok()?);
     }
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     std::fs::write(&path, B64.encode(key)).ok()?;
