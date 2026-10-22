@@ -739,6 +739,17 @@ fn all_tool_definitions() -> Value {
             }
         },
         {
+            "name": "project_facts",
+            "description": "What the project's repository says about itself right now, computed on demand and never stored: package manifests and dependency versions (package.json, Cargo.toml, pubspec.yaml), Cloudflare config (wrangler), cf-orchestrator deploy targets, Supabase migrations, SvelteKit routes, last commit. Trust it over memories when they disagree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string" },
+                    "working_dir": { "type": "string" }
+                }
+            }
+        },
+        {
             "name": "resolve_memory",
             "description": "Record the lifecycle of a bug, problem or todo: open, resolved or verified, with the commit that fixed it and a note. Resolved and verified bugs leave the project brain; open clears a previous resolution.",
             "inputSchema": {
@@ -852,6 +863,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "supersede_outdated" => handle_supersede(db, args),
         "unsupersede" => handle_unsupersede(db, args),
         "verify_memory" => handle_verify_memory(db, args),
+        "project_facts" => handle_project_facts(db, args),
         "resolve_memory" => handle_resolve_memory(db, args),
         "repair_index" => match db.repair_fts() {
             Ok((removed, added)) => tool_result(&format!("FTS index: {} orphan rows removed, {} missing rows added.", removed, added)),
@@ -974,6 +986,13 @@ fn handle_recall(db: &Database, args: &Value) -> Value {
                                 object.insert("episodes".into(), json!(episodes));
                             }
                         }
+                    }
+                }
+            }
+            if let Some(project) = detected_project_from_args(db, args) {
+                if let Some(facts) = db.compact_project_facts(&project) {
+                    if let Some(object) = ctx.as_object_mut() {
+                        object.insert("project_facts".into(), facts);
                     }
                 }
             }
@@ -2232,5 +2251,18 @@ fn handle_resolve_memory(db: &Database, args: &Value) -> Value {
         Ok(Some(memory)) => tool_result(&format!("{} is now {}.", memory.id, status)),
         Ok(None) => tool_error(&format!("Not found: {}", id)),
         Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_project_facts(db: &Database, args: &Value) -> Value {
+    let Some(project) = detected_project_from_args(db, args) else {
+        return tool_error("project or working_dir required");
+    };
+    match db.project_facts(&project) {
+        Some(facts) => tool_result(&serde_json::to_string_pretty(&facts).unwrap()),
+        None => tool_error(&format!(
+            "No Git repository registered for project {}: register_project with its path first.",
+            project
+        )),
     }
 }

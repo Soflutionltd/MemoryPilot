@@ -8,6 +8,7 @@ mod code_chunker;
 mod db;
 mod diversity;
 mod embedding;
+mod facts;
 mod fts;
 mod gc;
 mod graph;

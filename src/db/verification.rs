@@ -18,6 +18,16 @@ use super::{Database, Memory};
 use crate::verify::{self, Commit};
 
 const ACTIONABLE_KINDS: &[&str] = &["bug", "problem", "todo"];
+/// Kinds that state how things are now; milestones and bugs describe the past.
+const CURRENT_STATE_KINDS: &[&str] = &[
+    "fact",
+    "decision",
+    "architecture",
+    "pattern",
+    "note",
+    "skill",
+    "snippet",
+];
 /// Kinds that may describe an open problem in prose ("faille non corrigée").
 const PROSE_KINDS: &[&str] = &["fact", "note", "decision", "pattern"];
 const SKIP_KINDS: &[&str] = &["credential", "transcript"];
@@ -252,6 +262,11 @@ impl Database {
                 ));
             }
         }
+        if CURRENT_STATE_KINDS.contains(&memory.kind.as_str()) {
+            if let Some(contradicted) = contradiction_report(memory, &repo) {
+                return Some(contradicted);
+            }
+        }
         if !touching.is_empty() {
             return Some(report(
                 "changed_since",
@@ -274,6 +289,28 @@ impl Database {
             value["repo"] = json!(repo.to_string_lossy());
             value
         })
+    }
+
+    /// Facts computed from the project's repository (full detail).
+    pub fn project_facts(&self, project: &str) -> Option<Value> {
+        let project = Self::canonical_project_name(project)?;
+        let repo = self.project_repo(&project)?;
+        crate::facts::project_facts(&repo).map(|facts| facts.full.clone())
+    }
+
+    /// The few lines of repository facts shown by recall and the project brain.
+    pub fn compact_project_facts(&self, project: &str) -> Option<Value> {
+        if !self.verification_enabled() {
+            return None;
+        }
+        let project = Self::canonical_project_name(project)?;
+        let repo = self.project_repo(&project)?;
+        let facts = crate::facts::project_facts(&repo)?;
+        let empty = facts
+            .compact
+            .as_object()
+            .is_none_or(|object| object.is_empty());
+        (!empty).then(|| facts.compact.clone())
     }
 
     /// Adds `verification` to every memory object (`id` + `content` + `kind`)
@@ -392,6 +429,30 @@ fn headline(content: &str) -> &str {
         Some((index, _)) => &content[..index],
         None => content,
     }
+}
+
+fn contradiction_report(memory: &Memory, repo: &std::path::Path) -> Option<Value> {
+    let facts = crate::facts::project_facts(repo)?;
+    let found = crate::facts::contradictions(&memory.content, &facts.dependencies);
+    if found.is_empty() {
+        return None;
+    }
+    let claims: Vec<Value> = found
+        .iter()
+        .map(|c| {
+            json!({
+                "claim": c.claim,
+                "repo": format!("{} {}", c.package, c.actual),
+                "file": c.file,
+            })
+        })
+        .collect();
+    Some(json!({
+        "status": "contradicted",
+        "since": memory.created_at,
+        "claims": claims,
+        "hint": "The repository now uses a different version than this memory states: trust the repository, then update or supersede the memory.",
+    }))
 }
 
 fn memory_id(object: &Map<String, Value>) -> Option<String> {

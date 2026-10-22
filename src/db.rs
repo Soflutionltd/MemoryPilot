@@ -4878,9 +4878,24 @@ impl Database {
             }
         }
 
+        let derived_facts = self.compact_project_facts(&canonical_project);
+
         if compact {
             let mut lines = Vec::new();
             lines.push(format!("# {} brain", canonical_project));
+            if let Some(facts) = derived_facts.as_ref().and_then(|f| f.as_object()) {
+                for (key, value) in facts {
+                    let text = match value {
+                        serde_json::Value::Array(items) => items
+                            .iter()
+                            .filter_map(|item| item.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                        other => other.as_str().unwrap_or_default().to_string(),
+                    };
+                    lines.push(format!("REPO {}: {}", key.to_uppercase(), text));
+                }
+            }
             if !tech_stack.is_empty() {
                 lines.push(format!("STACK: {}", tech_stack.join(", ")));
             }
@@ -4907,7 +4922,7 @@ impl Database {
             );
         }
 
-        Ok(serde_json::json!({
+        let mut brain = serde_json::json!({
             "project": canonical_project,
             "tech_stack": tech_stack,
             "core_architecture": arch_content,
@@ -4917,7 +4932,11 @@ impl Database {
             "key_components": key_components,
             "team_members": team_members,
             "approx_tokens_used": current_chars / 4
-        }))
+        });
+        if let Some(facts) = derived_facts {
+            brain["derived_facts"] = facts;
+        }
+        Ok(brain)
     }
 
     pub fn get_project_context(
