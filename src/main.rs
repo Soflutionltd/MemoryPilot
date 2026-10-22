@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 mod ann;
 mod chunker;
+mod connectors;
 mod code_chunker;
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.

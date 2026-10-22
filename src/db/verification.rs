@@ -228,6 +228,20 @@ impl Database {
         let limit = if detail { 10 } else { 3 };
 
         if is_open_problem(memory) {
+            let closed = crate::connectors::cached(&repo)
+                .map(|data| crate::connectors::closed_references(&data, &memory.content))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|reference| closed_after(reference, &memory.created_at))
+                .collect::<Vec<_>>();
+            if !closed.is_empty() {
+                return Some(json!({
+                    "status": "likely_resolved",
+                    "since": memory.created_at,
+                    "github": closed,
+                    "hint": "A pull request or issue this memory references is merged or closed: it is probably resolved. Check, then record it with resolve_memory.",
+                }));
+            }
             // A prose memory cites files for several topics: only a bug,
             // problem or todo is about the files it cites.
             let fixes: Vec<&Commit> = if ACTIONABLE_KINDS.contains(&memory.kind.as_str()) {
@@ -291,11 +305,17 @@ impl Database {
         })
     }
 
-    /// Facts computed from the project's repository (full detail).
+    /// Facts computed from the project's repository, plus what the
+    /// connectors (GitHub, deploys, Supabase production) report, fetched now
+    /// when the cached copy is stale.
     pub fn project_facts(&self, project: &str) -> Option<Value> {
         let project = Self::canonical_project_name(project)?;
         let repo = self.project_repo(&project)?;
-        crate::facts::project_facts(&repo).map(|facts| facts.full.clone())
+        let mut full = crate::facts::project_facts(&repo)?.full.clone();
+        if let Some(data) = crate::connectors::fresh(&repo) {
+            merge_connectors(&mut full, &data);
+        }
+        Some(full)
     }
 
     /// The few lines of repository facts shown by recall and the project brain.
@@ -306,11 +326,16 @@ impl Database {
         let project = Self::canonical_project_name(project)?;
         let repo = self.project_repo(&project)?;
         let facts = crate::facts::project_facts(&repo)?;
-        let empty = facts
-            .compact
-            .as_object()
-            .is_none_or(|object| object.is_empty());
-        (!empty).then(|| facts.compact.clone())
+        let mut compact = facts.compact.clone();
+        if let Some(data) = crate::connectors::cached(&repo) {
+            if let (Some(target), Value::Object(extra)) =
+                (compact.as_object_mut(), crate::connectors::compact(&data))
+            {
+                target.extend(extra);
+            }
+        }
+        let empty = compact.as_object().is_none_or(|object| object.is_empty());
+        (!empty).then_some(compact)
     }
 
     /// Adds `verification` to every memory object (`id` + `content` + `kind`)
@@ -431,6 +456,33 @@ fn headline(content: &str) -> &str {
     }
 }
 
+/// A pull request merged before the memory was written says nothing about it.
+fn closed_after(reference: &Value, created_at: &str) -> bool {
+    let parse = |text: &str| chrono::DateTime::parse_from_rfc3339(text).ok();
+    match (reference["at"].as_str().and_then(parse), parse(created_at)) {
+        (Some(closed), Some(created)) => closed >= created,
+        _ => false,
+    }
+}
+
+fn merge_connectors(full: &mut Value, data: &Value) {
+    let Some(target) = full.as_object_mut() else {
+        return;
+    };
+    for key in ["github", "deploys", "supabase"] {
+        if let Some(value) = data.get(key) {
+            let mut value = value.clone();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("states");
+            }
+            target.insert(key.into(), value);
+        }
+    }
+    if let Some(at) = data.get("fetched_at") {
+        target.insert("connectors_fetched_at".into(), at.clone());
+    }
+}
+
 fn contradiction_report(memory: &Memory, repo: &std::path::Path) -> Option<Value> {
     let facts = crate::facts::project_facts(repo)?;
     let found = crate::facts::contradictions(&memory.content, &facts.dependencies);
@@ -467,6 +519,24 @@ fn memory_id(object: &Map<String, Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::db::{Database, MemoryScope};
+
+    #[test]
+    fn only_references_closed_after_the_memory_count() {
+        let reference =
+            serde_json::json!({ "ref": "pr #16", "state": "MERGED", "at": "2026-09-29T23:35:16Z" });
+        assert!(super::closed_after(
+            &reference,
+            "2026-09-20T10:00:00.000000+00:00"
+        ));
+        assert!(!super::closed_after(
+            &reference,
+            "2026-10-22T11:05:15.307829+00:00"
+        ));
+        assert!(!super::closed_after(
+            &serde_json::json!({ "at": null }),
+            "2026-09-20T10:00:00+00:00"
+        ));
+    }
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use uuid::Uuid;
