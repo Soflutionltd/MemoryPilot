@@ -62,12 +62,24 @@ impl FileWatcherState {
     }
 }
 
+/// The Git work tree containing `dir`, unless it is the home directory or
+/// the filesystem root: MCP clients often start the server from there, and
+/// watching a whole disk recursively is never what is wanted.
+fn watch_root(dir: &str) -> Option<PathBuf> {
+    let root = crate::verify::repo_root(dir)?;
+    let home = dirs::home_dir();
+    if root.parent().is_none() || home.as_deref() == Some(root.as_path()) {
+        return None;
+    }
+    Some(root)
+}
+
 pub fn start_watcher(dir: &str) -> Option<Arc<Mutex<FileWatcherState>>> {
+    let dir_path = watch_root(dir)?;
+    let dir_str = dir_path.to_string_lossy().into_owned();
     let state = Arc::new(Mutex::new(FileWatcherState::new()));
     let state_clone = state.clone();
     let state_linter = state.clone();
-    let dir_path = PathBuf::from(dir);
-    let dir_str = dir.to_string();
 
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel();
