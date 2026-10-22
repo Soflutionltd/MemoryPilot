@@ -279,6 +279,10 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## Unreleased
+
+- **Memories checked against Git**: a memory that cites files of its project's repository is compared with the commits made after it. Search, recall and get add a `verification` object when there is something to say: `likely_resolved` (a later fix commit touches the files a bug cites), `possibly_resolved` (a later fix commit reads like the bug's resolution), `changed_since` (the cited files changed), or the recorded `resolved` / `verified`. Mass commits (over 40 files) and docs, tests or chores are ignored. Git is read on demand and cached per HEAD: nothing is copied into the database. `verify_memory` gives the detail, `resolve_memory` records open / resolved / verified with the fixing commit; resolved bugs leave the project brain. `MEMORYPILOT_VERIFY=off` turns it off.
+
 ## What's new in v4.10
 
 - **Outdated memories hidden automatically**: when a newer memory says "X instead of Y" about an older one, or is a newer status of the same thing, the older one is tagged `superseded` (kept, readable by id, `unsupersede` to undo) and no longer surfaces in recall or search.

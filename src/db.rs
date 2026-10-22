@@ -37,6 +37,8 @@ mod vault;
 mod conflicts;
 #[path = "db/supersede.rs"]
 mod supersede;
+#[path = "db/verification.rs"]
+mod verification;
 
 /// Whether sealed credentials are decrypted on read (default yes; the
 /// HTTP server turns it off unless MEMORYPILOT_HTTP_SECRETS=on).
@@ -4820,11 +4822,27 @@ impl Database {
         let (bugs, _) = self.list_memories(Some(&canonical_project), Some("bug"), None, 10, 0)?;
         let mut bug_content = Vec::new();
         for m in bugs {
-            if current_chars + m.content.len() > max_chars {
+            if verification::is_closed(&m) {
+                continue;
+            }
+            let line = match self.verification(&m, false) {
+                Some(found) if found["status"] == "likely_resolved" || found["status"] == "possibly_resolved" => {
+                    let commit = &found["commits"][0];
+                    format!(
+                        "[{} by {} {}] {}",
+                        found["status"].as_str().unwrap_or_default(),
+                        commit["sha"].as_str().unwrap_or_default(),
+                        commit["subject"].as_str().unwrap_or_default(),
+                        m.content
+                    )
+                }
+                _ => m.content,
+            };
+            if current_chars + line.len() > max_chars {
                 break;
             }
-            current_chars += m.content.len();
-            bug_content.push(m.content);
+            current_chars += line.len();
+            bug_content.push(line);
         }
 
         let mut recent_content = Vec::new();

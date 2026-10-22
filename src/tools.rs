@@ -730,6 +730,29 @@ fn all_tool_definitions() -> Value {
             }
         },
         {
+            "name": "verify_memory",
+            "description": "Check a memory against the Git history of its project: commits made after it that touch the files it cites, or fix commits that read like its resolution. Statuses: resolved / verified (recorded), likely_resolved, possibly_resolved, changed_since, no_change_found, unverifiable.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "resolve_memory",
+            "description": "Record the lifecycle of a bug, problem or todo: open, resolved or verified, with the commit that fixed it and a note. Resolved and verified bugs leave the project brain; open clears a previous resolution.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["open", "resolved", "verified"] },
+                    "commit": { "type": "string", "description": "SHA of the fixing commit" },
+                    "note": { "type": "string" }
+                },
+                "required": ["id", "status"]
+            }
+        },
+        {
             "name": "repair_index",
             "description": "Resynchronise the full-text index with the memories table (orphan and missing rows). Also runs at startup.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -828,6 +851,8 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "find_conflicts" => handle_find_conflicts(db, args),
         "supersede_outdated" => handle_supersede(db, args),
         "unsupersede" => handle_unsupersede(db, args),
+        "verify_memory" => handle_verify_memory(db, args),
+        "resolve_memory" => handle_resolve_memory(db, args),
         "repair_index" => match db.repair_fts() {
             Ok((removed, added)) => tool_result(&format!("FTS index: {} orphan rows removed, {} missing rows added.", removed, added)),
             Err(e) => tool_error(&e),
@@ -952,6 +977,7 @@ fn handle_recall(db: &Database, args: &Value) -> Value {
                     }
                 }
             }
+            db.annotate_verification(&mut ctx);
             tool_result(&serde_json::to_string_pretty(&ctx).unwrap())
         }
         Err(e) => tool_error(&e),
@@ -1394,6 +1420,7 @@ fn handle_search(db: &Database, args: &Value) -> Value {
                     }
                 }
             }
+            db.annotate_verification(&mut output);
             tool_result(&serde_json::to_string_pretty(&output).unwrap())
         }
         Err(e) => tool_error(&e),
@@ -1406,7 +1433,14 @@ fn handle_get(db: &Database, args: &Value) -> Value {
         _ => return tool_error("id required"),
     };
     match db.get_memory(id) {
-        Ok(Some(mem)) => tool_result(&serde_json::to_string_pretty(&mem).unwrap()),
+        Ok(Some(mem)) => {
+            let verification = db.verification(&mem, false);
+            let mut output = json!(mem);
+            if let Some(verification) = verification {
+                output["verification"] = verification;
+            }
+            tool_result(&serde_json::to_string_pretty(&output).unwrap())
+        }
         Ok(None) => tool_error(&format!("Not found: {}", id)),
         Err(e) => tool_error(&e),
     }
@@ -2166,6 +2200,37 @@ fn handle_unsupersede(db: &Database, args: &Value) -> Value {
     match db.unsupersede(id) {
         Ok(true) => tool_result(&format!("{} is visible again.", id)),
         Ok(false) => tool_error(&format!("{} is not superseded.", id)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_verify_memory(db: &Database, args: &Value) -> Value {
+    let Some(id) = args.get("id").and_then(|v| v.as_str()) else {
+        return tool_error("id required");
+    };
+    match db.get_memory(id) {
+        Ok(Some(memory)) => {
+            let verification = db.verification(&memory, true).unwrap_or(Value::Null);
+            let output = json!({ "id": memory.id, "kind": memory.kind, "project": memory.project, "verification": verification });
+            tool_result(&serde_json::to_string_pretty(&output).unwrap())
+        }
+        Ok(None) => tool_error(&format!("Not found: {}", id)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_resolve_memory(db: &Database, args: &Value) -> Value {
+    let Some(id) = args.get("id").and_then(|v| v.as_str()) else {
+        return tool_error("id required");
+    };
+    let Some(status) = args.get("status").and_then(|v| v.as_str()) else {
+        return tool_error("status required (open, resolved or verified)");
+    };
+    let commit = args.get("commit").and_then(|v| v.as_str());
+    let note = args.get("note").and_then(|v| v.as_str());
+    match db.set_memory_status(id, status, commit, note) {
+        Ok(Some(memory)) => tool_result(&format!("{} is now {}.", memory.id, status)),
+        Ok(None) => tool_error(&format!("Not found: {}", id)),
         Err(e) => tool_error(&e),
     }
 }

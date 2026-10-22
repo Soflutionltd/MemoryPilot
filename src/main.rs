@@ -29,6 +29,7 @@ mod stemming;
 mod telemetry;
 mod text;
 mod tools;
+mod verify;
 mod watcher;
 mod working_memory;
 
