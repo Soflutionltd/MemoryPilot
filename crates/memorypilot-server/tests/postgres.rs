@@ -9,7 +9,7 @@ use memorypilot_core::db::{
     add_memory_to, fr_scenarios, hybrid_search, score_fr_queries, update_memory_in, Memory,
     MemoryScope, MemoryStore, RecallStore, WriteOutcome,
 };
-use memorypilot_server::{PgAdmin, PgConnection, PgStore, Scope};
+use memorypilot_server::{PgAdmin, PgConnection, PgPool, PgStore, Scope};
 use uuid::Uuid;
 
 const NEEDS_POSTGRES: &str = "needs Postgres with pgvector: scripts/test-postgres.sh";
@@ -74,6 +74,58 @@ fn tls_connections_verify_the_certificate_and_the_host_name() {
     assert!(
         !admin().session_encrypted().expect("ssl"),
         "a plain connection is not encrypted"
+    );
+}
+
+/// A pooled session moves from one tenant to another without carrying
+/// anything over, survives a failed statement, and the pool keeps at most
+/// `max_idle` sessions.
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn pooled_sessions_move_between_tenants_safely() {
+    let mut admin = admin();
+    let (first, second) = (new_space(&mut admin), new_space(&mut admin));
+    let pool = PgPool::new(plain(), 2);
+    {
+        let store = PgStore::from_pool(&pool, first).expect("first tenant");
+        store
+            .insert_memory(&memory("p-1", "Pool sessions are reused"), "h-1")
+            .expect("insert");
+        assert!(
+            store
+                .insert_memory(&memory("p-1", "Same id again"), "h-1")
+                .is_err(),
+            "duplicate id refused"
+        );
+        assert_eq!(
+            store.memory_count(None),
+            1,
+            "the session still works after a failed statement"
+        );
+    }
+    assert_eq!(pool.idle_sessions(), 1, "the session went back to the pool");
+    {
+        let store = PgStore::from_pool(&pool, second).expect("second tenant on the reused session");
+        assert_eq!(pool.idle_sessions(), 0);
+        assert_eq!(store.memory_count(None), 0, "nothing of the first tenant");
+        assert!(store.fetch_memory("p-1").expect("fetch").is_none());
+    }
+    let held: Vec<PgStore> = (0..3)
+        .map(|_| PgStore::from_pool(&pool, first).expect("store"))
+        .collect();
+    assert!(held.iter().all(|store| store.memory_count(None) == 1));
+    drop(held);
+    assert_eq!(pool.idle_sessions(), 2, "at most max_idle sessions kept");
+    assert!(
+        PgStore::from_pool(
+            &pool,
+            Scope {
+                space: second.space,
+                ..first
+            }
+        )
+        .is_err(),
+        "scope still checked"
     );
 }
 

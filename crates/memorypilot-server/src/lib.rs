@@ -9,11 +9,13 @@
 
 mod connection;
 mod pg_store;
+mod pool;
 mod schema;
 pub mod text;
 
 pub use connection::PgConnection;
 pub use pg_store::{PgAdmin, PgStore, Scope};
+pub use pool::PgPool;
 
 pub(crate) fn pg_error(error: postgres::Error) -> String {
     pg_message(&error)

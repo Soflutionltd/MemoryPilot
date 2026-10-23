@@ -13,13 +13,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+use crate::pool::{app_session, ExpiryClock, PooledClient};
 use crate::text::{fts5_to_tsquery, index_text};
-use crate::{pg_error, PgConnection};
+use crate::{pg_error, PgConnection, PgPool};
 
 /// Where a store reads and writes. With a subject it sees that end user's
 /// memories plus the ones shared by the space, and writes as that end
 /// user; without one it sees and writes only the space's shared memories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Scope {
     pub tenant: Uuid,
     pub space: Uuid,
@@ -167,26 +168,33 @@ impl PgAdmin {
 }
 
 pub struct PgStore {
-    client: Mutex<Client>,
+    client: Mutex<PooledClient>,
     scope: Scope,
-    last_expiry: Mutex<Option<std::time::Instant>>,
+    expiries: ExpiryClock,
 }
 
 /// Expired memories are dropped at most this often per store.
 const EXPIRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl PgStore {
-    /// Connects as `memorypilot_app` (the login role must be a member) and
-    /// checks that the space, and the subject when given, belong to the tenant.
+    /// Opens its own session as `memorypilot_app` (the login role must be
+    /// a member) and checks that the space, and the subject when given,
+    /// belong to the tenant.
     pub fn connect(connection: &PgConnection, scope: Scope) -> Result<Self, String> {
-        let mut client = connection.connect()?;
-        client
-            .batch_execute("SET ROLE memorypilot_app")
-            .map_err(pg_error)?;
+        let client = PooledClient::standalone(app_session(connection)?);
+        Self::bind(client, scope, ExpiryClock::default())
+    }
+
+    /// Same, on a session of `pool` that goes back to it when the store is dropped.
+    pub fn from_pool(pool: &PgPool, scope: Scope) -> Result<Self, String> {
+        Self::bind(pool.checkout()?, scope, pool.expiries())
+    }
+
+    fn bind(client: PooledClient, scope: Scope, expiries: ExpiryClock) -> Result<Self, String> {
         let store = Self {
             client: Mutex::new(client),
             scope,
-            last_expiry: Mutex::new(None),
+            expiries,
         };
         let known: bool = store
             .query(
@@ -1134,13 +1142,16 @@ impl RecallStore for PgStore {
 
     fn expire_memories(&self) {
         {
-            let Ok(mut last) = self.last_expiry.lock() else {
+            let Ok(mut clock) = self.expiries.lock() else {
                 return;
             };
-            if last.is_some_and(|at| at.elapsed() < EXPIRY_INTERVAL) {
+            if clock
+                .get(&self.scope)
+                .is_some_and(|at| at.elapsed() < EXPIRY_INTERVAL)
+            {
                 return;
             }
-            *last = Some(std::time::Instant::now());
+            clock.insert(self.scope, std::time::Instant::now());
         }
         let expired = self.execute(
             // Visible, not only owned: an expired shared memory must not
