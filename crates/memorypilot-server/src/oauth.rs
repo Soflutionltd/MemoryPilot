@@ -204,7 +204,8 @@ fn authorize(api: &Api, request: &Request) -> Response {
         Ok(code) => code,
         Err(error) => return Response::from(crate::api::Failure::from_store(error)),
     };
-    let mut location = format!("{}?code={}", redirect_uri, code);
+    let separator = if redirect_uri.contains('?') { '&' } else { '?' };
+    let mut location = format!("{}{}code={}", redirect_uri, separator, code);
     if let Some(state) = params.get("state") {
         location.push_str("&state=");
         location.push_str(&urlencoding(state));
