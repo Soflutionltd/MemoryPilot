@@ -91,7 +91,10 @@ mod recall;
 mod store;
 #[path = "db/sqlite_store.rs"]
 mod sqlite_store;
-pub use store::MemoryStore;
+#[cfg(any(test, feature = "store-contract"))]
+#[path = "db/store_contract.rs"]
+pub mod store_contract;
+pub use store::{MemoryStore, RecallStore};
 
 use embed_worker::{
     cached_embed_text, embed_db_path, queue_access_update, queue_embedding_job,

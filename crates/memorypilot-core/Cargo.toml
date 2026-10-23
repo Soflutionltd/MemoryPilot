@@ -42,6 +42,11 @@ base64 = "0.22"
 toml = "1.1.8"
 yaml-rust2 = "0.13.0"
 
+[features]
+# Exposes `db::store_contract`, the checks other `MemoryStore` and
+# `RecallStore` implementations run in their own tests.
+store-contract = []
+
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 

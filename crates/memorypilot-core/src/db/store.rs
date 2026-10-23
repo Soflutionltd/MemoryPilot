@@ -7,6 +7,7 @@
 //! contract.
 
 use super::Memory;
+use std::collections::{HashMap, HashSet};
 
 pub trait MemoryStore {
     /// Stores a new memory and its full-text entry. `content_hash` is the
@@ -46,4 +47,88 @@ pub trait MemoryStore {
 
     /// The most recently updated memories of a project (`None`: no project).
     fn recent_memories(&self, project: Option<&str>, limit: usize) -> Result<Vec<Memory>, String>;
+}
+
+/// What search, ranking and recall read. The pipeline (fusion, boosts,
+/// reranking, budgets) stays in `Database`; a store answers these queries
+/// with its own indexes (FTS5 and an in-process ANN for SQLite, tsvector and
+/// pgvector for Postgres).
+pub trait RecallStore {
+    /// Memories matching a full-text query in FTS5 syntax (as built by
+    /// `fts::fts5_query_variants`: quoted prefix terms, a phrase or `NEAR`),
+    /// best match first, at most `limit`. Other stores translate it.
+    fn full_text_candidates(
+        &self,
+        fts_query: &str,
+        project: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Memory>, String>;
+
+    /// Memories of the project and kind (restricted to `only_ids` when
+    /// given), each with its similarity to `query_embedding`, or `None`
+    /// while its embedding is not computed yet.
+    fn vector_candidates(
+        &self,
+        query_embedding: &[f32],
+        project: Option<&str>,
+        kind: Option<&str>,
+        only_ids: Option<&[String]>,
+    ) -> Result<Vec<(Memory, Option<f32>)>, String>;
+
+    /// Nearest memory ids from an approximate index, best first. Empty when
+    /// the store has none.
+    fn approximate_neighbours(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f32)>;
+
+    /// Number of vectors in the approximate index (0 without one).
+    fn approximate_index_len(&self) -> usize;
+
+    /// (target id, relation) of the links pointing at these memories; every
+    /// link with `None`.
+    fn link_relations(&self, target_ids: Option<&[&String]>) -> Vec<(String, String)>;
+
+    /// Terms related to a lowercased word: objects of current triples
+    /// whose subject it is (up to 3), subjects of those whose object it is
+    /// (up to 3), then entities that co-occur with it (up to 4).
+    fn related_terms(&self, word: &str) -> Vec<String>;
+
+    /// Pairs of these memories connected by a link or a shared non-date entity.
+    fn adjacency_pairs(&self, ids: &[String]) -> HashSet<(String, String)>;
+
+    /// Per memory: (current, closed) knowledge triples it is the source of.
+    fn triple_counts(&self, ids: &[&String]) -> HashMap<String, (i64, i64)>;
+
+    /// Stored vectors of these memories, decoded; memories without one
+    /// (or with another dimension) are absent.
+    fn memory_vectors(&self, ids: &[&String]) -> HashMap<String, Vec<f32>>;
+
+    /// Raw `date` entity values of these memories.
+    fn memory_date_values(&self, ids: &[&String]) -> HashMap<String, Vec<String>>;
+
+    /// These memory ids plus those reachable within `depth` link hops
+    /// (either direction).
+    fn graph_neighbours(&self, ids: &[String], depth: u32) -> Result<HashSet<String>, String>;
+
+    /// Root path recorded for a project.
+    fn project_path(&self, project: &str) -> Option<String>;
+
+    /// Distinct entity values of these kinds in a project's memories.
+    fn project_entities(&self, project: &str, kinds: &[&str], limit: usize) -> Vec<String>;
+
+    /// Contents (credentials masked) of a project's memories updated in the
+    /// last `days` days, newest first.
+    fn recent_project_contents(&self, project: &str, days: u32, limit: usize) -> Vec<String>;
+
+    /// Unexpired memories of importance `min_importance` or more, most
+    /// important then most recent first.
+    fn important_memories(&self, min_importance: i32, limit: usize) -> Result<Vec<Memory>, String>;
+
+    /// Memories tagged pinned, most important then most recent first.
+    fn pinned_memories(&self) -> Result<Vec<Memory>, String>;
+
+    /// Number of memories, of one kind when given.
+    fn memory_count(&self, kind: Option<&str>) -> i64;
+
+    /// Number of known projects.
+    fn project_count(&self) -> i64;
 }

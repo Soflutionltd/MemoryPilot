@@ -90,53 +90,14 @@ impl Database {
                 std::collections::HashSet<String>,
              >|
              -> Result<usize, String> {
-                let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
-                let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-                    vec![Box::new(fts_query.to_string())];
-
-                if let Some(p) = canonical_project.as_deref() {
-                    conditions.push(format!("m.project = ?{}", param_values.len() + 1));
-                    param_values.push(Box::new(p.to_string()));
-                }
-                if let Some(k) = kind {
-                    conditions.push(format!("m.kind = ?{}", param_values.len() + 1));
-                    param_values.push(Box::new(k.to_string()));
-                }
-
-                let where_clause = conditions.join(" AND ");
-                let sql = format!(
-                    "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,m.last_accessed_at,m.access_count,
-                            bm25(memories_fts, 8.0, 5.0, 2.0, 4.0) AS bm25_score
-                     FROM memories_fts f
-                     JOIN memories m ON m.rowid = f.rowid
-                     WHERE {}
-                     ORDER BY bm25_score ASC
-                     LIMIT {}", where_clause, limit_rows);
-
-                let mut stmt = match self.conn.prepare(&sql) {
-                    Ok(stmt) => stmt,
-                    Err(error) if return_err_on_failure => {
-                        return Err(format!("Search prepare: {}", error));
-                    }
-                    Err(_) => return Ok(0),
-                };
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    param_values.iter().map(|p| p.as_ref()).collect();
-                let rows = match stmt.query_map(param_refs.as_slice(), |row| {
-                    let mem = row_to_memory(row);
-                    let bm25: f64 = row.get(13)?;
-                    Ok((mem, bm25))
-                }) {
+                let rows = match self.full_text_candidates(fts_query, canonical_project.as_deref(), kind, limit_rows) {
                     Ok(rows) => rows,
-                    Err(error) if return_err_on_failure => {
-                        return Err(format!("Search: {}", error));
-                    }
+                    Err(error) if return_err_on_failure => return Err(error),
                     Err(_) => return Ok(0),
                 };
 
                 let mut produced = 0usize;
-                for (rank_index, row) in rows.flatten().enumerate() {
-                    let (mem, _) = row;
+                for (rank_index, mem) in rows.into_iter().enumerate() {
                     let rank = rank_index + 1 + rank_offset;
                     let entry = bm25_results.entry(mem.id.clone()).or_insert(rank);
                     *entry = (*entry).min(rank);
@@ -184,11 +145,7 @@ impl Database {
         // 2a. Optional ANN pre-filter. Marks candidates with `vector_ann` so the
         // explain output exposes which retrieval stage surfaced them. The full
         // scan below stays authoritative for ranking — ANN only annotates here.
-        let ann_hits: Vec<(String, f32)> = self
-            .ann
-            .as_ref()
-            .map(|index| index.search(&query_emb, 200))
-            .unwrap_or_default();
+        let ann_hits: Vec<(String, f32)> = self.approximate_neighbours(&query_emb, 200);
         for (id, _) in &ann_hits {
             candidate_sources
                 .entry(id.clone())
@@ -202,11 +159,8 @@ impl Database {
         // score it. Below the threshold the full scan is kept (provably no recall
         // regression).
         const ANN_BYPASS_THRESHOLD: usize = 5_000;
-        let ann_active_for_bypass = self
-            .ann
-            .as_ref()
-            .map(|index| index.len() >= ANN_BYPASS_THRESHOLD && !ann_hits.is_empty())
-            .unwrap_or(false);
+        let ann_active_for_bypass =
+            self.approximate_index_len() >= ANN_BYPASS_THRESHOLD && !ann_hits.is_empty();
         let restricted_ids: Option<Vec<String>> = if ann_active_for_bypass {
             let mut ids: std::collections::HashSet<String> = bm25_results.keys().cloned().collect();
             for (id, _) in &ann_hits {
@@ -224,59 +178,22 @@ impl Database {
 
         let vector_start = std::time::Instant::now();
         let vector_results = {
-            let mut vec_conditions = Vec::new();
-            let mut vec_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            if let Some(p) = canonical_project.as_deref() {
-                vec_conditions.push(format!("project = ?{}", vec_params.len() + 1));
-                vec_params.push(Box::new(p.to_string()));
-            }
-            if let Some(k) = kind {
-                vec_conditions.push(format!("kind = ?{}", vec_params.len() + 1));
-                vec_params.push(Box::new(k.to_string()));
-            }
-            if let Some(ids) = restricted_ids.as_ref() {
-                let placeholders = (1..=ids.len())
-                    .map(|i| format!("?{}", vec_params.len() + i))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                vec_conditions.push(format!("id IN ({})", placeholders));
-                for id in ids {
-                    vec_params.push(Box::new(id.clone()));
-                }
-            }
-            let vec_where = if vec_conditions.is_empty() {
-                String::new()
-            } else {
-                format!("WHERE {}", vec_conditions.join(" AND "))
-            };
-            let vec_sql = format!("SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count,embedding FROM memories {}", vec_where);
-            let rconn = self.read_conn();
-            let mut stmt2 = rconn
-                .prepare(&vec_sql)
-                .map_err(|e| format!("Vector Search: {}", e))?;
-            let vec_refs: Vec<&dyn rusqlite::types::ToSql> =
-                vec_params.iter().map(|p| p.as_ref()).collect();
-
+            let rows = self.vector_candidates(
+                &query_emb,
+                canonical_project.as_deref(),
+                kind,
+                restricted_ids.as_deref(),
+            )?;
             let mut vector_scores: Vec<(String, f32)> = Vec::new();
-            let rows2 = stmt2
-                .query_map(vec_refs.as_slice(), |row| {
-                    let mem = row_to_memory(row);
-                    let blob: Option<Vec<u8>> = row.get(13)?;
-                    Ok((mem, blob))
-                })
-                .map_err(|e| format!("Vector Search error: {}", e))?;
-
-            for r in rows2.flatten() {
-                let (mem, blob) = r;
+            for (mem, similarity) in rows {
                 all_memories
                     .entry(mem.id.clone())
                     .or_insert_with(|| mem.clone());
-                if let Some(b) = blob {
+                if let Some(score) = similarity {
                     candidate_sources
                         .entry(mem.id.clone())
                         .or_default()
                         .insert("vector".to_string());
-                    let score = crate::embedding::similarity_with_blob(&query_emb, &b);
                     vector_scores.push((mem.id, score));
                 } else {
                     candidate_sources
@@ -533,7 +450,7 @@ impl Database {
             .last()
             .map(|weakest| weakest.score * 0.5)
             .unwrap_or(0.0);
-        if let Ok(related_ids) = crate::graph::traverse_graph(&self.conn, &top_ids, 1) {
+        if let Ok(related_ids) = self.graph_neighbours(&top_ids, 1) {
             let mut added = 0usize;
             for rel_id in related_ids {
                 if added >= GRAPH_EXPANSION_MAX {

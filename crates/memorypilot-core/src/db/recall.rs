@@ -99,12 +99,7 @@ impl Database {
         // 3. Auto-scan project root GLOBAL_PROMPT.md
         let proj_dir: Option<String> = working_dir.map(Self::infer_project_root).or_else(|| {
             let proj_name = canonical_project.as_deref()?;
-            let mut stmt = self
-                .conn
-                .prepare("SELECT path FROM projects WHERE name=?1")
-                .ok()?;
-            stmt.query_row(params![proj_name], |r| r.get::<_, String>(0))
-                .ok()
+            self.project_path(proj_name)
         });
 
         if let Some(dir) = proj_dir {
@@ -200,15 +195,11 @@ impl Database {
         let mut current_chars = 0;
 
         let mut tech_stack = Vec::new();
-        if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT entity_value FROM memory_entities e JOIN memories m ON e.memory_id = m.id WHERE m.project = ?1 AND e.entity_kind = 'tech' LIMIT 15") {
-            if let Ok(rows) = stmt.query_map(params![&canonical_project], |r| r.get::<_, String>(0)) {
-                for tech in rows.flatten() {
-                    let len = tech.len();
-                    if current_chars + len > max_chars { break; }
-                    current_chars += len;
-                    tech_stack.push(tech);
-                }
-            }
+        for tech in self.project_entities(&canonical_project, &["tech"], 15) {
+            let len = tech.len();
+            if current_chars + len > max_chars { break; }
+            current_chars += len;
+            tech_stack.push(tech);
         }
 
         let (core_arch, _) =
@@ -260,41 +251,22 @@ impl Database {
         }
 
         let mut recent_content = Vec::new();
-        if let Ok(mut stmt) = self.conn.prepare("SELECT content, kind, metadata FROM memories WHERE project = ?1 AND updated_at > datetime('now','-7 days') ORDER BY updated_at DESC LIMIT 10") {
-            if let Ok(rows) = stmt.query_map(params![&canonical_project], |r| {
-                let metadata: Option<String> = r.get(2)?;
-                let metadata: Option<serde_json::Value> = metadata.and_then(|m| serde_json::from_str(&m).ok());
-                Ok(vault::read_content(&r.get::<_, String>(1)?, r.get(0)?, metadata.as_ref()))
-            }) {
-                for content in rows.flatten() {
-                    if current_chars + content.len() > max_chars { break; }
-                    current_chars += content.len();
-                    recent_content.push(content);
-                }
-            }
+        for content in self.recent_project_contents(&canonical_project, 7, 10) {
+            if current_chars + content.len() > max_chars { break; }
+            current_chars += content.len();
+            recent_content.push(content);
         }
 
         let mut key_components = Vec::new();
-        if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT entity_value FROM memory_entities e JOIN memories m ON e.memory_id = m.id WHERE m.project = ?1 AND e.entity_kind IN ('component', 'file') LIMIT 15") {
-            if let Ok(rows) = stmt.query_map(params![&canonical_project], |r| r.get::<_, String>(0)) {
-                for comp in rows.flatten() {
-                    let len = comp.len();
-                    if current_chars + len > max_chars { break; }
-                    current_chars += len;
-                    key_components.push(comp);
-                }
-            }
+        for comp in self.project_entities(&canonical_project, &["component", "file"], 15) {
+            let len = comp.len();
+            if current_chars + len > max_chars { break; }
+            current_chars += len;
+            key_components.push(comp);
         }
 
         // Team members (person entities)
-        let mut team_members = Vec::new();
-        if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT entity_value FROM memory_entities e JOIN memories m ON e.memory_id = m.id WHERE m.project = ?1 AND e.entity_kind = 'person' LIMIT 20") {
-            if let Ok(rows) = stmt.query_map(params![&canonical_project], |r| r.get::<_, String>(0)) {
-                for person in rows.flatten() {
-                    team_members.push(person);
-                }
-            }
-        }
+        let team_members = self.project_entities(&canonical_project, &["person"], 20);
 
         let derived_facts = self.compact_project_facts(&canonical_project);
 
@@ -485,13 +457,7 @@ impl Database {
         let credentials_hidden = if mode.includes_credentials() {
             0
         } else {
-            self.conn
-                .query_row(
-                    "SELECT COUNT(*) FROM memories WHERE kind = 'credential'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
+            self.memory_count(Some("credential"))
         };
 
         // Helper: check budget and dedup, returns true if item should be included
@@ -535,17 +501,9 @@ impl Database {
         // 2. Critical memories next, but keep them project-safe and hint-aware.
         let critical: Vec<Memory> = {
             let has_contextual_hint = !hint_terms.is_empty();
-            let mut stmt = self.conn.prepare(
-                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count \
-                 FROM memories WHERE importance >= 4 \
-                 AND (expires_at IS NULL OR expires_at > datetime('now')) \
-                 ORDER BY importance DESC, updated_at DESC LIMIT 30"
-            ).map_err(|e| format!("Recall critical: {}", e))?;
-            let rows = stmt
-                .query_map([], |r| Ok(row_to_memory(r)))
-                .map_err(|e| format!("Recall critical: {}", e))?;
-            let mut candidates: Vec<(i32, Memory)> = rows
-                .flatten()
+            let mut candidates: Vec<(i32, Memory)> = self
+                .important_memories(4, 30)?
+                .into_iter()
                 .filter(|memory| Self::should_include_in_context(memory, mode))
                 .map(|memory| {
                     let lowered_content = memory.content.to_ascii_lowercase();
@@ -611,14 +569,9 @@ impl Database {
 
         // 1b. Pinned memories — always included regardless of score/hints
         let pinned_memories: Vec<Memory> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count \
-                 FROM memories WHERE tags LIKE '%pinned%' ORDER BY importance DESC, updated_at DESC"
-            ).map_err(|e| format!("Recall pinned: {}", e))?;
-            let result: Vec<Memory> = stmt
-                .query_map([], |r| Ok(row_to_memory(r)))
-                .map_err(|e| format!("Recall pinned: {}", e))?
-                .flatten()
+            let result: Vec<Memory> = self
+                .pinned_memories()?
+                .into_iter()
                 .filter(|m| Self::should_include_in_context(m, mode))
                 .filter(|m| budget_check!(&m.id, &m.content))
                 .collect();
@@ -700,14 +653,8 @@ impl Database {
         };
 
         // 7. Stats (cheap, always included)
-        let total: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-            .unwrap_or(0);
-        let projects_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
-            .unwrap_or(0);
+        let total: i64 = self.memory_count(None);
+        let projects_count: i64 = self.project_count();
         let project_context_memories_count = proj_memories.len();
 
         if explain {
