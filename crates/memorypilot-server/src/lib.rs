@@ -10,6 +10,7 @@
 pub mod api;
 mod auth;
 mod connection;
+mod embedder;
 mod mcp;
 mod pg_store;
 mod pool;
@@ -18,6 +19,7 @@ pub mod text;
 
 pub use auth::{ApiKey, ApiKeyInfo, NewApiKey, Permission};
 pub use connection::PgConnection;
+pub use embedder::embed_scopes;
 pub use pg_store::{PgAdmin, PgStore, Scope};
 pub use pool::PgPool;
 

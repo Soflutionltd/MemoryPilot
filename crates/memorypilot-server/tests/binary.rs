@@ -47,6 +47,7 @@ fn serve() -> Server {
         .arg("serve")
         .env("MEMORYPILOT_BIND", "127.0.0.1:0")
         .env("MEMORYPILOT_WORKERS", "2")
+        .env("MEMORYPILOT_EMBEDDER", "off")
         .stderr(Stdio::piped())
         .spawn()
         .expect("start the server");

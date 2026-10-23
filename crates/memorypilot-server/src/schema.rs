@@ -6,6 +6,7 @@ use postgres::Client;
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_tenancy.sql")),
     (2, include_str!("../migrations/0002_api_keys.sql")),
+    (3, include_str!("../migrations/0003_pending_embeddings.sql")),
 ];
 
 pub fn migrate(client: &mut Client) -> Result<Vec<i32>, String> {

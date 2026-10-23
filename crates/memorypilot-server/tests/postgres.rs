@@ -9,7 +9,7 @@ use memorypilot_core::db::{
     add_memory_to, fr_scenarios, hybrid_search, score_fr_queries, update_memory_in, Memory,
     MemoryScope, MemoryStore, RecallStore, WriteOutcome,
 };
-use memorypilot_server::{Permission, PgAdmin, PgConnection, PgPool, PgStore, Scope};
+use memorypilot_server::{embed_scopes, Permission, PgAdmin, PgConnection, PgPool, PgStore, Scope};
 use uuid::Uuid;
 
 const NEEDS_POSTGRES: &str = "needs Postgres with pgvector: scripts/test-postgres.sh";
@@ -1096,4 +1096,60 @@ fn row_level_security_alone_keeps_tenants_apart() {
         &[&owner_scope.tenant, &owner_scope.space],
     );
     assert!(forged.is_err(), "insert into another tenant is rejected");
+}
+
+/// The background embedder finds pending memories in every tenant and for
+/// every end user, and an edit queues a memory again.
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn pending_memories_of_every_tenant_get_embedded() {
+    let mut admin = admin();
+    let (first, second) = (new_space(&mut admin), new_space(&mut admin));
+    let alice = end_user(&mut admin, first, "alice");
+    add(
+        &store(first),
+        "e-1",
+        "Quarterly reports are due on the fifth",
+    );
+    add(&store(alice), "e-2", "Alice reviews the quarterly reports");
+    add(&store(second), "e-3", "Backups run at three in the morning");
+    let ours = |admin: &mut PgAdmin| -> Vec<Scope> {
+        let mut scopes: Vec<Scope> = admin
+            .pending_embedding_scopes(100_000)
+            .expect("pending")
+            .into_iter()
+            .filter(|scope| [first.tenant, second.tenant].contains(&scope.tenant))
+            .collect();
+        scopes.sort_by_key(|scope| (scope.tenant, scope.subject));
+        scopes
+    };
+    let pending = ours(&mut admin);
+    assert_eq!(pending.len(), 3, "{:?}", pending);
+    for scope in [first, alice, second] {
+        assert!(pending.contains(&scope), "{:?} is pending", scope);
+    }
+
+    let pool = PgPool::new(plain(), 2);
+    assert_eq!(embed_scopes(&pool, &pending, 32), 3);
+    assert!(ours(&mut admin).is_empty());
+    let id = "e-2".to_string();
+    assert_eq!(
+        store(alice).memory_vectors(&[&id]).len(),
+        1,
+        "the vector is stored"
+    );
+
+    update_memory_in(
+        &store(first),
+        "e-1",
+        Some("Quarterly reports are due on the tenth"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("update")
+    .expect("found");
+    assert_eq!(ours(&mut admin), vec![first], "an edit queues it again");
 }

@@ -4,10 +4,10 @@
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use memorypilot_server::api::{Api, Request, Response, MAX_BODY_BYTES};
-use memorypilot_server::{Permission, PgAdmin, PgConnection, PgPool};
+use memorypilot_server::{embed_scopes, Permission, PgAdmin, PgConnection, PgPool};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -30,6 +30,8 @@ Environment:
   MEMORYPILOT_PG_TLS      on (default: certificate and host name verified) or off (local only)
   MEMORYPILOT_BIND        address to listen on (default 127.0.0.1:8080)
   MEMORYPILOT_WORKERS     concurrent requests (default 8)
+  MEMORYPILOT_EMBEDDER    on (default) or off: compute vectors in the background
+                          (keep it on in one replica at least)
   MEMORYPILOT_ALLOWED_ORIGINS
                           browser origins allowed on /mcp, comma separated (default none)
 
@@ -39,6 +41,10 @@ Authorization: Bearer <key>. X-MemoryPilot-Subject: <end user id> acts for one e
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
 const DEFAULT_WORKERS: usize = 8;
 const MAX_WORKERS: usize = 256;
+const EMBED_BATCH: usize = 32;
+const EMBED_SCOPES_PER_PASS: usize = 100;
+const EMBED_IDLE: Duration = Duration::from_secs(2);
+const EMBED_RETRY: Duration = Duration::from_secs(30);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -158,7 +164,21 @@ fn serve() -> Result<(), String> {
                 .collect()
         })
         .unwrap_or_default();
-    let api = Api::new(PgPool::new(connection, workers)).with_allowed_origins(origins);
+    let pool = PgPool::new(connection.clone(), workers);
+    match env("MEMORYPILOT_EMBEDDER").as_deref() {
+        None | Some("on") => {
+            let pool = pool.clone();
+            std::thread::spawn(move || embed_in_background(connection, pool));
+        }
+        Some("off") => eprintln!("[memorypilot-server] background embedding off"),
+        Some(other) => {
+            return Err(format!(
+                "MEMORYPILOT_EMBEDDER is on or off, not '{}'",
+                other
+            ))
+        }
+    }
+    let api = Api::new(pool).with_allowed_origins(origins);
     let server = Arc::new(
         tiny_http::Server::http(&bind).map_err(|e| format!("cannot listen on {}: {}", bind, e))?,
     );
@@ -184,6 +204,31 @@ fn serve() -> Result<(), String> {
             .map_err(|_| "a worker stopped unexpectedly".to_string())?;
     }
     Ok(())
+}
+
+/// Embeds pending memories of every tenant while there are some, then
+/// polls; reconnects after a failure.
+fn embed_in_background(connection: PgConnection, pool: PgPool) {
+    let mut admin: Option<PgAdmin> = None;
+    loop {
+        let pass = match admin.take() {
+            Some(session) => Ok(session),
+            None => PgAdmin::connect(&connection),
+        }
+        .and_then(|mut session| {
+            let scopes = session.pending_embedding_scopes(EMBED_SCOPES_PER_PASS)?;
+            admin = Some(session);
+            Ok(embed_scopes(&pool, &scopes, EMBED_BATCH))
+        });
+        match pass {
+            Ok(0) => std::thread::sleep(EMBED_IDLE),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("[memorypilot-server] background embedding: {}", error);
+                std::thread::sleep(EMBED_RETRY);
+            }
+        }
+    }
 }
 
 fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, Response> {

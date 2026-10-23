@@ -168,6 +168,25 @@ impl PgAdmin {
         Ok(row.get(0))
     }
 
+    /// Scopes (any tenant) holding memories without a vector yet.
+    pub fn pending_embedding_scopes(&mut self, limit: usize) -> Result<Vec<Scope>, String> {
+        Ok(self
+            .client
+            .query(
+                "SELECT DISTINCT tenant_id, space_id, subject_id FROM memories
+                 WHERE embedding IS NULL LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .map_err(pg_error)?
+            .iter()
+            .map(|row| Scope {
+                tenant: row.get(0),
+                space: row.get(1),
+                subject: row.get(2),
+            })
+            .collect())
+    }
+
     /// A new key for one space of `tenant`. The secret is in the answer only.
     pub fn create_api_key(
         &mut self,
