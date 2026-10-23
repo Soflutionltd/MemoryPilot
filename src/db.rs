@@ -53,6 +53,12 @@ pub fn set_remote_server(on: bool) {
 
 pub use vault::RevealConfirm;
 
+/// Put back a vault key (base64) after checking it opens every sealed credential.
+#[cfg(target_os = "macos")]
+pub fn restore_vault_key(encoded: &str, db_path: &std::path::Path) -> Result<(usize, usize), String> {
+    vault::restore_key(encoded, db_path)
+}
+
 /// Seal the credentials of an old backup file in place (no schema change).
 pub fn seal_backup_file(path: &std::path::Path) -> Result<usize, String> {
     vault::seal_file(path)

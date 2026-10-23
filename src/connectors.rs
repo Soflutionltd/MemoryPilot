@@ -181,7 +181,7 @@ pub fn run_with_timeout(
 
 /// MCP clients start the server with a minimal PATH: look where package
 /// managers install binaries too.
-fn find_binary(name: &str) -> Option<PathBuf> {
+pub fn find_binary(name: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();

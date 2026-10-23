@@ -116,12 +116,16 @@ fn encrypt(plain: &str) -> Option<String> {
 }
 
 pub(crate) fn decrypt(encoded: &str) -> Option<String> {
+    decrypt_with(key()?, encoded)
+}
+
+fn decrypt_with(key: &[u8; 32], encoded: &str) -> Option<String> {
     let blob = B64.decode(encoded).ok()?;
     if blob.len() < 24 {
         return None;
     }
     let (nonce, ct) = blob.split_at(24);
-    let cipher = XChaCha20Poly1305::new(key()?.into());
+    let cipher = XChaCha20Poly1305::new(key.into());
     let plain = cipher.decrypt(XNonce::from_slice(nonce), ct).ok()?;
     String::from_utf8(plain).ok()
 }
@@ -359,7 +363,9 @@ impl Database {
 
     /// The value of a credential, after the user said yes. Every request is
     /// written to ~/.MemoryPilot/logs/reveal-audit.log, without the value.
-    pub fn reveal_secret(&self, id: &str, reason: &str, confirm: RevealConfirm) -> Result<(Memory, String), String> {
+    /// The value comes from 1Password when the credential points there, else
+    /// from the local encrypted copy; the source is returned with it.
+    pub fn reveal_secret(&self, id: &str, reason: &str, confirm: RevealConfirm) -> Result<(Memory, String, &'static str), String> {
         let reason = reason.trim();
         if reason.is_empty() {
             return Err("reason required: say why the value is needed".into());
@@ -392,11 +398,19 @@ impl Database {
                 }
             }
         }
-        let value = self
-            .credential_clear_text(id)?
-            .ok_or_else(|| format!("Not found: {}", id))?;
+        let location = memory.metadata.as_ref().and_then(|m| m.get("location")).and_then(|v| v.as_str());
+        let from_onepassword = location
+            .filter(|l| l.starts_with("op://"))
+            .and_then(|reference| crate::onepassword::read(reference).ok());
+        let (value, source) = match from_onepassword {
+            Some(value) => (value, "1password"),
+            None => (
+                self.credential_clear_text(id)?.ok_or_else(|| format!("Not found: {}", id))?,
+                "memorypilot",
+            ),
+        };
         audit(&memory, reason, if confirm == RevealConfirm::Dialog { "revealed" } else { "revealed_unconfirmed" });
-        Ok((memory, value))
+        Ok((memory, value, source))
     }
 }
 
@@ -457,10 +471,16 @@ pub(crate) fn looks_secret(token: &str) -> bool {
 /// True when the text holds a secret VALUE (key, token, password), not
 /// merely talks about secrets ("secrets Cloudflare", "clé dans 1Password").
 pub(crate) fn contains_secret_value(content: &str) -> bool {
+    find_secret_value(content).is_some()
+}
+
+/// The first secret value of the text (best effort: the full text stays the reference).
+pub(crate) fn find_secret_value(content: &str) -> Option<String> {
     let tokens: Vec<&str> = content.split_whitespace().collect();
     for (index, token) in tokens.iter().enumerate() {
         if looks_secret(token) {
-            return true;
+            let core = token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c));
+            return Some(core.to_string());
         }
         let lower = token.to_lowercase();
         let word = lower.trim_matches(|c: char| !c.is_alphanumeric());
@@ -500,10 +520,10 @@ pub(crate) fn contains_secret_value(content: &str) -> bool {
         let mixed = core.chars().any(|c| c.is_ascii_digit() || PASSWORD_SYMBOLS.contains(&c))
             || (core.chars().any(|c| c.is_uppercase()) && core.chars().skip(1).any(|c| c.is_uppercase()) && core.chars().any(|c| c.is_lowercase()));
         if !is_reference && core.chars().count() >= 6 && (assigned || mixed) {
-            return true;
+            return Some(core.to_string());
         }
     }
-    false
+    None
 }
 
 /// Searchable label with secret-looking tokens masked.
@@ -697,6 +717,246 @@ impl Database {
     }
 }
 
+/// Puts back a vault key read on stdin (base64), after checking it opens
+/// every sealed credential. Returns (opened, sealed).
+#[cfg(target_os = "macos")]
+pub(crate) fn restore_key(encoded: &str, db_path: &std::path::Path) -> Result<(usize, usize), String> {
+    let key = decode_key(encoded).ok_or("not a base64 32-byte key")?;
+    let conn = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("open {}: {}", db_path.display(), e))?;
+    let mut stmt = conn
+        .prepare("SELECT metadata FROM memories WHERE kind = 'credential' AND metadata LIKE '%\"enc\"%'")
+        .map_err(|e| e.to_string())?;
+    let encs: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, Option<String>>(0))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .flatten()
+        .filter_map(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+        .filter_map(|m| m.get("enc").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    let opened = encs.iter().filter(|enc| decrypt_with(&key, enc).is_some()).count();
+    if encs.is_empty() || opened != encs.len() {
+        return Err(format!("this key opens {} of {} sealed credentials: Keychain left untouched", opened, encs.len()));
+    }
+    security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, B64.encode(key).as_bytes())
+        .map_err(|e| format!("Keychain write failed ({})", e.code()))?;
+    let check = security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Keychain read-back failed ({})", e.code()))?;
+    if decode_key(&String::from_utf8_lossy(&check)) != Some(key) {
+        return Err("Keychain read-back differs".into());
+    }
+    Ok((opened, encs.len()))
+}
+
+/// A recovered text belongs to a sealed row when it gives back the stored
+/// label: exactly, or with every visible word of an older label in order.
+/// A label cut at 220 characters may end with a truncated word.
+fn label_matches(stored: &str, clear: &str) -> bool {
+    if masked_label(clear) == stored {
+        return true;
+    }
+    let body = stored.trim_start_matches(SEAL_PREFIX);
+    let truncated = body.chars().count() >= 220;
+    let mut words = clear.split_whitespace();
+    let visible: Vec<&str> = body.split_whitespace().filter(|word| !word.contains('•')).collect();
+    let last = visible.len().saturating_sub(1);
+    !visible.is_empty()
+        && visible.iter().enumerate().all(|(index, word)| {
+            words.any(|w| w == *word || (truncated && index == last && w.starts_with(word)))
+        })
+}
+
+#[derive(Debug, Default)]
+pub struct Reseal {
+    pub resealed: usize,
+    /// Ids whose recovered text does not give back the stored label.
+    pub mismatched: Vec<String>,
+    /// Sealed credentials absent from the recovered set.
+    pub missing: Vec<String>,
+    /// Recovered ids that are not credentials of this database.
+    pub unknown: Vec<String>,
+}
+
+impl Database {
+    /// Re-encrypts with the current key the credentials recovered in clear
+    /// (id → text) after a key loss. Labels are kept; only `metadata.enc`
+    /// changes, and nothing is written unless every text matches its label.
+    /// Dry run unless `apply`.
+    pub fn reseal_recovered(
+        &self,
+        recovered: &std::collections::HashMap<String, String>,
+        apply: bool,
+    ) -> Result<Reseal, String> {
+        let rows: Vec<(String, String, Option<String>)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, content, metadata FROM memories WHERE kind = 'credential'")
+                .map_err(|e| format!("reseal prepare: {}", e))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| format!("reseal query: {}", e))?;
+            rows.flatten().collect()
+        };
+        let mut report = Reseal::default();
+        let mut updates: Vec<(String, String)> = Vec::new();
+        for (id, stored, metadata) in &rows {
+            let Some(clear) = recovered.get(id) else {
+                report.missing.push(id.clone());
+                continue;
+            };
+            if !label_matches(stored, clear) {
+                report.mismatched.push(id.clone());
+                continue;
+            }
+            if !apply {
+                report.resealed += 1;
+                continue;
+            }
+            let enc = encrypt(clear).ok_or("no encryption key available")?;
+            if decrypt(&enc).as_deref() != Some(clear.as_str()) {
+                return Err(format!("{}: ciphertext does not read back", id));
+            }
+            let mut meta: serde_json::Value = metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !meta.is_object() {
+                meta = serde_json::json!({ "previous_metadata": meta });
+            }
+            meta["enc"] = serde_json::Value::String(enc);
+            meta["sealed"] = serde_json::Value::Bool(true);
+            updates.push((id.clone(), serde_json::to_string(&meta).map_err(|e| e.to_string())?));
+        }
+        report.unknown = recovered
+            .keys()
+            .filter(|id| !rows.iter().any(|(row_id, _, _)| row_id == *id))
+            .cloned()
+            .collect();
+        if !apply {
+            return Ok(report);
+        }
+        if !report.mismatched.is_empty() || !report.unknown.is_empty() {
+            return Err(format!(
+                "{} text(s) do not match their label and {} id(s) are unknown: nothing written",
+                report.mismatched.len(),
+                report.unknown.len()
+            ));
+        }
+        let tx = self.conn.unchecked_transaction().map_err(|e| format!("reseal begin: {}", e))?;
+        for (id, meta_json) in &updates {
+            tx.execute("UPDATE memories SET metadata=?1 WHERE id=?2", params![meta_json, id])
+                .map_err(|e| format!("reseal update: {}", e))?;
+        }
+        tx.commit().map_err(|e| format!("reseal commit: {}", e))?;
+        report.resealed = updates.len();
+        Ok(report)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct OnePasswordSync {
+    /// "present", "created" or "to_create".
+    pub key: &'static str,
+    pub already: usize,
+    /// (id, op:// reference) of credentials whose value was already in 1Password.
+    pub linked: Vec<(String, String)>,
+    /// (id, masked label) of credentials copied into a new 1Password item.
+    pub created: Vec<(String, String)>,
+    pub failed: Vec<(String, String)>,
+}
+
+impl Database {
+    /// Points every credential to 1Password: an item about the same account
+    /// (title or URL host in the text) already holding its value is linked,
+    /// otherwise a new item (tag memorypilot-import) is created. The
+    /// vault key is backed up first. Nothing is deleted; dry run unless `apply`.
+    pub fn sync_to_onepassword(&self, apply: bool) -> Result<OnePasswordSync, String> {
+        use crate::onepassword as op;
+        let key = key().ok_or("no encryption key available: credentials cannot be read")?;
+        let items = op::vault_items()?;
+        let mut report = OnePasswordSync {
+            key: if op::find_title(&items, op::KEY_ITEM_TITLE).is_some() { "present" } else { "to_create" },
+            ..Default::default()
+        };
+        if apply && report.key == "to_create" {
+            let template = serde_json::json!({
+                "title": op::KEY_ITEM_TITLE,
+                "category": "PASSWORD",
+                "tags": ["memorypilot"],
+                "fields": [
+                    { "id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": B64.encode(key) },
+                    { "id": "notesPlain", "type": "STRING", "purpose": "NOTES", "label": "notesPlain",
+                      "value": format!("Clé XChaCha20-Poly1305 (base64) des identifiants MemoryPilot. Sur un nouveau Mac, la remettre dans le Trousseau : service {}, compte {}.", KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) }
+                ]
+            });
+            op::create_item(&template)?;
+            report.key = "created";
+        }
+        let ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM memories WHERE kind = 'credential' ORDER BY created_at")
+                .map_err(|e| format!("sync prepare: {}", e))?;
+            let rows = stmt.query_map([], |r| r.get(0)).map_err(|e| format!("sync query: {}", e))?;
+            rows.flatten().collect()
+        };
+        for id in ids {
+            let Some(memory) = self.get_memory(&id)? else { continue };
+            let location = memory.metadata.as_ref().and_then(|m| m.get("location")).and_then(|v| v.as_str());
+            if location.is_some_and(|l| l.starts_with("op://")) {
+                report.already += 1;
+                continue;
+            }
+            let clear = match self.credential_clear_text(&id) {
+                Ok(Some(clear)) => clear,
+                Ok(None) => continue,
+                Err(error) => {
+                    report.failed.push((id, error));
+                    continue;
+                }
+            };
+            let secret = find_secret_value(&clear);
+            let label = memory.content.trim_start_matches(SEAL_PREFIX).to_string();
+            let known = secret.as_deref().and_then(|value| op::find_value(&items, value, &clear));
+            let reference = match known {
+                Some(reference) => {
+                    report.linked.push((id.clone(), reference.clone()));
+                    reference
+                }
+                None => {
+                    report.created.push((id.clone(), label.clone()));
+                    if !apply {
+                        continue;
+                    }
+                    let title = format!(
+                        "{} · {}",
+                        memory.project.as_deref().unwrap_or("global"),
+                        label.chars().take(70).collect::<String>()
+                    );
+                    let (template, field) = op::item_template(&title, memory.project.as_deref(), &clear, secret.as_deref());
+                    match op::create_item(&template) {
+                        Ok(item_id) => op::reference(&item_id, field),
+                        Err(error) => {
+                            report.created.pop();
+                            report.failed.push((id, error));
+                            continue;
+                        }
+                    }
+                }
+            };
+            if apply {
+                let mut metadata = memory.metadata.clone().unwrap_or_else(|| serde_json::json!({}));
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert("location".into(), serde_json::json!(reference));
+                }
+                self.update_memory_full(&id, None, None, None, None, None, Some(&metadata))?;
+            }
+        }
+        Ok(report)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CredentialRepair {
     /// (id, new kind, masked label) of memories that held no secret value.
@@ -834,6 +1094,55 @@ mod tests {
         assert!(!read_content("credential", plain.into(), None).contains("Hx9!kLm2pQ"));
         assert_eq!(read_content("fact", plain.into(), None), plain);
         assert_eq!(unseal(&label, Some(&metadata)).as_deref(), Some(plain));
+    }
+
+    #[test]
+    fn recovered_text_must_give_back_its_label() {
+        let clear = "Admin demo : login admin@demo.fr password: Hx9!kLm2pQ";
+        assert!(label_matches(&masked_label(clear), clear));
+        assert!(label_matches("🔒 Admin demo : login •••• password: ••••", clear), "older label");
+        assert!(!label_matches(&masked_label(clear), "Admin autre : password: Hx9!kLm2pQ"));
+        assert!(!label_matches("🔒 •••• ••••", clear), "a label without visible words proves nothing");
+
+        let long = format!("{}VILLART", "mot ".repeat(54));
+        let cut = format!("{}{}VILLAR", SEAL_PREFIX, "mot ".repeat(54));
+        assert!(label_matches(&cut, &long), "word cut by the 220-character cap");
+        assert!(!label_matches("🔒 Admin demo : login VILLAR", "Admin demo : login VILLART"), "short label: no prefix match");
+    }
+
+    #[test]
+    fn reseal_recovered_rewrites_only_matching_ciphertexts() {
+        let dir = std::env::temp_dir().join(format!("mp-reseal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open_at(&dir.join("memory.db")).unwrap();
+        let clear = "Admin demo : password: Hx9!kLm2pQ";
+        let (memory, _) = db
+            .add_memory(clear, "credential", Some("demo"), &[], "test", 5, None, None, &super::super::MemoryScope::default())
+            .unwrap();
+        let id = memory.id;
+        let enc_of = |db: &Database| -> String {
+            let meta: String = db
+                .conn
+                .query_row("SELECT metadata FROM memories WHERE id=?1", params![id], |r| r.get(0))
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&meta).unwrap()["enc"].as_str().unwrap().to_string()
+        };
+        let before = enc_of(&db);
+
+        let wrong = std::collections::HashMap::from([(id.clone(), "Admin autre : password: x".to_string())]);
+        assert!(db.reseal_recovered(&wrong, true).is_err());
+        assert_eq!(enc_of(&db), before, "a mismatch writes nothing");
+
+        let right = std::collections::HashMap::from([(id.clone(), clear.to_string())]);
+        let dry = db.reseal_recovered(&right, false).unwrap();
+        assert_eq!((dry.resealed, dry.mismatched.len(), dry.missing.len()), (1, 0, 0));
+        assert_eq!(enc_of(&db), before, "dry run");
+
+        assert_eq!(db.reseal_recovered(&right, true).unwrap().resealed, 1);
+        let after = enc_of(&db);
+        assert_ne!(after, before);
+        assert_eq!(decrypt(&after).as_deref(), Some(clear));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

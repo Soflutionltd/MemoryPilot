@@ -2,6 +2,7 @@
 mod ann;
 mod chunker;
 mod connectors;
+mod onepassword;
 mod code_chunker;
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
@@ -126,6 +127,116 @@ fn main() {
             }
         }
         std::process::exit(if failed { 1 } else { 0 });
+    }
+    #[cfg(target_os = "macos")]
+    if args.iter().any(|a| a == "--restore-vault-key") {
+        // The key comes on stdin only: never on a command line or in a log.
+        let mut encoded = String::new();
+        if io::stdin().read_line(&mut encoded).is_err() {
+            eprintln!("✗ no key on stdin");
+            std::process::exit(1);
+        }
+        let db_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".MemoryPilot")
+            .join("memory.db");
+        match db::restore_vault_key(encoded.trim(), &db_path) {
+            Ok((opened, total)) => println!("✓ Clé remise dans le Trousseau : elle ouvre {}/{} identifiants.", opened, total),
+            Err(e) => {
+                eprintln!("✗ {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--reseal-recovered") {
+        // Recovered texts come on stdin only (JSON object id → text).
+        let apply = args.iter().any(|a| a == "--apply");
+        let mut input = String::new();
+        if io::Read::read_to_string(&mut io::stdin(), &mut input).is_err() {
+            eprintln!("✗ nothing on stdin");
+            std::process::exit(1);
+        }
+        let recovered: std::collections::HashMap<String, String> = match serde_json::from_str(&input) {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!("✗ stdin is not a JSON object id → text: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let db = match db::Database::open() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("DB error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        match db.reseal_recovered(&recovered, apply) {
+            Ok(report) => {
+                let short = |id: &String| id.chars().take(8).collect::<String>();
+                for id in &report.mismatched {
+                    println!("ne correspond pas  {}", short(id));
+                }
+                for id in &report.missing {
+                    println!("absent             {}", short(id));
+                }
+                for id in &report.unknown {
+                    println!("inconnu            {}", short(id));
+                }
+                println!(
+                    "{} : {} rechiffré(s), {} sans correspondance, {} absent(s), {} inconnu(s).",
+                    if apply { "Appliqué" } else { "À blanc (--apply pour écrire)" },
+                    report.resealed,
+                    report.mismatched.len(),
+                    report.missing.len(),
+                    report.unknown.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("✗ {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--sync-1password") {
+        let apply = args.iter().any(|a| a == "--apply");
+        let db = match db::Database::open() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("DB error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        match db.sync_to_onepassword(apply) {
+            Ok(report) => {
+                let short = |id: &str| id.chars().take(8).collect::<String>();
+                for (id, reference) in &report.linked {
+                    println!("lié     {}  {}", short(id), reference);
+                }
+                for (id, label) in &report.created {
+                    println!("{} {}  {}", if apply { "créé   " } else { "à créer" }, short(id), label.chars().take(90).collect::<String>());
+                }
+                for (id, error) in &report.failed {
+                    println!("échec   {}  {}", short(id), error);
+                }
+                println!(
+                    "{} : clé du coffre {}, {} déjà pointé(s), {} lié(s) à un élément existant, {} {}, {} échec(s).",
+                    if apply { "Appliqué" } else { "À blanc (--apply pour écrire)" },
+                    report.key,
+                    report.already,
+                    report.linked.len(),
+                    report.created.len(),
+                    if apply { "créé(s)" } else { "à créer" },
+                    report.failed.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("✗ {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
     }
     if args.iter().any(|a| a == "--repair-credentials") {
         let apply = args.iter().any(|a| a == "--apply");
@@ -975,6 +1086,8 @@ fn print_help() {
         "  MemoryPilot --backfill-force Recompute ALL embeddings (use after switching engine)"
     );
     println!("  MemoryPilot --seal-backup FILE...  Encrypt credentials inside old backup files");
+    println!("  MemoryPilot --reseal-recovered [--apply]  Re-encrypt with the current key credentials recovered in clear (JSON id → text on stdin), each checked against its label");
+    println!("  MemoryPilot --sync-1password [--apply]  Point every credential to 1Password (Soflution vault), creating missing items; back up the vault key");
     println!("  MemoryPilot --repair-credentials [--apply]  Re-mask leaking labels, reclassify credentials holding no secret");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop auto-ingest");

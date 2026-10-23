@@ -2295,11 +2295,12 @@ fn handle_reveal_secret(db: &Database, args: &Value) -> Value {
         Err(e) => return tool_error(&e),
     };
     match db.reveal_secret(id, reason, confirm) {
-        Ok((memory, value)) => {
+        Ok((memory, value, source)) => {
             let output = json!({
                 "id": memory.id,
                 "label": memory.content,
                 "value": value,
+                "source": source,
                 "warning": "For this task only: never write it to files, commits, logs or memories.",
             });
             tool_result(&serde_json::to_string_pretty(&output).unwrap())
