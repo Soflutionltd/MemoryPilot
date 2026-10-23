@@ -41,7 +41,10 @@ fn visible(alias: &str) -> String {
 
 /// Rows of `alias` the scope may change.
 fn owned(alias: &str) -> String {
-    format!("{a}.tenant_id = $1 AND {a}.space_id = $2 AND {a}.subject_id IS NOT DISTINCT FROM $3", a = alias)
+    format!(
+        "{a}.tenant_id = $1 AND {a}.space_id = $2 AND {a}.subject_id IS NOT DISTINCT FROM $3",
+        a = alias
+    )
 }
 
 fn refs(params: &[Param]) -> Vec<&(dyn ToSql + Sync)> {
@@ -105,7 +108,9 @@ pub struct PgAdmin {
 
 impl PgAdmin {
     pub fn connect(url: &str) -> Result<Self, String> {
-        Ok(Self { client: Client::connect(url, NoTls).map_err(pg_error)? })
+        Ok(Self {
+            client: Client::connect(url, NoTls).map_err(pg_error)?,
+        })
     }
 
     /// Applies the missing migrations; returns their versions.
@@ -116,7 +121,10 @@ impl PgAdmin {
     pub fn create_tenant(&mut self, name: &str) -> Result<Uuid, String> {
         let row = self
             .client
-            .query_one("INSERT INTO tenants (name) VALUES ($1) RETURNING id", &[&name])
+            .query_one(
+                "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
+                &[&name],
+            )
             .map_err(pg_error)?;
         Ok(row.get(0))
     }
@@ -124,12 +132,20 @@ impl PgAdmin {
     pub fn create_space(&mut self, tenant: Uuid, name: &str) -> Result<Uuid, String> {
         let row = self
             .client
-            .query_one("INSERT INTO spaces (tenant_id, name) VALUES ($1, $2) RETURNING id", &[&tenant, &name])
+            .query_one(
+                "INSERT INTO spaces (tenant_id, name) VALUES ($1, $2) RETURNING id",
+                &[&tenant, &name],
+            )
             .map_err(pg_error)?;
         Ok(row.get(0))
     }
 
-    pub fn create_subject(&mut self, tenant: Uuid, space: Uuid, external_id: &str) -> Result<Uuid, String> {
+    pub fn create_subject(
+        &mut self,
+        tenant: Uuid,
+        space: Uuid,
+        external_id: &str,
+    ) -> Result<Uuid, String> {
         let row = self
             .client
             .query_one(
@@ -144,15 +160,25 @@ impl PgAdmin {
 pub struct PgStore {
     client: Mutex<Client>,
     scope: Scope,
+    last_expiry: Mutex<Option<std::time::Instant>>,
 }
+
+/// Expired memories are dropped at most this often per store.
+const EXPIRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl PgStore {
     /// Connects as `memorypilot_app` (the login role must be a member) and
     /// checks that the space, and the subject when given, belong to the tenant.
     pub fn connect(url: &str, scope: Scope) -> Result<Self, String> {
         let mut client = Client::connect(url, NoTls).map_err(pg_error)?;
-        client.batch_execute("SET ROLE memorypilot_app").map_err(pg_error)?;
-        let store = Self { client: Mutex::new(client), scope };
+        client
+            .batch_execute("SET ROLE memorypilot_app")
+            .map_err(pg_error)?;
+        let store = Self {
+            client: Mutex::new(client),
+            scope,
+            last_expiry: Mutex::new(None),
+        };
         let known: bool = store
             .query(
                 "SELECT EXISTS(SELECT 1 FROM spaces WHERE tenant_id = $1 AND id = $2)
@@ -172,18 +198,31 @@ impl PgStore {
         self.scope
     }
 
-    fn run<T>(&self, work: impl FnOnce(&mut Transaction<'_>) -> Result<T, postgres::Error>) -> Result<T, String> {
-        let mut client = self.client.lock().map_err(|_| "Postgres connection lock poisoned".to_string())?;
+    fn run<T>(
+        &self,
+        work: impl FnOnce(&mut Transaction<'_>) -> Result<T, postgres::Error>,
+    ) -> Result<T, String> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| "Postgres connection lock poisoned".to_string())?;
         let mut tx = client.transaction().map_err(pg_error)?;
-        tx.execute("SELECT set_config('app.tenant_id', $1, true)", &[&self.scope.tenant.to_string()])
-            .map_err(pg_error)?;
+        tx.execute(
+            "SELECT set_config('app.tenant_id', $1, true)",
+            &[&self.scope.tenant.to_string()],
+        )
+        .map_err(pg_error)?;
         let value = work(&mut tx).map_err(pg_error)?;
         tx.commit().map_err(pg_error)?;
         Ok(value)
     }
 
     fn scope_params(&self, extra: Vec<Param>) -> Vec<Param> {
-        let mut params: Vec<Param> = vec![Box::new(self.scope.tenant), Box::new(self.scope.space), Box::new(self.scope.subject)];
+        let mut params: Vec<Param> = vec![
+            Box::new(self.scope.tenant),
+            Box::new(self.scope.space),
+            Box::new(self.scope.subject),
+        ];
         params.extend(extra);
         params
     }
@@ -200,18 +239,85 @@ impl PgStore {
     }
 
     fn memories(&self, sql: &str, extra: Vec<Param>) -> Result<Vec<Memory>, String> {
-        self.query(sql, extra)?.iter().map(row_to_memory).collect::<Result<_, _>>().map_err(pg_error)
+        self.query(sql, extra)?
+            .iter()
+            .map(row_to_memory)
+            .collect::<Result<_, _>>()
+            .map_err(pg_error)
     }
 
     fn strings(&self, sql: &str, extra: Vec<Param>) -> Result<Vec<String>, String> {
-        Ok(self.query(sql, extra)?.iter().map(|row| row.get(0)).collect())
+        Ok(self
+            .query(sql, extra)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    /// Computes the embeddings of up to `batch` memories of the scope that
+    /// have none (new or edited), with the same encoder input as SQLite.
+    /// Returns how many were stored; 0 once everything is embedded.
+    pub fn embed_pending(&self, batch: usize) -> Result<usize, String> {
+        let rows = self.query(
+            &format!(
+                "SELECT m.id, m.kind, m.project, m.created_at, m.content, m.content_hash FROM memories m
+                 WHERE {} AND m.embedding IS NULL ORDER BY m.created_at, m.id LIMIT $4",
+                visible("m")
+            ),
+            vec![Box::new(batch as i64)],
+        )?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let inputs: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                let created_at: DateTime<Utc> = row.get(3);
+                memorypilot_core::db::Database::embedding_input(
+                    row.get(1),
+                    row.get(2),
+                    &created_at.to_rfc3339(),
+                    row.get(4),
+                )
+            })
+            .collect();
+        let texts: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let vectors = memorypilot_core::embedding::embed_batch(&texts);
+        if vectors.len() != rows.len() {
+            return Err(format!(
+                "Embedding: {} vectors for {} memories",
+                vectors.len(),
+                rows.len()
+            ));
+        }
+        let mut stored = 0usize;
+        for (row, vector) in rows.iter().zip(vectors) {
+            let id: String = row.get(0);
+            let hash: String = row.get(5);
+            // Skipped when the content changed meanwhile: the edit queued it again.
+            stored += self.execute(
+                &format!(
+                    "UPDATE memories AS m SET embedding = $6
+                     WHERE {} AND m.id = $4 AND m.content_hash = $5 AND m.embedding IS NULL",
+                    visible("m")
+                ),
+                vec![Box::new(id), Box::new(hash), Box::new(Vector::from(vector))],
+            )? as usize;
+        }
+        Ok(stored)
     }
 
     /// Stores the embedding the server computed for one of the scope's memories.
     pub fn set_embedding(&self, id: &str, vector: &[f32]) -> Result<(), String> {
         let changed = self.execute(
-            &format!("UPDATE memories AS m SET embedding = $5 WHERE {} AND m.id = $4", owned("m")),
-            vec![Box::new(id.to_string()), Box::new(Vector::from(vector.to_vec()))],
+            &format!(
+                "UPDATE memories AS m SET embedding = $5 WHERE {} AND m.id = $4",
+                owned("m")
+            ),
+            vec![
+                Box::new(id.to_string()),
+                Box::new(Vector::from(vector.to_vec())),
+            ],
         )?;
         if changed == 0 {
             return Err(format!("Embedding: no memory {} this scope can change", id));
@@ -233,7 +339,10 @@ impl PgStore {
             vec![Box::new(source_id.to_string()), Box::new(target_id.to_string()), Box::new(relation.to_string())],
         )?;
         if added == 0 {
-            return Err(format!("Link: {} or {} is not in this scope", source_id, target_id));
+            return Err(format!(
+                "Link: {} or {} is not in this scope",
+                source_id, target_id
+            ));
         }
         Ok(())
     }
@@ -245,17 +354,30 @@ impl PgStore {
                  SELECT $1, m.id, $5, $6 FROM memories m WHERE {} AND m.id = $4",
                 owned("m")
             ),
-            vec![Box::new(memory_id.to_string()), Box::new(kind.to_string()), Box::new(value.to_string())],
+            vec![
+                Box::new(memory_id.to_string()),
+                Box::new(kind.to_string()),
+                Box::new(value.to_string()),
+            ],
         )?;
         if added == 0 {
-            return Err(format!("Entity: no memory {} this scope can change", memory_id));
+            return Err(format!(
+                "Entity: no memory {} this scope can change",
+                memory_id
+            ));
         }
         Ok(())
     }
 
     /// A current knowledge triple owned by the scope, optionally sourced
     /// from a memory it can see.
-    pub fn add_triple(&self, subject: &str, predicate: &str, object: &str, source_memory_id: Option<&str>) -> Result<(), String> {
+    pub fn add_triple(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        source_memory_id: Option<&str>,
+    ) -> Result<(), String> {
         if let Some(id) = source_memory_id {
             if self.fetch_memory(id)?.is_none() {
                 return Err(format!("Triple: no memory {} in this scope", id));
@@ -324,7 +446,11 @@ impl MemoryStore for PgStore {
 
     fn fetch_memory(&self, id: &str) -> Result<Option<Memory>, String> {
         let mut found = self.memories(
-            &format!("SELECT {} FROM memories m WHERE {} AND m.id = $4", COLUMNS, visible("m")),
+            &format!(
+                "SELECT {} FROM memories m WHERE {} AND m.id = $4",
+                COLUMNS,
+                visible("m")
+            ),
             vec![Box::new(id.to_string())],
         )?;
         Ok(found.pop())
@@ -332,14 +458,22 @@ impl MemoryStore for PgStore {
 
     fn stored_content(&self, id: &str) -> Result<String, String> {
         self.strings(
-            &format!("SELECT m.content FROM memories m WHERE {} AND m.id = $4", visible("m")),
+            &format!(
+                "SELECT m.content FROM memories m WHERE {} AND m.id = $4",
+                visible("m")
+            ),
             vec![Box::new(id.to_string())],
         )?
         .pop()
         .ok_or_else(|| format!("Update read: no memory {} in this scope", id))
     }
 
-    fn write_memory(&self, memory: &Memory, content_hash: &str, content_changed: bool) -> Result<(), String> {
+    fn write_memory(
+        &self,
+        memory: &Memory,
+        content_hash: &str,
+        content_changed: bool,
+    ) -> Result<(), String> {
         refuse_credential(memory)?;
         let updated_at = timestamp(&memory.updated_at, "updated_at")?;
         let expires_at = optional_timestamp(memory.expires_at.as_deref(), "expires_at")?;
@@ -373,7 +507,10 @@ impl MemoryStore for PgStore {
             )
             .map_err(|e| format!("Update: {}", e))?;
         if changed == 0 {
-            return Err(format!("Update: no memory {} this scope can change", memory.id));
+            return Err(format!(
+                "Update: no memory {} this scope can change",
+                memory.id
+            ));
         }
         Ok(())
     }
@@ -381,7 +518,10 @@ impl MemoryStore for PgStore {
     fn remove_memory(&self, id: &str) -> Result<bool, String> {
         let removed = self
             .execute(
-                &format!("DELETE FROM memories AS m WHERE {} AND m.id = $4", owned("m")),
+                &format!(
+                    "DELETE FROM memories AS m WHERE {} AND m.id = $4",
+                    owned("m")
+                ),
                 vec![Box::new(id.to_string())],
             )
             .map_err(|e| format!("Delete: {}", e))?;
@@ -398,7 +538,11 @@ impl MemoryStore for PgStore {
     ) -> Result<(Vec<Memory>, i64), String> {
         let mut conditions = vec![visible("m")];
         let mut extra: Vec<Param> = Vec::new();
-        for (filter, value) in [("m.project =", project), ("m.kind =", kind), ("m.kind <>", exclude_kind)] {
+        for (filter, value) in [
+            ("m.project =", project),
+            ("m.kind =", kind),
+            ("m.kind <>", exclude_kind),
+        ] {
             if let Some(value) = value {
                 extra.push(Box::new(value.to_string()));
                 conditions.push(format!("{} ${}", filter, extra.len() + 3));
@@ -409,7 +553,12 @@ impl MemoryStore for PgStore {
         let count_params = self.scope_params(extra);
         let (rows, total) = {
             let total: i64 = self
-                .run(|tx| tx.query_one(&format!("SELECT count(*) FROM memories m WHERE {}", where_clause), &refs(&count_params)))
+                .run(|tx| {
+                    tx.query_one(
+                        &format!("SELECT count(*) FROM memories m WHERE {}", where_clause),
+                        &refs(&count_params),
+                    )
+                })
                 .map_err(|e| format!("Count: {}", e))?
                 .get(0);
             let mut page_params = count_params;
@@ -422,10 +571,16 @@ impl MemoryStore for PgStore {
                 filters + 4,
                 filters + 5
             );
-            let rows = self.run(|tx| tx.query(&sql, &refs(&page_params))).map_err(|e| format!("List: {}", e))?;
+            let rows = self
+                .run(|tx| tx.query(&sql, &refs(&page_params)))
+                .map_err(|e| format!("List: {}", e))?;
             (rows, total)
         };
-        let memories = rows.iter().map(row_to_memory).collect::<Result<_, _>>().map_err(pg_error)?;
+        let memories = rows
+            .iter()
+            .map(row_to_memory)
+            .collect::<Result<_, _>>()
+            .map_err(pg_error)?;
         Ok((memories, total))
     }
 
@@ -470,11 +625,20 @@ impl MemoryStore for PgStore {
 }
 
 impl RecallStore for PgStore {
-    fn full_text_candidates(&self, fts_query: &str, project: Option<&str>, kind: Option<&str>, limit: usize) -> Result<Vec<Memory>, String> {
+    fn full_text_candidates(
+        &self,
+        fts_query: &str,
+        project: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Memory>, String> {
         let Some(tsquery) = fts5_to_tsquery(fts_query) else {
             return Ok(Vec::new());
         };
-        let mut conditions = vec![visible("m"), "m.fts @@ to_tsquery('simple', $4)".to_string()];
+        let mut conditions = vec![
+            visible("m"),
+            "m.fts @@ to_tsquery('simple', $4)".to_string(),
+        ];
         let mut extra: Vec<Param> = vec![Box::new(tsquery)];
         for (column, value) in [("m.project", project), ("m.kind", kind)] {
             if let Some(value) = value {
@@ -504,7 +668,10 @@ impl RecallStore for PgStore {
         only_ids: Option<&[String]>,
     ) -> Result<Vec<(Memory, Option<f32>)>, String> {
         let mut conditions = vec![visible("m")];
-        let mut extra: Vec<Param> = vec![Box::new(Vector::from(query_embedding.to_vec())), Box::new(query_embedding.len() as i32)];
+        let mut extra: Vec<Param> = vec![
+            Box::new(Vector::from(query_embedding.to_vec())),
+            Box::new(query_embedding.len() as i32),
+        ];
         for (column, value) in [("m.project", project), ("m.kind", kind)] {
             if let Some(value) = value {
                 extra.push(Box::new(value.to_string()));
@@ -533,7 +700,11 @@ impl RecallStore for PgStore {
             .map_err(|e| format!("Vector Search error: {}", pg_error(e)))
     }
 
-    fn approximate_neighbours(&self, _query_embedding: &[f32], _limit: usize) -> Vec<(String, f32)> {
+    fn approximate_neighbours(
+        &self,
+        _query_embedding: &[f32],
+        _limit: usize,
+    ) -> Vec<(String, f32)> {
         Vec::new()
     }
 
@@ -556,7 +727,9 @@ impl RecallStore for PgStore {
                 return Vec::new();
             }
             sql.push_str(" AND l.target_id = ANY($4)");
-            extra.push(Box::new(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>()));
+            extra.push(Box::new(
+                ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            ));
         }
         let rows = reported(self.query(&sql, extra), "link relations");
         rows.iter().map(|row| (row.get(0), row.get(1))).collect()
@@ -622,7 +795,9 @@ impl RecallStore for PgStore {
         );
         let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         let rows = reported(self.query(&sql, vec![Box::new(ids)]), "triple counts");
-        rows.iter().map(|row| (row.get(0), (row.get(1), row.get(2)))).collect()
+        rows.iter()
+            .map(|row| (row.get(0), (row.get(1), row.get(2))))
+            .collect()
     }
 
     fn memory_vectors(&self, ids: &[&String]) -> HashMap<String, Vec<f32>> {
@@ -689,7 +864,11 @@ impl RecallStore for PgStore {
     }
 
     fn project_path(&self, project: &str) -> Option<String> {
-        let params: Vec<Param> = vec![Box::new(self.scope.tenant), Box::new(self.scope.space), Box::new(project.to_string())];
+        let params: Vec<Param> = vec![
+            Box::new(self.scope.tenant),
+            Box::new(self.scope.space),
+            Box::new(project.to_string()),
+        ];
         let rows = reported(
             self.run(|tx| tx.query("SELECT path FROM projects WHERE tenant_id = $1 AND space_id = $2 AND name = $3", &refs(&params))),
             "project path",
@@ -709,7 +888,10 @@ impl RecallStore for PgStore {
             limit
         );
         let kinds: Vec<String> = kinds.iter().map(|kind| kind.to_string()).collect();
-        reported(self.strings(&sql, vec![Box::new(project.to_string()), Box::new(kinds)]), "project entities")
+        reported(
+            self.strings(&sql, vec![Box::new(project.to_string()), Box::new(kinds)]),
+            "project entities",
+        )
     }
 
     fn recent_project_contents(&self, project: &str, days: u32, limit: usize) -> Vec<String> {
@@ -721,7 +903,10 @@ impl RecallStore for PgStore {
             limit
         );
         let days = i32::try_from(days).unwrap_or(i32::MAX);
-        reported(self.strings(&sql, vec![Box::new(project.to_string()), Box::new(days)]), "recent project contents")
+        reported(
+            self.strings(&sql, vec![Box::new(project.to_string()), Box::new(days)]),
+            "recent project contents",
+        )
     }
 
     fn important_memories(&self, min_importance: i32, limit: usize) -> Result<Vec<Memory>, String> {
@@ -752,16 +937,67 @@ impl RecallStore for PgStore {
 
     fn memory_count(&self, kind: Option<&str>) -> i64 {
         let (sql, extra): (String, Vec<Param>) = match kind {
-            Some(k) => (format!("SELECT count(*) FROM memories m WHERE {} AND m.kind = $4", visible("m")), vec![Box::new(k.to_string())]),
-            None => (format!("SELECT count(*) FROM memories m WHERE {}", visible("m")), Vec::new()),
+            Some(k) => (
+                format!(
+                    "SELECT count(*) FROM memories m WHERE {} AND m.kind = $4",
+                    visible("m")
+                ),
+                vec![Box::new(k.to_string())],
+            ),
+            None => (
+                format!("SELECT count(*) FROM memories m WHERE {}", visible("m")),
+                Vec::new(),
+            ),
         };
-        reported(self.query(&sql, extra), "memory count").first().map(|row| row.get(0)).unwrap_or(0)
+        reported(self.query(&sql, extra), "memory count")
+            .first()
+            .map(|row| row.get(0))
+            .unwrap_or(0)
+    }
+
+    fn expire_memories(&self) {
+        {
+            let Ok(mut last) = self.last_expiry.lock() else {
+                return;
+            };
+            if last.is_some_and(|at| at.elapsed() < EXPIRY_INTERVAL) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let expired = self.execute(
+            // Visible, not only owned: an expired shared memory must not
+            // surface in an end user's search until the space's own pass.
+            &format!("DELETE FROM memories AS m WHERE {} AND m.expires_at IS NOT NULL AND m.expires_at < now()", visible("m")),
+            Vec::new(),
+        );
+        reported(expired, "expiry");
+    }
+
+    fn record_access(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let recorded = self.execute(
+            &format!(
+                "UPDATE memories AS m SET access_count = m.access_count + 1, last_accessed_at = now()
+                 WHERE {} AND m.id = ANY($4)",
+                visible("m")
+            ),
+            vec![Box::new(ids.to_vec())],
+        );
+        reported(recorded, "access count");
     }
 
     fn project_count(&self) -> i64 {
         let params: Vec<Param> = vec![Box::new(self.scope.tenant), Box::new(self.scope.space)];
         reported(
-            self.run(|tx| tx.query("SELECT count(*) FROM projects WHERE tenant_id = $1 AND space_id = $2", &refs(&params))),
+            self.run(|tx| {
+                tx.query(
+                    "SELECT count(*) FROM projects WHERE tenant_id = $1 AND space_id = $2",
+                    &refs(&params),
+                )
+            }),
             "project count",
         )
         .first()
