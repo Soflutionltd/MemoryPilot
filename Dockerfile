@@ -21,7 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home /var/lib/memorypilot --create-home --uid 10001 memorypilot
 COPY --from=build /src/target/release/memorypilot-server /usr/local/bin/memorypilot-server
+COPY console/build /var/lib/memorypilot/console
 ENV FASTEMBED_CACHE_PATH=/var/lib/memorypilot/models \
+    MEMORYPILOT_CONSOLE_DIR=/var/lib/memorypilot/console \
     MEMORYPILOT_BIND=0.0.0.0:8080 \
     MEMORYPILOT_VAULT=off \
     HOME=/var/lib/memorypilot

@@ -3,3 +3,7 @@ target/
 .fastembed_cache/
 CURSOR_ROADMAP*.md
 benchmarks/*.json
+console/node_modules
+console/.svelte-kit
+sdks/python/**/__pycache__
+sdks/dart/.dart_tool

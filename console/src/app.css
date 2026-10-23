@@ -1,0 +1,38 @@
+:root {
+  color-scheme: dark;
+  --bg: #14120f;
+  --ink: #f3efe6;
+  --muted: #b7b0a3;
+  --line: rgba(255, 255, 255, 0.1);
+  --accent: #e8a317;
+  --danger: #ffb4a2;
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+  font-feature-settings: "kern" 1, "liga" 1;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+body {
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: var(--accent);
+}

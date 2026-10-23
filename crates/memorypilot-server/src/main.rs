@@ -52,6 +52,7 @@ Environment:
   MEMORYPILOT_MASTER_KEY  32-byte key (base64) that wraps each tenant's data key;
                           required to store credentials. Generate with generate-master-key
   MEMORYPILOT_PUBLIC_URL  public origin of this server (OAuth issuer, e.g. https://memory.example)
+  MEMORYPILOT_CONSOLE_DIR built SvelteKit console (default console/build), served at /console
 
 Endpoints: GET /health; REST /v1/memories, /v1/search; MCP (Streamable HTTP) POST /mcp.
 Authorization: Bearer <key>. X-MemoryPilot-Subject: <end user id> acts for one end user.";
@@ -336,13 +337,19 @@ fn serve() -> Result<(), String> {
         .to_ip()
         .map_or_else(|| bind.clone(), |address| address.to_string());
     eprintln!("[memorypilot-server] listening on http://{}", address);
+    let console = std::sync::Arc::new(
+        env("MEMORYPILOT_CONSOLE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("console/build")),
+    );
     let handles: Vec<_> = (0..workers)
         .map(|_| {
             let server = Arc::clone(&server);
             let api = api.clone();
+            let console = Arc::clone(&console);
             std::thread::spawn(move || {
                 for request in server.incoming_requests() {
-                    answer(&api, request);
+                    answer(&api, &console, request);
                 }
             })
         })
@@ -437,8 +444,47 @@ fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, Response> {
 }
 
 /// One request: a panic in the handler answers 500 instead of killing the worker.
-fn answer(api: &Api, mut request: tiny_http::Request) {
+fn console_asset(root: &Path, url: &str) -> Option<(String, Vec<u8>)> {
+    let rest = url.split('?').next()?.strip_prefix("/console")?;
+    let relative = if rest.is_empty() || rest == "/" {
+        "index.html"
+    } else {
+        rest.trim_start_matches('/')
+    };
+    if relative.contains("..") || Path::new(relative).is_absolute() {
+        return None;
+    }
+    let path = root.join(relative);
+    let bytes = std::fs::read(&path).ok().or_else(|| {
+        if relative.contains('.') {
+            None
+        } else {
+            std::fs::read(root.join("index.html")).ok()
+        }
+    })?;
+    let content_type = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("js") => "text/javascript",
+        Some("css") => "text/css",
+        Some("svg") => "image/svg+xml",
+        Some("json") => "application/json",
+        _ => "text/html; charset=utf-8",
+    };
+    Some((content_type.into(), bytes))
+}
+
+fn answer(api: &Api, console: &Path, mut request: tiny_http::Request) {
     let started = Instant::now();
+    if request.method().as_str() == "GET" {
+        if let Some((content_type, bytes)) = console_asset(console, request.url()) {
+            let header = format!("Content-Type: {}", content_type);
+            let _ = request.respond(
+                tiny_http::Response::from_data(bytes)
+                    .with_header(fixed_header(&header))
+                    .with_header(fixed_header("Cache-Control: no-store")),
+            );
+            return;
+        }
+    }
     let response = match read_body(&mut request) {
         Err(response) => response,
         Ok(body) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
