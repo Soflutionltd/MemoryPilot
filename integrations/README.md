@@ -1,4 +1,8 @@
-# Phase 7 — brancher MemoryPilot
+# Phase 7 : brancher MemoryPilot
+
+## Règle d'isolation
+
+Un produit ou un client = un tenant vierge, ou sa propre instance (image Docker chez lui, sa base Postgres). Jamais la base locale d'Antoine, jamais deux clients sur le même tenant : aucune donnée ne passe d'un client à l'autre. Seuls les credentials sont chiffrés par tenant ; un client qui ne veut pas que l'hébergeur puisse lire ses mémoires héberge l'image lui-même.
 
 ## claude.ai et ChatGPT (serveur)
 
@@ -19,31 +23,32 @@ await client.addMemory({'content': note});
 
 Raccourci iOS : `POST https://…/v1/memories` avec `Authorization: Bearer` et `X-MemoryPilot-Subject`.
 
-## Slate (local)
+## Usage d'Antoine (local)
 
-Slate reste sur le MemoryPilot de bureau (stdio MCP, base SQLite). Pas le SaaS. Dans la config MCP de Claude Desktop :
+Le MemoryPilot de bureau (binaire, base SQLite, servi par McpHub) est la mémoire de l'agent dans Cursor. Il n'est branché sur aucun produit et ne parle jamais au serveur SaaS. Un client MCP de bureau qui veut la même mémoire locale le lance en stdio :
 
 ```json
 { "mcpServers": { "memorypilot": { "command": "MemoryPilot" } } }
 ```
-
-Le binaire local est déjà le serveur MCP. Slate n'a pas à embarquer le SaaS.
 
 ## LightFrame (SDK TypeScript)
 
 ```ts
 import { MemoryPilot } from "../../MemoryPilot/sdks/typescript/src/index.js";
 
+// One tenant (and API key) per LightFrame customer; end users inside it.
 const memory = new MemoryPilot({
   baseUrl: process.env.MEMORYPILOT_URL!,
-  apiKey: process.env.MEMORYPILOT_KEY!,
-}).forSubject(siteId);
+  apiKey: customerApiKey,
+}).forSubject(userId);
 
 await memory.addMemory({
-  content: `The site ${siteId} publishes in ${locale}`,
+  content: `${userId} publishes in ${locale}`,
   project: "lightframe",
 });
 ```
+
+Deux sites de deux clients différents ne partagent jamais un tenant : `forSubject` sépare les utilisateurs d'un même client, pas des entreprises.
 
 ## Docix / Konta (SDK Dart)
 
