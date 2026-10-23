@@ -894,3 +894,97 @@ fn search_reports_lexical_candidate_sources() {
     }
     cleanup_db_files(&path);
 }
+
+fn contract_memory(id: &str, content: &str, kind: &str, project: Option<&str>, updated_at: &str) -> super::Memory {
+    super::Memory {
+        id: id.into(),
+        content: content.into(),
+        kind: kind.into(),
+        project: project.map(String::from),
+        tags: vec!["contract".into()],
+        source: "test".into(),
+        importance: 3,
+        expires_at: None,
+        created_at: "2026-01-01T00:00:00+00:00".into(),
+        updated_at: updated_at.into(),
+        metadata: Some(serde_json::json!({ "origin": "contract" })),
+        last_accessed_at: None,
+        access_count: 0,
+    }
+}
+
+/// What any `MemoryStore` must do, written against the trait so the
+/// server mode's store runs the same checks.
+fn assert_memory_store_contract(store: &dyn super::MemoryStore) {
+    use super::content_hash;
+    let older = contract_memory("m-old", "Deploys go through cf-orchestrator", "decision", Some("acme"), "2026-01-02T00:00:00+00:00");
+    let newer = contract_memory("m-new", "Invoices are numbered per year", "fact", Some("acme"), "2026-01-03T00:00:00+00:00");
+    let global = contract_memory("m-global", "Answers in French", "preference", None, "2026-01-04T00:00:00+00:00");
+    for memory in [&older, &newer, &global] {
+        store.insert_memory(memory, &content_hash(&memory.content)).expect("insert");
+    }
+
+    let fetched = store.fetch_memory("m-old").expect("fetch").expect("stored");
+    assert_eq!(fetched.content, older.content);
+    assert_eq!(fetched.kind, "decision");
+    assert_eq!(fetched.project.as_deref(), Some("acme"));
+    assert_eq!(fetched.tags, older.tags);
+    assert_eq!(fetched.metadata, older.metadata);
+    assert_eq!(store.stored_content("m-old").expect("content"), older.content);
+    assert!(store.fetch_memory("missing").expect("fetch").is_none());
+
+    let hash = content_hash(&older.content);
+    assert_eq!(store.find_by_content_hash(&hash, Some("acme")).map(|m| m.id), Some("m-old".into()));
+    assert!(store.find_by_content_hash(&hash, None).is_none(), "hash lookup stays inside the project");
+
+    let recent: Vec<String> = store.recent_memories(Some("acme"), 10).expect("recent").into_iter().map(|m| m.id).collect();
+    assert_eq!(recent, vec!["m-new", "m-old"]);
+    let unscoped: Vec<String> = store.recent_memories(None, 10).expect("recent").into_iter().map(|m| m.id).collect();
+    assert_eq!(unscoped, vec!["m-global"]);
+
+    let (all, total) = store.list_memory_rows(None, None, None, 10, 0).expect("list");
+    assert_eq!(total, 3);
+    assert_eq!(all.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["m-global", "m-new", "m-old"]);
+    let (page, total) = store.list_memory_rows(Some("acme"), None, None, 1, 1).expect("list");
+    assert_eq!((total, page.len(), page[0].id.as_str()), (2, 1, "m-old"));
+    let (facts, _) = store.list_memory_rows(Some("acme"), Some("fact"), None, 10, 0).expect("list");
+    assert_eq!(facts.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["m-new"]);
+    let (others, total) = store.list_memory_rows(None, None, Some("fact"), 10, 0).expect("list");
+    assert_eq!((total, others.len()), (2, 2));
+
+    let mut edited = older.clone();
+    edited.content = "Deploys go through cf-orchestrator only".into();
+    edited.tags = vec!["contract".into(), "deploy".into()];
+    edited.importance = 5;
+    edited.updated_at = "2026-01-05T00:00:00+00:00".into();
+    store.write_memory(&edited, &content_hash(&edited.content), true).expect("write");
+    let reread = store.fetch_memory("m-old").expect("fetch").expect("stored");
+    assert_eq!((reread.content.as_str(), reread.importance), (edited.content.as_str(), 5));
+    assert_eq!(reread.tags, edited.tags);
+    assert_eq!(reread.updated_at, edited.updated_at);
+    assert_eq!(store.find_by_content_hash(&content_hash(&edited.content), Some("acme")).map(|m| m.id), Some("m-old".into()));
+    assert!(store.find_by_content_hash(&hash, Some("acme")).is_none(), "the old hash is replaced");
+    assert_eq!(store.recent_memories(Some("acme"), 1).expect("recent")[0].id, "m-old");
+
+    assert!(store.remove_memory("m-old").expect("remove"));
+    assert!(!store.remove_memory("m-old").expect("remove again"));
+    assert!(store.fetch_memory("m-old").expect("fetch").is_none());
+    assert_eq!(store.list_memory_rows(None, None, None, 10, 0).expect("list").1, 2);
+}
+
+#[test]
+fn sqlite_store_meets_the_memory_store_contract() {
+    let path = temp_db_path("store-contract");
+    {
+        let db = Database::open_at(&path).expect("db");
+        assert_memory_store_contract(&db);
+        let fts_rows = |term: &str| -> i64 {
+            db.conn
+                .query_row("SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH ?1", [term], |r| r.get(0))
+                .expect("fts")
+        };
+        assert_eq!(fts_rows("invoices"), 1, "a stored memory has its full-text entry");
+        assert_eq!(fts_rows("orchestrator"), 0, "a removed memory leaves no full-text entry");
+    }
+    cleanup_db_files(&path);
+}

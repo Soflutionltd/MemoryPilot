@@ -87,6 +87,11 @@ mod search;
 mod maintenance;
 #[path = "db/recall.rs"]
 mod recall;
+#[path = "db/store.rs"]
+mod store;
+#[path = "db/sqlite_store.rs"]
+mod sqlite_store;
+pub use store::MemoryStore;
 
 use embed_worker::{
     cached_embed_text, embed_db_path, queue_access_update, queue_embedding_job,
