@@ -1509,3 +1509,38 @@ fn an_access_token_cannot_be_traded_for_a_wider_one() {
         "no token for Bob from Alice's"
     );
 }
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn an_access_token_dies_with_its_key_and_its_end_user() {
+    let mut admin = PgAdmin::connect(&plain()).expect("admin connection");
+    admin.migrate().expect("migrations");
+    let tenant = admin
+        .create_tenant(&format!("api-{}", Uuid::new_v4()))
+        .expect("tenant");
+    let space = admin.create_space(tenant, "app").expect("space");
+    let key = admin
+        .create_api_key(tenant, space, "test", &Permission::ALL)
+        .expect("key");
+    let api = Api::new(PgPool::new(plain(), 2)).with_public_url("http://127.0.0.1:8080".into());
+    let alice = oauth_access_token(&api, &key.secret, "alice");
+    let bob = oauth_access_token(&api, &key.secret, "bob");
+    let call = |method: &str, url: &str, token: &str| {
+        let authorization = format!("Bearer {}", token);
+        api.handle(&Request {
+            method,
+            url,
+            headers: &[("authorization", authorization.as_str())],
+            body: b"",
+        })
+        .status
+    };
+
+    assert_eq!(call("GET", "/v1/memories", &alice), 200);
+    assert_eq!(call("DELETE", "/v1/subject", &alice), 200);
+    assert_eq!(call("GET", "/v1/memories", &alice), 401, "erased end user");
+    assert_eq!(call("GET", "/v1/memories", &bob), 200);
+
+    assert!(admin.revoke_api_key(tenant, key.id).expect("revoke"));
+    assert_eq!(call("GET", "/v1/memories", &bob), 401, "revoked API key");
+}
