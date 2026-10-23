@@ -95,6 +95,9 @@ mod sqlite_store;
 #[path = "db/store_contract.rs"]
 pub mod store_contract;
 pub use store::{MemoryStore, RecallStore};
+pub use search::hybrid_search;
+pub use benchmark_fr::{fr_scenarios, score_fr_queries, FrScenario};
+use ranking::RankingSignals;
 
 use embed_worker::{
     cached_embed_text, embed_db_path, queue_access_update, queue_embedding_job,
@@ -137,7 +140,7 @@ impl Database {
     /// so "what did we do on Sociomator in March" lands on the right
     /// chunk. Every other kind is embedded verbatim; the stored content
     /// and its hash are never touched.
-    pub(crate) fn embedding_input(
+    pub fn embedding_input(
         kind: &str,
         project: Option<&str>,
         created_at: &str,

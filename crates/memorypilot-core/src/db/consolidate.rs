@@ -490,6 +490,7 @@ fn snippet(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ranking::RankingSignals;
     use super::*;
 
     fn temp_db() -> (Database, std::path::PathBuf) {

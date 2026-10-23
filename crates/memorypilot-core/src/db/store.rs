@@ -131,4 +131,11 @@ pub trait RecallStore {
 
     /// Number of known projects.
     fn project_count(&self) -> i64;
+
+    /// Drops expired memories before a search. A store may throttle it.
+    fn expire_memories(&self);
+
+    /// Counts one access for each memory a search returned. A store may
+    /// defer the write.
+    fn record_access(&self, ids: &[String]);
 }

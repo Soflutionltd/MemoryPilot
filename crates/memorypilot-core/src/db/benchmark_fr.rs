@@ -15,12 +15,12 @@ use serde_json::{json, Value};
 
 use super::{Database, MemoryScope};
 
-struct FrScenario {
-    id: &'static str,
-    project: &'static str,
-    kind: &'static str,
-    tags: &'static [&'static str],
-    content: &'static str,
+pub struct FrScenario {
+    pub id: &'static str,
+    pub project: &'static str,
+    pub kind: &'static str,
+    pub tags: &'static [&'static str],
+    pub content: &'static str,
 }
 
 struct FrQuery {
@@ -1522,6 +1522,27 @@ fn run_fr_bench(db_path: &std::path::Path) -> Result<Value, String> {
     // ordering of identical-score candidates on subsequent queries.
     crate::reranking::warmup_cross_reranker();
 
+    score_fr_queries(&id_map, |query, project| {
+        Ok(db
+            .search(query, 10, project, None, None, None)?
+            .into_iter()
+            .map(|result| result.memory.id)
+            .collect())
+    })
+}
+
+/// The memories of the French benchmark, for other stores to seed.
+pub fn fr_scenarios() -> &'static [FrScenario] {
+    SCENARIOS
+}
+
+/// Replays the French queries through `search` (query, project filter ->
+/// ranked memory ids, at most 10) and scores them. `id_map` maps each
+/// scenario id to the id of the memory stored for it.
+pub fn score_fr_queries(
+    id_map: &std::collections::HashMap<String, String>,
+    mut search: impl FnMut(&str, Option<&str>) -> Result<Vec<String>, String>,
+) -> Result<Value, String> {
     let mut hit_at_1 = 0usize;
     let mut hit_at_5 = 0usize;
     let mut hit_at_10 = 0usize;
@@ -1537,13 +1558,11 @@ fn run_fr_bench(db_path: &std::path::Path) -> Result<Value, String> {
             .clone();
 
         let started = std::time::Instant::now();
-        let results = db.search(query.query, 10, query.project, None, None, None)?;
+        let results = search(query.query, query.project)?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         total_search_ms += elapsed_ms;
 
-        let position = results
-            .iter()
-            .position(|result| result.memory.id == target_db_id);
+        let position = results.iter().position(|id| *id == target_db_id);
         let rank = position.map(|index| index + 1);
 
         if let Some(rank) = rank {

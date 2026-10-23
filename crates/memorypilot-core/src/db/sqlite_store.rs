@@ -564,4 +564,16 @@ impl RecallStore for Database {
             .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
             .unwrap_or(0)
     }
+
+    fn expire_memories(&self) {
+        let _ = self.cleanup_expired();
+    }
+
+    fn record_access(&self, ids: &[String]) {
+        // Deferred to the embed worker so the hot search path never holds
+        // the WAL writer lock; it drains the queue every ~2 s in one UPDATE.
+        for id in ids {
+            queue_access_update(id.clone());
+        }
+    }
 }

@@ -124,80 +124,6 @@ impl Database {
         ((memory.access_count.min(10) as f64) / 10.0 * 0.2 * 100.0).round() / 100.0
     }
 
-    pub(super) fn build_link_boosts(&self) -> std::collections::HashMap<String, f64> {
-        self.build_link_boosts_for(&[])
-    }
-
-    pub(super) fn build_link_boosts_for(
-        &self,
-        candidate_ids: &[&String],
-    ) -> std::collections::HashMap<String, f64> {
-        let mut link_boosts = std::collections::HashMap::new();
-        let rows_data = if candidate_ids.is_empty() || candidate_ids.len() > 200 {
-            self.link_relations(None)
-        } else {
-            self.link_relations(Some(candidate_ids))
-        };
-
-        for (target_id, relation_type) in rows_data {
-            let boost: f64 = match relation_type.as_str() {
-                "deprecates" => -0.6,
-                // A newer memory restates this one with a different
-                // value (see `link_superseded_memories`): keep it
-                // retrievable, but below its replacement.
-                "supersedes" => -0.35,
-                "depends_on" | "implements" | "resolves" | "resolved_by" | "fixed_by" | "fixes" => {
-                    0.08
-                }
-                "shares_topic" => 0.06,
-                "same_agent" => 0.05,
-                "same_origin" => 0.02,
-                _ => 0.03,
-            };
-            let total = link_boosts.entry(target_id).or_insert(0.0);
-            *total = (*total + boost).clamp(-0.8_f64, 0.25_f64);
-        }
-        link_boosts
-    }
-
-    pub(super) fn get_kg_expansion_terms(&self, query: &str) -> Vec<String> {
-        let words: Vec<&str> = query.split_whitespace().collect();
-        if words.len() > 15 {
-            return Vec::new();
-        }
-
-        let mut terms: Vec<String> = Vec::new();
-        let query_lower = query.to_lowercase();
-
-        for word in &words {
-            if word.len() < 3 {
-                continue;
-            }
-            let lower = word.to_lowercase();
-
-            // KG triples (related subjects/objects), then entity co-occurrence
-            for r in self.related_terms(&lower) {
-                if !query_lower.contains(&r.to_lowercase()) && r.len() >= 2 {
-                    terms.push(r.to_lowercase());
-                }
-            }
-        }
-
-        terms.truncate(12);
-        terms
-    }
-
-    pub(super) fn build_adjacency_set(&self, ids: &[String]) -> std::collections::HashSet<(String, String)> {
-        self.adjacency_pairs(ids)
-    }
-
-    pub(super) fn batch_triple_counts(
-        &self,
-        candidate_ids: &[&String],
-    ) -> std::collections::HashMap<String, (i64, i64)> {
-        self.triple_counts(candidate_ids)
-    }
-
     // ─── SEARCH (FTS5 BM25 × importance) ──────────────
 
     pub(super) fn infer_query_intent(query: &str) -> QueryIntent {
@@ -387,9 +313,88 @@ impl Database {
         1.0 + ((frequency * 0.07) + (recency * 0.05)).min(0.12)
     }
 
+}
+
+/// Ranking signals read from a store, shared by search and recall on any
+/// `RecallStore` (SQLite or the server's Postgres).
+pub(crate) trait RankingSignals: RecallStore {
+    fn build_link_boosts(&self) -> std::collections::HashMap<String, f64> {
+        self.build_link_boosts_for(&[])
+    }
+
+    fn build_link_boosts_for(
+        &self,
+        candidate_ids: &[&String],
+    ) -> std::collections::HashMap<String, f64> {
+        let mut link_boosts = std::collections::HashMap::new();
+        let rows_data = if candidate_ids.is_empty() || candidate_ids.len() > 200 {
+            self.link_relations(None)
+        } else {
+            self.link_relations(Some(candidate_ids))
+        };
+
+        for (target_id, relation_type) in rows_data {
+            let boost: f64 = match relation_type.as_str() {
+                "deprecates" => -0.6,
+                // A newer memory restates this one with a different
+                // value (see `link_superseded_memories`): keep it
+                // retrievable, but below its replacement.
+                "supersedes" => -0.35,
+                "depends_on" | "implements" | "resolves" | "resolved_by" | "fixed_by" | "fixes" => {
+                    0.08
+                }
+                "shares_topic" => 0.06,
+                "same_agent" => 0.05,
+                "same_origin" => 0.02,
+                _ => 0.03,
+            };
+            let total = link_boosts.entry(target_id).or_insert(0.0);
+            *total = (*total + boost).clamp(-0.8_f64, 0.25_f64);
+        }
+        link_boosts
+    }
+
+    fn get_kg_expansion_terms(&self, query: &str) -> Vec<String> {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        if words.len() > 15 {
+            return Vec::new();
+        }
+
+        let mut terms: Vec<String> = Vec::new();
+        let query_lower = query.to_lowercase();
+
+        for word in &words {
+            if word.len() < 3 {
+                continue;
+            }
+            let lower = word.to_lowercase();
+
+            // KG triples (related subjects/objects), then entity co-occurrence
+            for r in self.related_terms(&lower) {
+                if !query_lower.contains(&r.to_lowercase()) && r.len() >= 2 {
+                    terms.push(r.to_lowercase());
+                }
+            }
+        }
+
+        terms.truncate(12);
+        terms
+    }
+
+    fn build_adjacency_set(&self, ids: &[String]) -> std::collections::HashSet<(String, String)> {
+        self.adjacency_pairs(ids)
+    }
+
+    fn batch_triple_counts(
+        &self,
+        candidate_ids: &[&String],
+    ) -> std::collections::HashMap<String, (i64, i64)> {
+        self.triple_counts(candidate_ids)
+    }
+
     /// Stored vectors of the given memories, decoded. Rows without an
     /// embedding (still queued) are absent from the map.
-    pub(super) fn batch_memory_vectors(
+    fn batch_memory_vectors(
         &self,
         ids: &[&String],
     ) -> std::collections::HashMap<String, Vec<f32>> {
@@ -400,7 +405,7 @@ impl Database {
     }
 
     /// `date` entities of the given memories, as calendar days.
-    pub(super) fn batch_memory_dates(
+    fn batch_memory_dates(
         &self,
         ids: &[&String],
     ) -> std::collections::HashMap<String, Vec<chrono::NaiveDate>> {
@@ -416,3 +421,5 @@ impl Database {
         dates
     }
 }
+
+impl<S: RecallStore + ?Sized> RankingSignals for S {}
