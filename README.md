@@ -287,6 +287,7 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 - **Secrets as pointers**: no tool returns the value of a credential any more, `full` mode and exports included. A credential comes out as its masked label plus a `secret` pointer: where the value lives (the `location` set with `update_memory`, an `op://` reference in the label, or the vault) and how to ask for it. `reveal_secret {id, reason}` is the only way to the value: the user confirms in a macOS dialog an agent cannot click (Reveal / Refuse, 55 s), and every request is logged to `~/.MemoryPilot/logs/reveal-audit.log` without the value. Updates can no longer destroy a secret: writing back the masked text, replacing the metadata, or changing the kind alone is refused or keeps the ciphertext. `MEMORYPILOT_REVEAL_CONFIRM=none` skips the dialog (audit only); `MEMORYPILOT_SECRETS=reveal` restores transparent decryption; over HTTP `reveal_secret` is refused unless `MEMORYPILOT_HTTP_SECRETS=on`.
 - **1Password as the home of secrets**: `MemoryPilot --sync-1password [--apply]` backs up the vault key to 1Password (item "MemoryPilot vault key"), then points every credential to an `op://` reference: an existing item about the same account (title or URL host in the text) that already holds the value is linked, otherwise a Login or Secure Note is created (tag `memorypilot-import`). Nothing is deleted; dry run by default. `reveal_secret` then reads the value from 1Password first (`op-sof` when installed, else `op`; values only on stdin/stdout) and says where it came from.
 - **`memorypilot-core` library**: storage, search, recall, knowledge graph and vault now live in `crates/memorypilot-core` (Cargo workspace); the `MemoryPilot` binary is the MCP server on top of it. `db.rs` is split into one file per domain. Memory rows go through a `MemoryStore` trait (SQLite today), with a contract test any other store must pass. Same tests, same benchmark results (`scripts/bench-gate.sh`).
+- **No Keychain prompts**: the server reads the vault key only when it holds credentials, on a background thread (a prompt no longer freezes every request). The macOS release is signed and notarized, Homebrew installs it on Apple Silicon, and `install.sh` checks the checksum and the signing team.
 - **Vault key safety and recovery**: a refused Keychain read no longer creates a new key (only a missing item does). `--restore-vault-key` puts back a key read on stdin after checking it opens every sealed credential; `--reseal-recovered [--apply]` re-encrypts with the current key credentials recovered in clear (JSON on stdin), each checked against its stored label, all or nothing.
 
 ## What's new in v4.10
@@ -313,7 +314,9 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 brew install Soflutionltd/memorypilot/memorypilot
 ```
 
-That's it. Builds from source via `cargo` (Homebrew pulls Rust automatically). After install, run `./install.sh` from the cloned repo or follow the manual MCP config below.
+That's it. On Apple Silicon, Homebrew installs the signed and notarized release binary (from the first signed release on); Intel Macs and Linux build from source via `cargo` (Homebrew pulls Rust automatically). After install, run `./install.sh` from the cloned repo or follow the manual MCP config below.
+
+> **Why signed matters on macOS.** Credentials stored in MemoryPilot are encrypted with a key kept in your Keychain. macOS lets a binary read it without asking only when that binary is signed by the team that created the key. The signed release keeps that identity across updates, so you are never prompted; a binary built from source (`cargo install`, Homebrew on Intel) has a new identity at each build, and macOS asks for your Keychain password after each update. Without stored credentials, the Keychain is never read.
 
 ### One-liner — auto-configures every IDE on your machine
 
@@ -323,16 +326,18 @@ curl -fsSL https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/insta
 
 What this does:
 1. Detects your platform (macOS arm64 / x64, Linux x64 / arm64).
-2. Fetches the pre-built binary from the [latest GitHub Release](https://github.com/Soflutionltd/MemoryPilot/releases/latest) (~11 MB tar.gz).
-3. Installs to `~/.local/bin/MemoryPilot` and clears Gatekeeper attributes on macOS.
-4. Auto-configures every supported IDE / agent it finds — Cursor, Claude Desktop, Claude Code, Codex CLI, Gemini CLI, Windsurf, VS Code, OpenCode, Cline, Roo Code — in a single pass.
+2. Fetches the pre-built binary from the [latest GitHub Release](https://github.com/Soflutionltd/MemoryPilot/releases/latest) and checks its `.sha256`.
+3. On macOS, checks the signature: refuses a binary signed by another team, warns when it is unsigned.
+4. Installs to `~/.local/bin/MemoryPilot` and clears Gatekeeper attributes on macOS.
+5. Auto-configures every supported IDE / agent it finds — Cursor, Claude Desktop, Claude Code, Codex CLI, Gemini CLI, Windsurf, VS Code, OpenCode, Cline, Roo Code — in a single pass.
 
 If no pre-built binary is available for your platform, it falls back to `cargo build --release --features http` automatically (requires Rust).
 
 ### Alternative paths
 
 ```bash
-# Via Cargo, pinned to a release tag — works anywhere Rust runs:
+# Via Cargo, pinned to a release tag — works anywhere Rust runs
+# (unsigned on macOS: Keychain prompt after each update if you store credentials):
 cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.10.0 --bin MemoryPilot
 
 # Local clone + auto-config (same installer, run from inside the repo):
@@ -343,7 +348,7 @@ The installer is idempotent: re-run it any time to refresh configs without break
 
 ### Pre-built binaries
 
-Every release ships pre-built binaries for the three mainstream targets — built by the [release CI workflow](https://github.com/Soflutionltd/MemoryPilot/actions/workflows/release.yml) on every `v*.*.*` tag:
+Every release ships pre-built binaries for the three mainstream targets. Linux builds come from the [release CI workflow](https://github.com/Soflutionltd/MemoryPilot/actions/workflows/release.yml) on every `v*.*.*` tag; the macOS build is signed with Soflution's Developer ID and notarized by Apple (`scripts/release-macos.sh`):
 
 | Platform | Target triple | Archive |
 |----------|---------------|---------|
