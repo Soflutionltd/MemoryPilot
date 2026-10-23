@@ -20,15 +20,27 @@ const ROLLUP_INTERVAL_SECS: u64 = 600;
 /// at least a couple of interval rollups.
 const ROLLUP_MIN_MEMORIES: i64 = 8;
 
-/// Rewind the compaction debounce so the next `add_memory` runs GC +
-/// capsule compaction immediately. Test-only: the clock is process-wide.
+#[cfg(test)]
+thread_local! {
+    static ARMED_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make the next `add_memory` on this thread skip the compaction debounce.
+/// Per thread: the debounce clock is process-wide, and parallel tests
+/// writing memories would otherwise consume a rewound clock first.
 #[cfg(test)]
 pub(super) fn arm_compaction_for_tests() {
-    let last = LAST_COMPACT.get_or_init(|| Mutex::new(std::time::Instant::now()));
-    if let Ok(mut timestamp) = last.lock() {
-        *timestamp = std::time::Instant::now() - std::time::Duration::from_secs(600);
-    }
-    COMPACTING.store(false, Ordering::SeqCst);
+    ARMED_FOR_TESTS.with(|armed| armed.set(true));
+}
+
+#[cfg(test)]
+fn take_test_arming() -> bool {
+    ARMED_FOR_TESTS.with(|armed| armed.replace(false))
+}
+
+#[cfg(not(test))]
+fn take_test_arming() -> bool {
+    false
 }
 
 pub(super) fn maybe_auto_compact(db: &Database) {
@@ -123,7 +135,7 @@ fn maybe_compact(db: &Database) {
         let Ok(mut timestamp) = last.lock() else {
             return;
         };
-        if timestamp.elapsed() < std::time::Duration::from_secs(300) {
+        if !take_test_arming() && timestamp.elapsed() < std::time::Duration::from_secs(300) {
             return;
         }
         *timestamp = std::time::Instant::now();

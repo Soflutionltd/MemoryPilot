@@ -35,10 +35,9 @@ fn auto_compaction_reenters_add_memory_without_deadlock() {
                 )
                 .expect("seed memory");
         }
-        super::compaction::arm_compaction_for_tests();
-
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            super::compaction::arm_compaction_for_tests();
             let outcome = db.add_memory(
                 "Fresh decision that trips auto-compaction.",
                 "decision",
