@@ -7,12 +7,14 @@
 //! `memorypilot_app` role, `app.tenant_id` set per transaction) rejects
 //! any row of another tenant.
 
+mod auth;
 mod connection;
 mod pg_store;
 mod pool;
 mod schema;
 pub mod text;
 
+pub use auth::{ApiKey, ApiKeyInfo, NewApiKey, Permission};
 pub use connection::PgConnection;
 pub use pg_store::{PgAdmin, PgStore, Scope};
 pub use pool::PgPool;

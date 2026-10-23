@@ -19,6 +19,8 @@ unicode-normalization = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 webpki-roots = "1"
+ring = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 memorypilot-core = { path = "../memorypilot-core", features = ["store-contract"] }

@@ -9,7 +9,7 @@ use memorypilot_core::db::{
     add_memory_to, fr_scenarios, hybrid_search, score_fr_queries, update_memory_in, Memory,
     MemoryScope, MemoryStore, RecallStore, WriteOutcome,
 };
-use memorypilot_server::{PgAdmin, PgConnection, PgPool, PgStore, Scope};
+use memorypilot_server::{Permission, PgAdmin, PgConnection, PgPool, PgStore, Scope};
 use uuid::Uuid;
 
 const NEEDS_POSTGRES: &str = "needs Postgres with pgvector: scripts/test-postgres.sh";
@@ -126,6 +126,149 @@ fn pooled_sessions_move_between_tenants_safely() {
         )
         .is_err(),
         "scope still checked"
+    );
+}
+
+/// A key resolves to its own space only while it is live, and a tenant
+/// cannot revoke or create keys for another tenant's space.
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn api_keys_resolve_to_their_space_until_revoked() {
+    let mut admin = admin();
+    let (owner, other) = (new_space(&mut admin), new_space(&mut admin));
+    let pool = PgPool::new(plain(), 2);
+    let created = admin
+        .create_api_key(
+            owner.tenant,
+            owner.space,
+            "backend",
+            &[Permission::Write, Permission::Read],
+        )
+        .expect("key");
+    assert!(!format!("{:?}", created).contains(&created.secret));
+
+    let key = pool
+        .authenticate(&created.secret)
+        .expect("lookup")
+        .expect("live key");
+    assert_eq!(
+        (key.id, key.tenant, key.space),
+        (created.id, owner.tenant, owner.space)
+    );
+    assert_eq!(key.permissions, vec![Permission::Read, Permission::Write]);
+    assert_eq!(key.scope(None), owner);
+
+    let mut forged = created.secret.clone();
+    forged.replace_range(10..11, if &forged[10..11] == "A" { "B" } else { "A" });
+    assert_eq!(
+        pool.authenticate(&forged).expect("lookup"),
+        None,
+        "another key of the same shape"
+    );
+    assert_eq!(pool.authenticate("Bearer whatever").expect("lookup"), None);
+
+    let listed = admin.list_api_keys(owner.tenant).expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "backend");
+    assert!(created.secret.starts_with(&listed[0].prefix));
+    assert!(listed[0].last_used_at.is_some(), "use is recorded");
+    assert!(admin.list_api_keys(other.tenant).expect("list").is_empty());
+
+    assert!(
+        admin
+            .create_api_key(other.tenant, owner.space, "stolen", &[Permission::Read])
+            .is_err(),
+        "a tenant cannot create keys for another tenant's space"
+    );
+    assert!(!admin
+        .revoke_api_key(other.tenant, created.id)
+        .expect("revoke"));
+    assert!(pool
+        .authenticate(&created.secret)
+        .expect("lookup")
+        .is_some());
+    assert!(admin
+        .revoke_api_key(owner.tenant, created.id)
+        .expect("revoke"));
+    assert!(!admin
+        .revoke_api_key(owner.tenant, created.id)
+        .expect("revoke twice"));
+    assert_eq!(
+        pool.authenticate(&created.secret).expect("lookup"),
+        None,
+        "revoked"
+    );
+}
+
+/// The application role never reads the key table, even inside its tenant.
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn the_application_role_cannot_read_api_keys() {
+    let mut admin = admin();
+    let owner = new_space(&mut admin);
+    admin
+        .create_api_key(owner.tenant, owner.space, "backend", &[Permission::Read])
+        .expect("key");
+    let mut client = postgres::Client::connect(&url(), postgres::NoTls).expect("raw connection");
+    client
+        .batch_execute("SET ROLE memorypilot_app")
+        .expect("app role");
+    let mut tx = client.transaction().expect("tx");
+    tx.execute(
+        "SELECT set_config('app.tenant_id', $1, true)",
+        &[&owner.tenant.to_string()],
+    )
+    .expect("tenant");
+    let read = tx.query("SELECT key_hash FROM api_keys", &[]);
+    assert!(read.is_err(), "permission denied on api_keys");
+}
+
+/// End users are created on first use, once, in the key's own space, and
+/// only by a key allowed to act for them.
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn keys_with_the_subjects_permission_act_for_end_users() {
+    let mut admin = admin();
+    let (owner, other) = (new_space(&mut admin), new_space(&mut admin));
+    let pool = PgPool::new(plain(), 2);
+    let resolve = |admin: &mut PgAdmin, scope: Scope, permissions: &[Permission]| {
+        let created = admin
+            .create_api_key(scope.tenant, scope.space, "app", permissions)
+            .expect("key");
+        pool.authenticate(&created.secret)
+            .expect("lookup")
+            .expect("live key")
+    };
+    let app = resolve(
+        &mut admin,
+        owner,
+        &[Permission::Read, Permission::Write, Permission::Subjects],
+    );
+    let reader = resolve(&mut admin, owner, &[Permission::Read]);
+    let foreign = resolve(&mut admin, other, &[Permission::Subjects]);
+
+    let alice = pool.subject(&app, "user-42").expect("created");
+    assert_eq!(pool.subject(&app, "user-42").expect("found again"), alice);
+    assert_ne!(
+        pool.subject(&foreign, "user-42")
+            .expect("same id elsewhere"),
+        alice
+    );
+    assert!(
+        pool.subject(&reader, "user-42").is_err(),
+        "no subjects permission"
+    );
+    assert!(pool.subject(&app, "").is_err());
+    assert!(pool.subject(&app, "line\nbreak").is_err());
+    assert!(pool.subject(&app, &"x".repeat(201)).is_err());
+
+    let as_alice = PgStore::from_pool(&pool, app.scope(Some(alice))).expect("end user store");
+    as_alice
+        .insert_memory(&memory("a-1", "Alice prefers dark mode"), "h-a")
+        .expect("insert");
+    assert!(
+        PgStore::from_pool(&pool, foreign.scope(Some(alice))).is_err(),
+        "a subject belongs to one space"
     );
 }
 

@@ -1715,10 +1715,12 @@ dependencies = [
 name = "memorypilot-server"
 version = "4.10.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "memorypilot-core",
  "pgvector",
  "postgres",
+ "ring",
  "rustls",
  "serde_json",
  "tokio-postgres-rustls",

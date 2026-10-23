@@ -3,7 +3,10 @@
 
 use postgres::Client;
 
-const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/0001_tenancy.sql"))];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("../migrations/0001_tenancy.sql")),
+    (2, include_str!("../migrations/0002_api_keys.sql")),
+];
 
 pub fn migrate(client: &mut Client) -> Result<Vec<i32>, String> {
     let mut tx = client.transaction().map_err(crate::pg_error)?;

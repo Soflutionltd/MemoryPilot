@@ -13,9 +13,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+use crate::auth::{generate_key, info_from_row, permission_names};
 use crate::pool::{app_session, ExpiryClock, PooledClient};
 use crate::text::{fts5_to_tsquery, index_text};
 use crate::{pg_error, PgConnection, PgPool};
+use crate::{ApiKeyInfo, NewApiKey, Permission};
 
 /// Where a store reads and writes. With a subject it sees that end user's
 /// memories plus the ones shared by the space, and writes as that end
@@ -164,6 +166,58 @@ impl PgAdmin {
             )
             .map_err(pg_error)?;
         Ok(row.get(0))
+    }
+
+    /// A new key for one space of `tenant`. The secret is in the answer only.
+    pub fn create_api_key(
+        &mut self,
+        tenant: Uuid,
+        space: Uuid,
+        name: &str,
+        permissions: &[Permission],
+    ) -> Result<NewApiKey, String> {
+        let names = permission_names(permissions)?;
+        let key = generate_key()?;
+        let row = self
+            .client
+            .query_opt(
+                "INSERT INTO api_keys (tenant_id, space_id, name, prefix, key_hash, permissions)
+                 SELECT $1, $2, $3, $4, $5, $6 FROM spaces WHERE tenant_id = $1 AND id = $2
+                 RETURNING id",
+                &[&tenant, &space, &name, &key.prefix, &key.hash, &names],
+            )
+            .map_err(pg_error)?
+            .ok_or("Unknown space for this tenant")?;
+        Ok(NewApiKey {
+            id: row.get(0),
+            secret: key.secret,
+        })
+    }
+
+    /// Revokes a key of `tenant`; false when it has no such live key.
+    pub fn revoke_api_key(&mut self, tenant: Uuid, key: Uuid) -> Result<bool, String> {
+        let changed = self
+            .client
+            .execute(
+                "UPDATE api_keys SET revoked_at = now()
+                 WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL",
+                &[&tenant, &key],
+            )
+            .map_err(pg_error)?;
+        Ok(changed == 1)
+    }
+
+    pub fn list_api_keys(&mut self, tenant: Uuid) -> Result<Vec<ApiKeyInfo>, String> {
+        self.client
+            .query(
+                "SELECT id, space_id, name, prefix, permissions, created_at, last_used_at, revoked_at
+                 FROM api_keys WHERE tenant_id = $1 ORDER BY created_at, id",
+                &[&tenant],
+            )
+            .map_err(pg_error)?
+            .iter()
+            .map(info_from_row)
+            .collect()
     }
 }
 
