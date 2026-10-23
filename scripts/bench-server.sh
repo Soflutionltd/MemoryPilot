@@ -3,10 +3,14 @@
 # (scripts/test-postgres.sh starts it). Does not call an LLM.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-# shellcheck disable=SC1091
+PASS_FILE="$HOME/.cache/memorypilot-dev/pg.pass"
 if [ -z "${MEMORYPILOT_TEST_PG_URL:-}" ]; then
-  echo "Run after scripts/test-postgres.sh, or set MEMORYPILOT_TEST_PG_URL." >&2
-  exit 1
+  if [ -f "$PASS_FILE" ]; then
+    MEMORYPILOT_TEST_PG_URL="postgresql://postgres:$(cat "$PASS_FILE")@127.0.0.1:55432/memorypilot"
+  else
+    echo "Run scripts/test-postgres.sh first (it starts the test Postgres)." >&2
+    exit 1
+  fi
 fi
 export MEMORYPILOT_PG_URL="$MEMORYPILOT_TEST_PG_URL"
 export MEMORYPILOT_PG_TLS=off
@@ -45,9 +49,17 @@ curl -fsS -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
 alice="$(curl -fsS -H "Authorization: Bearer $key" -H "X-MemoryPilot-Subject: alice" "$base/v1/memories")"
 echo "$alice" | grep -q "green tea"
 echo "$alice" | grep -q "stand-up"
-echo "$alice" | grep -qv "Old stripe" || true
 other_list="$(curl -fsS -H "Authorization: Bearer $okey" "$base/v1/memories")"
-echo "$other_list" | grep -qv "green tea"
+if echo "$other_list" | grep -q "green tea"; then
+  echo "other tenant saw alice" >&2
+  exit 1
+fi
+search_expired="$(curl -fsS -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+  -d '{"query":"Old stripe proxy","limit":5}' "$base/v1/search")"
+if echo "$search_expired" | grep -q "Old stripe"; then
+  echo "expired memory still in search" >&2
+  exit 1
+fi
 
 python3 - <<PY
 import json, time, urllib.request
