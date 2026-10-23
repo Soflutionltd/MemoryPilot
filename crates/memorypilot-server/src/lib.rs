@@ -10,6 +10,7 @@
 pub mod api;
 mod auth;
 mod connection;
+mod mcp;
 mod pg_store;
 mod pool;
 mod schema;

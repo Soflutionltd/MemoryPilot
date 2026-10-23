@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use memorypilot_server::api::{Api, Request, Response, MAX_BODY_BYTES};
 use memorypilot_server::{Permission, PgAdmin, PgConnection, PgPool};
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 const USAGE: &str = "memorypilot-server [command]
@@ -29,7 +29,12 @@ Environment:
   MEMORYPILOT_PG_CA       extra CA certificate (PEM), e.g. Supabase's prod-ca-2021.crt
   MEMORYPILOT_PG_TLS      on (default: certificate and host name verified) or off (local only)
   MEMORYPILOT_BIND        address to listen on (default 127.0.0.1:8080)
-  MEMORYPILOT_WORKERS     concurrent requests (default 8)";
+  MEMORYPILOT_WORKERS     concurrent requests (default 8)
+  MEMORYPILOT_ALLOWED_ORIGINS
+                          browser origins allowed on /mcp, comma separated (default none)
+
+Endpoints: GET /health; REST /v1/memories, /v1/search; MCP (Streamable HTTP) POST /mcp.
+Authorization: Bearer <key>. X-MemoryPilot-Subject: <end user id> acts for one end user.";
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
 const DEFAULT_WORKERS: usize = 8;
@@ -145,7 +150,15 @@ fn serve() -> Result<(), String> {
             .filter(|n| (1..=MAX_WORKERS).contains(n))
             .ok_or_else(|| format!("MEMORYPILOT_WORKERS is a number from 1 to {}", MAX_WORKERS))?,
     };
-    let api = Api::new(PgPool::new(connection, workers));
+    let origins = env("MEMORYPILOT_ALLOWED_ORIGINS")
+        .map(|list| {
+            list.split(',')
+                .map(|origin| origin.trim().to_string())
+                .filter(|origin| !origin.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let api = Api::new(PgPool::new(connection, workers)).with_allowed_origins(origins);
     let server = Arc::new(
         tiny_http::Server::http(&bind).map_err(|e| format!("cannot listen on {}: {}", bind, e))?,
     );
@@ -171,14 +184,6 @@ fn serve() -> Result<(), String> {
             .map_err(|_| "a worker stopped unexpectedly".to_string())?;
     }
     Ok(())
-}
-
-fn header<'a>(request: &'a tiny_http::Request, name: &'static str) -> Option<&'a str> {
-    request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv(name))
-        .map(|header| header.value.as_str())
 }
 
 fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, Response> {
@@ -213,11 +218,15 @@ fn answer(api: &Api, mut request: tiny_http::Request) {
     let response = match read_body(&mut request) {
         Err(response) => response,
         Ok(body) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let headers: Vec<(&str, &str)> = request
+                .headers()
+                .iter()
+                .map(|header| (header.field.as_str().as_str(), header.value.as_str()))
+                .collect();
             api.handle(&Request {
                 method: request.method().as_str(),
                 url: request.url(),
-                authorization: header(&request, "Authorization"),
-                subject: header(&request, "X-MemoryPilot-Subject"),
+                headers: &headers,
                 body: &body,
             })
         }))
@@ -229,10 +238,13 @@ fn answer(api: &Api, mut request: tiny_http::Request) {
     let path = request.url().split('?').next().unwrap_or("").to_string();
     let method = request.method().as_str().to_string();
     let status = response.status;
-    let mut reply = tiny_http::Response::from_string(response.body.to_string())
-        .with_status_code(status)
-        .with_header(fixed_header("Content-Type: application/json"))
-        .with_header(fixed_header("Cache-Control: no-store"));
+    let mut reply = match response.body {
+        Value::Null => tiny_http::Response::from_string(String::new()),
+        body => tiny_http::Response::from_string(body.to_string())
+            .with_header(fixed_header("Content-Type: application/json")),
+    }
+    .with_status_code(status)
+    .with_header(fixed_header("Cache-Control: no-store"));
     if status == 401 {
         reply = reply.with_header(fixed_header("WWW-Authenticate: Bearer"));
     }

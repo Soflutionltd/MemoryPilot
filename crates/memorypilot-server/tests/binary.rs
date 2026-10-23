@@ -157,6 +157,24 @@ fn the_binary_sets_up_a_tenant_and_serves_its_memories() {
     );
     assert_eq!(status, 413, "bodies over 1 MiB are refused");
 
+    let (status, head, body) = http(
+        &server,
+        "POST",
+        "/mcp",
+        Some(&key),
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    assert_eq!((status, body.as_str()), (202, ""), "{}", head);
+    let (status, _, body) = http(
+        &server,
+        "POST",
+        "/mcp",
+        Some(&key),
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+    );
+    assert_eq!(status, 200, "{}", body);
+    assert!(body.contains("search_memory"));
+
     admin(&["revoke-key", &tenant, key_id]);
     let (status, _, _) = http(&server, "GET", "/v1/memories", Some(&key), "");
     assert_eq!(status, 401, "a revoked key stops working at once");

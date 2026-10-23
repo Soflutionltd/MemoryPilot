@@ -24,14 +24,24 @@ const MAX_METADATA_BYTES: usize = 16 * 1024;
 const MAX_LIST_LIMIT: usize = 100;
 const MAX_SEARCH_LIMIT: usize = 50;
 const SOURCE: &str = "api";
+pub const SUBJECT_HEADER: &str = "X-MemoryPilot-Subject";
 
 pub struct Request<'a> {
     pub method: &'a str,
     /// Path and query string.
     pub url: &'a str,
-    pub authorization: Option<&'a str>,
-    pub subject: Option<&'a str>,
+    /// Name and value of each header, names in any case.
+    pub headers: &'a [(&'a str, &'a str)],
     pub body: &'a [u8],
+}
+
+impl Request<'_> {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| *value)
+    }
 }
 
 #[derive(Debug)]
@@ -46,9 +56,9 @@ impl Response {
     }
 }
 
-struct Failure {
-    status: u16,
-    message: String,
+pub(crate) struct Failure {
+    pub(crate) status: u16,
+    pub(crate) message: String,
 }
 
 impl Failure {
@@ -121,11 +131,22 @@ fn route<'a>(method: &str, path: &'a str) -> Option<Route<'a>> {
 #[derive(Clone)]
 pub struct Api {
     pool: PgPool,
+    allowed_origins: Vec<String>,
 }
 
 impl Api {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            allowed_origins: Vec::new(),
+        }
+    }
+
+    /// Browser origins allowed to call `/mcp` (DNS rebinding guard: any
+    /// other `Origin` is refused). Server-side clients send none.
+    pub fn with_allowed_origins(mut self, origins: Vec<String>) -> Self {
+        self.allowed_origins = origins;
+        self
     }
 
     pub fn handle(&self, request: &Request) -> Response {
@@ -139,13 +160,16 @@ impl Api {
                 json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }),
             ));
         }
+        if path == "/mcp" {
+            return self.mcp(request);
+        }
         let route = route(request.method, path).ok_or_else(|| {
             Failure::new(
                 404,
-                "Not found. Routes: POST|GET /v1/memories, GET|PATCH|DELETE /v1/memories/{id}, POST /v1/search",
+                "Not found. Routes: POST|GET /v1/memories, GET|PATCH|DELETE /v1/memories/{id}, POST /v1/search, POST /mcp",
             )
         })?;
-        let key = self.authenticate(request.authorization)?;
+        let key = self.authenticate(request.header("Authorization"))?;
         if !key.allows(route.permission()) {
             return Err(Failure::new(
                 403,
@@ -155,15 +179,34 @@ impl Api {
                 ),
             ));
         }
-        let store = self.store(&key, request.subject)?;
+        let store = self.store(&key, request.header(SUBJECT_HEADER))?;
         match route {
             Route::AddMemory => add(&store, request.body),
-            Route::ListMemories => list(&store, query),
+            Route::ListMemories => list(&store, &query_params(query)),
             Route::GetMemory(id) => get(&store, id),
             Route::UpdateMemory(id) => update(&store, id, request.body),
             Route::DeleteMemory(id) => delete(&store, id),
             Route::Search => search(&store, request.body),
         }
+    }
+
+    fn mcp(&self, request: &Request) -> Result<Response, Failure> {
+        if request.method != "POST" {
+            return Err(Failure::new(
+                405,
+                "The MCP endpoint takes POST only (no session, no stream to open)",
+            ));
+        }
+        if let Some(origin) = request.header("Origin") {
+            if !self.allowed_origins.iter().any(|allowed| allowed == origin) {
+                return Ok(Response {
+                    status: 403,
+                    body: json!({ "jsonrpc": "2.0", "error": { "code": -32600, "message": "Origin not allowed" } }),
+                });
+            }
+        }
+        let key = self.authenticate(request.header("Authorization"))?;
+        Ok(crate::mcp::handle(self, &key, request))
     }
 
     fn authenticate(&self, authorization: Option<&str>) -> Result<ApiKey, Failure> {
@@ -177,7 +220,7 @@ impl Api {
             .ok_or_else(|| Failure::new(401, "Invalid or revoked API key"))
     }
 
-    fn store(&self, key: &ApiKey, subject: Option<&str>) -> Result<PgStore, Failure> {
+    pub(crate) fn store(&self, key: &ApiKey, subject: Option<&str>) -> Result<PgStore, Failure> {
         let subject = match subject {
             None => None,
             Some(_) if !key.allows(Permission::Subjects) => {
@@ -281,7 +324,7 @@ struct NewMemory {
     metadata: Option<Value>,
 }
 
-fn add(store: &PgStore, body: &[u8]) -> Result<Response, Failure> {
+pub(crate) fn add(store: &PgStore, body: &[u8]) -> Result<Response, Failure> {
     let input: NewMemory = parse(body)?;
     let content = non_empty("content", &input.content, MAX_CONTENT_BYTES)?;
     let (auto_importance, auto_kind, auto_ttl_days) = memorypilot_core::gc::auto_classify(content);
@@ -346,10 +389,9 @@ fn bounded(
     }
 }
 
-fn list(store: &PgStore, query: &str) -> Result<Response, Failure> {
-    let params = query_params(query);
-    let limit = bounded(&params, "limit", 20, MAX_LIST_LIMIT)?;
-    let offset = bounded(&params, "offset", 0, usize::MAX)?;
+pub(crate) fn list(store: &PgStore, params: &HashMap<String, String>) -> Result<Response, Failure> {
+    let limit = bounded(params, "limit", 20, MAX_LIST_LIMIT)?;
+    let offset = bounded(params, "offset", 0, usize::MAX)?;
     let kind = params.get("kind").map(String::as_str);
     if let Some(kind) = kind {
         check_known_kind(kind)?;
@@ -388,7 +430,7 @@ fn found(memory: Option<Memory>, id: &str) -> Result<Memory, Failure> {
     memory.ok_or_else(|| Failure::new(404, format!("No memory '{}'", id)))
 }
 
-fn get(store: &PgStore, id: &str) -> Result<Response, Failure> {
+pub(crate) fn get(store: &PgStore, id: &str) -> Result<Response, Failure> {
     let memory = found(store.fetch_memory(id).map_err(Failure::from_store)?, id)?;
     Ok(Response::ok(json!({ "memory": memory })))
 }
@@ -404,7 +446,7 @@ struct MemoryChanges {
     metadata: Option<Value>,
 }
 
-fn update(store: &PgStore, id: &str, body: &[u8]) -> Result<Response, Failure> {
+pub(crate) fn update(store: &PgStore, id: &str, body: &[u8]) -> Result<Response, Failure> {
     let changes: MemoryChanges = parse(body)?;
     if let Some(content) = &changes.content {
         non_empty("content", content, MAX_CONTENT_BYTES)?;
@@ -440,7 +482,7 @@ fn update(store: &PgStore, id: &str, body: &[u8]) -> Result<Response, Failure> {
     Ok(Response::ok(json!({ "memory": memory })))
 }
 
-fn delete(store: &PgStore, id: &str) -> Result<Response, Failure> {
+pub(crate) fn delete(store: &PgStore, id: &str) -> Result<Response, Failure> {
     changeable(store, id)?;
     if !store.remove_memory(id).map_err(Failure::from_store)? {
         return Err(Failure::new(404, format!("No memory '{}'", id)));
@@ -458,7 +500,7 @@ struct SearchQuery {
     tags: Option<Vec<String>>,
 }
 
-fn search(store: &PgStore, body: &[u8]) -> Result<Response, Failure> {
+pub(crate) fn search(store: &PgStore, body: &[u8]) -> Result<Response, Failure> {
     let input: SearchQuery = parse(body)?;
     let query = non_empty("query", &input.query, MAX_QUERY_BYTES)?;
     let limit = input.limit.unwrap_or(10);
