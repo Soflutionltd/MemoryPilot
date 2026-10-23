@@ -191,6 +191,17 @@ fn the_binary_sets_up_a_tenant_and_serves_its_memories() {
     }
     admin(&["usage", &tenant, "7"]);
 
+    let exported = admin(&["export-tenant", &tenant]);
+    assert_eq!(exported.lines().count(), 1, "{}", exported);
+    assert!(exported.contains("The binary test stores this memory"));
+    let wrong_name = command()
+        .args(["delete-tenant", &tenant, "not-its-name"])
+        .output()
+        .expect("run");
+    assert!(!wrong_name.status.success(), "the exact name is required");
+    admin(&["delete-tenant", &tenant, "binary-test"]);
+    assert_eq!(admin(&["export-tenant", &tenant]), "");
+
     let unknown = command().arg("create-space").output().expect("run");
     assert!(!unknown.status.success());
     let plain_refused = Command::new(BINARY)

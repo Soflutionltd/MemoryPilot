@@ -262,6 +262,59 @@ impl PgAdmin {
             .collect())
     }
 
+    /// Writes every memory of the tenant as one JSON object per line
+    /// (portability when a customer leaves); returns how many.
+    pub fn export_tenant(
+        &mut self,
+        tenant: Uuid,
+        out: &mut dyn std::io::Write,
+    ) -> Result<usize, String> {
+        use postgres::fallible_iterator::FallibleIterator;
+        let sql = format!(
+            "SELECT {}, sp.id, sp.name, su.external_id FROM memories m
+             JOIN spaces sp ON sp.tenant_id = m.tenant_id AND sp.id = m.space_id
+             LEFT JOIN subjects su ON su.tenant_id = m.tenant_id AND su.id = m.subject_id
+             WHERE m.tenant_id = $1 ORDER BY m.created_at, m.id",
+            COLUMNS
+        );
+        let mut rows = self
+            .client
+            .query_raw(
+                sql.as_str(),
+                [&tenant as &(dyn postgres::types::ToSql + Sync)],
+            )
+            .map_err(pg_error)?;
+        let mut written = 0;
+        while let Some(row) = rows.next().map_err(pg_error)? {
+            let memory = row_to_memory(&row).map_err(pg_error)?;
+            let line = serde_json::json!({
+                "space": row.get::<_, Uuid>(13).to_string(),
+                "space_name": row.get::<_, String>(14),
+                "end_user": row.get::<_, Option<String>>(15),
+                "memory": memory,
+            });
+            writeln!(out, "{}", line).map_err(|e| format!("Export: {}", e))?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Deletes a tenant and everything it owns, irreversibly. `name` must be
+    /// the tenant's exact name, as a guard against a wrong id.
+    pub fn delete_tenant(&mut self, tenant: Uuid, name: &str) -> Result<(), String> {
+        let deleted = self
+            .client
+            .execute(
+                "DELETE FROM tenants WHERE id = $1 AND name = $2",
+                &[&tenant, &name],
+            )
+            .map_err(pg_error)?;
+        if deleted != 1 {
+            return Err("No tenant with this id and this exact name".into());
+        }
+        Ok(())
+    }
+
     /// Sets a tenant's limits (`None`: the server default); false for an unknown tenant.
     pub fn set_limits(&mut self, tenant: Uuid, limits: TenantLimits) -> Result<bool, String> {
         let requests_per_minute = limits
@@ -468,6 +521,66 @@ impl PgStore {
             .iter()
             .map(|row| row.get(0))
             .collect())
+    }
+
+    fn end_user(&self) -> Result<Uuid, String> {
+        self.scope
+            .subject
+            .ok_or_else(|| "This needs an end user (X-MemoryPilot-Subject)".to_string())
+    }
+
+    /// Everything stored for this scope's end user (GDPR access and
+    /// portability): their own memories and facts, not the shared ones.
+    pub fn export_subject(&self) -> Result<serde_json::Value, String> {
+        self.end_user()?;
+        let memories = self.memories(
+            &format!(
+                "SELECT {} FROM memories m WHERE {} ORDER BY m.created_at, m.id",
+                COLUMNS,
+                owned("m")
+            ),
+            Vec::new(),
+        )?;
+        let facts: Vec<serde_json::Value> = self
+            .query(
+                "SELECT t.subject, t.predicate, t.object, t.valid_to, t.created_at FROM knowledge_triples t
+                 WHERE t.tenant_id = $1 AND t.space_id = $2 AND t.subject_id = $3 ORDER BY t.created_at, t.id",
+                Vec::new(),
+            )?
+            .iter()
+            .map(|row| {
+                let valid_to: Option<DateTime<Utc>> = row.get(3);
+                let created_at: DateTime<Utc> = row.get(4);
+                serde_json::json!({
+                    "subject": row.get::<_, String>(0),
+                    "predicate": row.get::<_, String>(1),
+                    "object": row.get::<_, String>(2),
+                    "valid_to": valid_to.map(|at| at.to_rfc3339()),
+                    "created_at": created_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "memories": memories, "facts": facts }))
+    }
+
+    /// Erases this scope's end user and everything they own (GDPR); returns
+    /// how many memories went with them.
+    pub fn delete_subject(&self) -> Result<i64, String> {
+        self.end_user()?;
+        let owned_memories = format!("SELECT count(*) FROM memories m WHERE {}", owned("m"));
+        self.run(|tx| {
+            let params: Vec<Param> = vec![
+                Box::new(self.scope.tenant),
+                Box::new(self.scope.space),
+                Box::new(self.scope.subject),
+            ];
+            let count: i64 = tx.query_one(&owned_memories, &refs(&params))?.get(0);
+            tx.execute(
+                "DELETE FROM subjects WHERE tenant_id = $1 AND space_id = $2 AND id = $3",
+                &refs(&params),
+            )?;
+            Ok(count)
+        })
     }
 
     /// Records a change made through API key `key` in this scope.

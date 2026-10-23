@@ -997,3 +997,174 @@ fn usage_is_metered_and_changes_are_audited_by_id_only() {
         "the application never reads the audit log"
     );
 }
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn an_end_user_is_exported_then_erased_with_everything_they_own() {
+    let app = app();
+    app.add(Some("alice"), "Alice prefers green tea in the morning");
+    app.add(Some("alice"), "Alice lives in Lyon near the river");
+    app.add(Some("bob"), "Bob collects old maps of Corsica");
+    app.add(None, "The team stand-up is at nine every weekday");
+
+    let export = app.send("GET", "/v1/subject/export", Some("alice"), Value::Null);
+    assert_eq!(export.status, 200, "{}", export.body);
+    let mut contents: Vec<&str> = export.body["memories"]
+        .as_array()
+        .expect("memories")
+        .iter()
+        .map(|memory| memory["content"].as_str().expect("content"))
+        .collect();
+    contents.sort();
+    assert_eq!(
+        contents,
+        [
+            "Alice lives in Lyon near the river",
+            "Alice prefers green tea in the morning"
+        ],
+        "only her own memories, never the shared ones"
+    );
+    assert!(export.body["facts"].is_array());
+    let alice_id = export.body["end_user_id"].as_str().expect("id").to_string();
+
+    let no_subject = app.send("DELETE", "/v1/subject", None, Value::Null);
+    assert_eq!(no_subject.status, 400, "{}", no_subject.body);
+    let reader = app.call(
+        "DELETE",
+        "/v1/subject",
+        Some(&app.reader),
+        Some("alice"),
+        "",
+    );
+    assert_eq!(reader.status, 403, "{}", reader.body);
+    let reader_export = app.call(
+        "GET",
+        "/v1/subject/export",
+        Some(&app.reader),
+        Some("alice"),
+        "",
+    );
+    assert_eq!(reader_export.status, 403, "{}", reader_export.body);
+
+    let erased = app.send("DELETE", "/v1/subject", Some("alice"), Value::Null);
+    assert_eq!(erased.status, 200, "{}", erased.body);
+    assert_eq!(erased.body["deleted_memories"], json!(2));
+    assert_eq!(erased.body["end_user_id"], json!(alice_id));
+
+    for (method, url) in [("GET", "/v1/subject/export"), ("DELETE", "/v1/subject")] {
+        let gone = app.send(method, url, Some("alice"), Value::Null);
+        assert_eq!(gone.status, 404, "{} {}: {}", method, url, gone.body);
+    }
+    let unknown = app.send("GET", "/v1/subject/export", Some("carol"), Value::Null);
+    assert_eq!(unknown.status, 404, "export never creates an end user");
+
+    assert_eq!(
+        app.listed(Some("bob")),
+        [
+            "Bob collects old maps of Corsica",
+            "The team stand-up is at nine every weekday"
+        ]
+    );
+    assert_eq!(
+        app.listed(None),
+        ["The team stand-up is at nine every weekday"]
+    );
+    assert_eq!(
+        app.listed(Some("alice")),
+        ["The team stand-up is at nine every weekday"]
+    );
+
+    let mut admin = PgAdmin::connect(&plain()).expect("admin connection");
+    let audit = admin.audit_log(app.tenant, 3).expect("audit");
+    let actions: Vec<&str> = audit.iter().map(|entry| entry.action.as_str()).collect();
+    assert_eq!(actions[..2], ["subject.delete", "subject.export"]);
+    for entry in &audit[..2] {
+        assert_eq!(entry.target.as_deref(), Some(alice_id.as_str()));
+        assert_eq!(
+            entry.subject.map(|id| id.to_string()),
+            Some(alice_id.clone())
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn a_tenant_is_exported_then_deleted_only_with_its_exact_name() {
+    let mut admin = PgAdmin::connect(&plain()).expect("admin connection");
+    admin.migrate().expect("migrations");
+    let name = format!("leaving-{}", Uuid::new_v4());
+    let tenant = admin.create_tenant(&name).expect("tenant");
+    let space = admin.create_space(tenant, "app").expect("space");
+    let key = admin
+        .create_api_key(tenant, space, "test", &Permission::ALL)
+        .expect("key")
+        .secret;
+    let pool = PgPool::new(plain(), 2);
+    let api = Api::new(pool.clone());
+    for (subject, content) in [
+        (Some("dana"), "Dana is allergic to peanuts"),
+        (None, "Office closes at six on Fridays"),
+    ] {
+        let authorization = format!("Bearer {}", key);
+        let mut headers = vec![
+            ("authorization", authorization.as_str()),
+            ("content-type", "application/json"),
+        ];
+        if let Some(subject) = subject {
+            headers.push(("x-memorypilot-subject", subject));
+        }
+        let body = json!({ "content": content }).to_string();
+        let response = api.handle(&Request {
+            method: "POST",
+            url: "/v1/memories",
+            headers: &headers,
+            body: body.as_bytes(),
+        });
+        assert_eq!(response.status, 201, "{}", response.body);
+    }
+
+    let mut out = Vec::new();
+    assert_eq!(admin.export_tenant(tenant, &mut out).expect("export"), 2);
+    let lines: Vec<Value> = String::from_utf8(out)
+        .expect("utf-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    let dana = lines
+        .iter()
+        .find(|line| line["end_user"] == json!("dana"))
+        .expect("Dana's memory names her");
+    assert_eq!(
+        dana["memory"]["content"],
+        json!("Dana is allergic to peanuts")
+    );
+    assert_eq!(dana["space"], json!(space.to_string()));
+    assert_eq!(dana["space_name"], json!("app"));
+    assert!(lines.iter().any(|line| line["end_user"].is_null()));
+
+    assert!(admin.delete_tenant(tenant, "wrong name").is_err());
+    assert!(admin.delete_tenant(Uuid::new_v4(), &name).is_err());
+    assert_eq!(
+        admin.list_api_keys(tenant).expect("keys").len(),
+        1,
+        "a refused delete keeps everything"
+    );
+
+    admin.delete_tenant(tenant, &name).expect("delete");
+    assert!(admin.list_api_keys(tenant).expect("keys").is_empty());
+    assert!(admin.audit_log(tenant, 10).expect("audit").is_empty());
+    let mut out = Vec::new();
+    assert_eq!(admin.export_tenant(tenant, &mut out).expect("export"), 0);
+    let authorization = format!("Bearer {}", key);
+    let headers = [("authorization", authorization.as_str())];
+    let response = api.handle(&Request {
+        method: "GET",
+        url: "/v1/memories",
+        headers: &headers,
+        body: b"",
+    });
+    assert_eq!(
+        response.status, 401,
+        "the deleted tenant's keys no longer work"
+    );
+}

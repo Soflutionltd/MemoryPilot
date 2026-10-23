@@ -30,6 +30,8 @@ Commands:
   usage <tenant> <days>                     daily requests, writes and searches per space
   audit <tenant> <count>                    latest changes (ids only), newest first
   list-keys <tenant>
+  export-tenant <tenant>                    every memory as JSON lines on stdout (portability)
+  delete-tenant <tenant> <exact name>       erases the tenant and all its data, irreversibly
 
 Environment:
   MEMORYPILOT_PG_URL      postgres://user:password@host:port/database (required)
@@ -145,6 +147,20 @@ fn run(args: &[String]) -> Result<(), String> {
                         .map_or(String::new(), |subject| format!("  end user {}", subject)),
                 );
             }
+            Ok(())
+        }
+        ["export-tenant", tenant] => {
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            let written = admin()?.export_tenant(uuid(tenant)?, &mut out)?;
+            std::io::Write::flush(&mut out).map_err(|e| format!("Export: {}", e))?;
+            eprintln!("{} memories exported", written);
+            Ok(())
+        }
+        ["delete-tenant", tenant, name] => {
+            admin()?.delete_tenant(uuid(tenant)?, name)?;
+            println!(
+                "tenant deleted with all its spaces, end users, memories, keys, usage and audit"
+            );
             Ok(())
         }
         ["revoke-key", tenant, key] => match admin()?.revoke_api_key(uuid(tenant)?, uuid(key)?)? {

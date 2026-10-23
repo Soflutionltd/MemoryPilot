@@ -194,6 +194,26 @@ impl PgPool {
     /// The end user known to the app as `external_id`, created on first use.
     /// Needs the subjects permission.
     pub fn subject(&self, key: &ApiKey, external_id: &str) -> Result<Uuid, String> {
+        self.find_subject(key, external_id, true)?
+            .ok_or_else(|| "End user not created".to_string())
+    }
+
+    /// The end user known to the app as `external_id`, if there is one
+    /// (never created: for export and erasure).
+    pub fn existing_subject(
+        &self,
+        key: &ApiKey,
+        external_id: &str,
+    ) -> Result<Option<Uuid>, String> {
+        self.find_subject(key, external_id, false)
+    }
+
+    fn find_subject(
+        &self,
+        key: &ApiKey,
+        external_id: &str,
+        create: bool,
+    ) -> Result<Option<Uuid>, String> {
         if !key.allows(Permission::Subjects) {
             return Err("This key cannot act for end users".into());
         }
@@ -213,19 +233,21 @@ impl PgPool {
             &[&key.tenant.to_string()],
         )
         .map_err(pg_error)?;
-        tx.execute(
-            "INSERT INTO subjects (tenant_id, space_id, external_id) VALUES ($1, $2, $3)
-             ON CONFLICT (tenant_id, space_id, external_id) DO NOTHING",
-            &[&key.tenant, &key.space, &external_id],
-        )
-        .map_err(pg_error)?;
-        let id: Uuid = tx
-            .query_one(
+        if create {
+            tx.execute(
+                "INSERT INTO subjects (tenant_id, space_id, external_id) VALUES ($1, $2, $3)
+                 ON CONFLICT (tenant_id, space_id, external_id) DO NOTHING",
+                &[&key.tenant, &key.space, &external_id],
+            )
+            .map_err(pg_error)?;
+        }
+        let id: Option<Uuid> = tx
+            .query_opt(
                 "SELECT id FROM subjects WHERE tenant_id = $1 AND space_id = $2 AND external_id = $3",
                 &[&key.tenant, &key.space, &external_id],
             )
             .map_err(pg_error)?
-            .get(0);
+            .map(|row| row.get(0));
         tx.commit().map_err(pg_error)?;
         Ok(id)
     }

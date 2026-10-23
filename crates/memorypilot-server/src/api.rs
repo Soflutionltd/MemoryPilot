@@ -112,9 +112,23 @@ impl From<Failure> for Response {
     }
 }
 
+fn audit(store: &PgStore, key: &ApiKey, action: &str, target: &str) {
+    if let Err(error) = store.record_audit(key.id, action, target) {
+        eprintln!(
+            "[memorypilot-server] audit of {} {}: {}",
+            action, target, error
+        );
+    }
+}
+
 pub(crate) enum Event {
     Search,
     Change {
+        action: &'static str,
+        target: String,
+    },
+    /// Audited, not metered as a write: an end user's data was read out.
+    Access {
         action: &'static str,
         target: String,
     },
@@ -146,6 +160,20 @@ impl Event {
                 action: "memory.delete",
                 target: id.to_string(),
             }),
+            Route::ExportSubject => Some(Event::Access {
+                action: "subject.export",
+                target: response.body["end_user_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            Route::DeleteSubject => Some(Event::Change {
+                action: "subject.delete",
+                target: response.body["end_user_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
             Route::ListMemories | Route::GetMemory(_) => None,
         }
     }
@@ -164,6 +192,8 @@ impl Event {
 }
 
 pub(crate) enum Route<'a> {
+    ExportSubject,
+    DeleteSubject,
     AddMemory,
     ListMemories,
     GetMemory(&'a str),
@@ -175,8 +205,13 @@ pub(crate) enum Route<'a> {
 impl Route<'_> {
     fn permission(&self) -> Permission {
         match self {
-            Route::ListMemories | Route::GetMemory(_) | Route::Search => Permission::Read,
-            Route::AddMemory | Route::UpdateMemory(_) | Route::DeleteMemory(_) => Permission::Write,
+            Route::ListMemories | Route::GetMemory(_) | Route::Search | Route::ExportSubject => {
+                Permission::Read
+            }
+            Route::AddMemory
+            | Route::UpdateMemory(_)
+            | Route::DeleteMemory(_)
+            | Route::DeleteSubject => Permission::Write,
         }
     }
 }
@@ -189,6 +224,8 @@ fn route<'a>(method: &str, path: &'a str) -> Option<Route<'a>> {
         ("POST", "/v1/memories", _) => Some(Route::AddMemory),
         ("GET", "/v1/memories", _) => Some(Route::ListMemories),
         ("POST", "/v1/search", _) => Some(Route::Search),
+        ("GET", "/v1/subject/export", _) => Some(Route::ExportSubject),
+        ("DELETE", "/v1/subject", _) => Some(Route::DeleteSubject),
         ("GET", _, Some(id)) => Some(Route::GetMemory(id)),
         ("PATCH", _, Some(id)) => Some(Route::UpdateMemory(id)),
         ("DELETE", _, Some(id)) => Some(Route::DeleteMemory(id)),
@@ -243,13 +280,9 @@ impl Api {
             Event::Search => self.meter.count(key.tenant, key.space, day, Usage::Search),
             Event::Change { action, target } => {
                 self.meter.count(key.tenant, key.space, day, Usage::Write);
-                if let Err(error) = store.record_audit(key.id, action, &target) {
-                    eprintln!(
-                        "[memorypilot-server] audit of {} {}: {}",
-                        action, target, error
-                    );
-                }
+                audit(store, key, action, &target);
             }
+            Event::Access { action, target } => audit(store, key, action, &target),
         }
     }
 
@@ -317,7 +350,7 @@ impl Api {
         let route = route(request.method, path).ok_or_else(|| {
             Failure::new(
                 404,
-                "Not found. Routes: POST|GET /v1/memories, GET|PATCH|DELETE /v1/memories/{id}, POST /v1/search, POST /mcp",
+                "Not found. Routes: POST|GET /v1/memories, GET|PATCH|DELETE /v1/memories/{id}, POST /v1/search, GET /v1/subject/export, DELETE /v1/subject, POST /mcp",
             )
         })?;
         let (key, headers) = match self.admit(request.header("Authorization")) {
@@ -347,8 +380,13 @@ impl Api {
                 ),
             ));
         }
-        let store = self.store(key, request.header(SUBJECT_HEADER))?;
+        let store = match route {
+            Route::ExportSubject | Route::DeleteSubject => self.existing_end_user(key, request)?,
+            _ => self.store(key, request.header(SUBJECT_HEADER))?,
+        };
         let response = match route {
+            Route::ExportSubject => export_subject(&store),
+            Route::DeleteSubject => delete_subject(&store),
             Route::AddMemory => add(&store, request.body, self.max_memories(key)),
             Route::ListMemories => list(&store, &query_params(query)),
             Route::GetMemory(id) => get(&store, id),
@@ -395,6 +433,29 @@ impl Api {
             .authenticate(presented)
             .map_err(Failure::from_store)?
             .ok_or_else(|| Failure::new(401, "Invalid or revoked API key"))
+    }
+
+    /// The store of the end user named by the request, who must exist:
+    /// export and erasure never create one.
+    fn existing_end_user(&self, key: &ApiKey, request: &Request) -> Result<PgStore, Failure> {
+        let external_id = request
+            .header(SUBJECT_HEADER)
+            .ok_or_else(|| Failure::invalid(format!("{} names the end user", SUBJECT_HEADER)))?;
+        if !key.allows(Permission::Subjects) {
+            return Err(Failure::new(
+                403,
+                "This key lacks the 'subjects' permission to act for an end user",
+            ));
+        }
+        let subject = self
+            .pool
+            .existing_subject(key, external_id)
+            .map_err(|error| match error.contains("Postgres:") {
+                true => Failure::from_store(error),
+                false => Failure::invalid(error),
+            })?
+            .ok_or_else(|| Failure::new(404, "No such end user"))?;
+        PgStore::from_pool(&self.pool, key.scope(Some(subject))).map_err(Failure::from_store)
     }
 
     pub(crate) fn store(&self, key: &ApiKey, subject: Option<&str>) -> Result<PgStore, Failure> {
@@ -716,5 +777,28 @@ pub(crate) fn search(store: &PgStore, body: &[u8]) -> Result<Response, Failure> 
     .map_err(Failure::from_store)?;
     Ok(Response::ok(
         json!({ "results": results, "confidence": confidence }),
+    ))
+}
+
+fn end_user_id(store: &PgStore) -> String {
+    store
+        .scope()
+        .subject
+        .map(|id| id.to_string())
+        .unwrap_or_default()
+}
+
+/// GDPR access and portability for one end user.
+fn export_subject(store: &PgStore) -> Result<Response, Failure> {
+    let mut export = store.export_subject().map_err(Failure::from_store)?;
+    export["end_user_id"] = json!(end_user_id(store));
+    Ok(Response::ok(export))
+}
+
+/// GDPR erasure of one end user and everything they own.
+fn delete_subject(store: &PgStore) -> Result<Response, Failure> {
+    let memories = store.delete_subject().map_err(Failure::from_store)?;
+    Ok(Response::ok(
+        json!({ "end_user_id": end_user_id(store), "deleted_memories": memories }),
     ))
 }
