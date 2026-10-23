@@ -3,22 +3,7 @@ use crate::protocol::{tool_error, tool_result};
 /// MCP Tool definitions and handlers for MemoryPilot v2.1.
 use serde_json::{json, Value};
 
-const VALID_KINDS: &[&str] = &[
-    "fact",
-    "preference",
-    "decision",
-    "pattern",
-    "snippet",
-    "bug",
-    "credential",
-    "todo",
-    "note",
-    "transcript",
-    "milestone",
-    "architecture",
-    "problem",
-    "skill",
-];
+const VALID_KINDS: &[&str] = crate::db::MEMORY_KINDS;
 
 // ─── Tool profile ────────────────────────────────────────────────────────
 // Every conversation loads the full tool list into the model's context

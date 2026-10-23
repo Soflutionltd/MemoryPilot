@@ -175,6 +175,24 @@ struct QueryIntent {
     technical: bool,
 }
 
+/// The kinds a memory can have.
+pub const MEMORY_KINDS: &[&str] = &[
+    "fact",
+    "preference",
+    "decision",
+    "pattern",
+    "snippet",
+    "bug",
+    "credential",
+    "todo",
+    "note",
+    "transcript",
+    "milestone",
+    "architecture",
+    "problem",
+    "skill",
+];
+
 /// Serialized by hand (db/vault.rs): credentials go out masked, with a pointer.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Memory {
