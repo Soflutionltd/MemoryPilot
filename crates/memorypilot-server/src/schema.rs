@@ -10,6 +10,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (4, include_str!("../migrations/0004_limits.sql")),
     (5, include_str!("../migrations/0005_usage_audit.sql")),
     (6, include_str!("../migrations/0006_erasure.sql")),
+    (7, include_str!("../migrations/0007_hnsw.sql")),
 ];
 
 pub fn migrate(client: &mut Client) -> Result<Vec<i32>, String> {

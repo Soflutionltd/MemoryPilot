@@ -1154,3 +1154,67 @@ fn pending_memories_of_every_tenant_get_embedded() {
     .expect("found");
     assert_eq!(ours(&mut admin), vec![first], "an edit queues it again");
 }
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn hnsw_indexes_nearest_neighbours_of_the_scope_only() {
+    let mut admin = admin();
+    let indexes = admin.indexes_on("memories").expect("indexes");
+    for name in [
+        "memories_embedding_384",
+        "memories_embedding_768",
+        "memories_embedding_1024",
+    ] {
+        assert!(
+            indexes.iter().any(|index| index == name),
+            "{name} in {indexes:?}"
+        );
+    }
+
+    let ours = store(new_space(&mut admin));
+    let theirs = store(new_space(&mut admin));
+    ours.insert_memory(&memory("near", "close"), "near")
+        .expect("insert");
+    ours.insert_memory(&memory("far", "distant"), "far")
+        .expect("insert");
+    theirs
+        .insert_memory(&memory("near", "someone else's close"), "near")
+        .expect("insert");
+    ours.set_embedding("near", &unit_vector(0)).expect("embed");
+    ours.set_embedding("far", &unit_vector(1)).expect("embed");
+    theirs
+        .set_embedding("near", &unit_vector(0))
+        .expect("embed");
+
+    let neighbours = ours.hnsw_search(&unit_vector(0), 10);
+    assert_eq!(
+        neighbours
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["near", "far"],
+        "{neighbours:?}"
+    );
+    assert!(
+        neighbours[0].1 > neighbours[1].1,
+        "axis 0 is closer than axis 1: {neighbours:?}"
+    );
+    assert_eq!(
+        theirs
+            .hnsw_search(&unit_vector(0), 10)
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["near"],
+        "another tenant's memories stay out of this search"
+    );
+    assert!(
+        ours.approximate_neighbours(&unit_vector(0), 10).is_empty(),
+        "search skips HNSW until the scope has {} vectors",
+        memorypilot_core::db::ANN_BYPASS_THRESHOLD
+    );
+    assert_eq!(ours.approximate_index_len(), 2);
+    assert_eq!(theirs.approximate_index_len(), 1);
+    assert!(ours.hnsw_search(&[0.0f32; 8], 10).is_empty());
+    assert!(ours.hnsw_search(&unit_vector(0), 0).is_empty());
+}

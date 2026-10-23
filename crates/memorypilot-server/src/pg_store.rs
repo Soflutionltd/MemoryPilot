@@ -38,6 +38,10 @@ const RANK_WEIGHTS: &str = "'{0.25, 0.5, 0.625, 1.0}'";
 type Param = Box<dyn ToSql + Sync>;
 
 /// Rows of `alias` the scope reads. Parameters: $1 tenant, $2 space, $3 subject.
+/// pgvector's ceiling for `hnsw.ef_search`, which bounds the neighbours one
+/// index scan returns.
+const MAX_EF_SEARCH: usize = 1000;
+
 fn visible(alias: &str) -> String {
     format!("{a}.tenant_id = $1 AND {a}.space_id = $2 AND ({a}.subject_id IS NULL OR {a}.subject_id = $3)", a = alias)
 }
@@ -405,6 +409,22 @@ impl PgAdmin {
         Ok(changed == 1)
     }
 
+    /// Index names on `table` (used to check the HNSW migration).
+    pub fn indexes_on(&mut self, table: &str) -> Result<Vec<String>, String> {
+        if table.is_empty() || !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err("Not a table name".into());
+        }
+        self.client
+            .query(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1 ORDER BY indexname",
+                &[&table],
+            )
+            .map_err(pg_error)?
+            .iter()
+            .map(|row| Ok(row.get(0)))
+            .collect()
+    }
+
     pub fn list_api_keys(&mut self, tenant: Uuid) -> Result<Vec<ApiKeyInfo>, String> {
         self.client
             .query(
@@ -761,6 +781,41 @@ impl PgStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Nearest ids in this scope through the HNSW index, ignoring how many
+    /// vectors the scope holds. Search uses [`MemoryStore::approximate_neighbours`].
+    pub fn hnsw_search(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f32)> {
+        let dim = memorypilot_core::embedding::vector_dim();
+        if query_embedding.len() != dim || limit == 0 {
+            return Vec::new();
+        }
+        let limit = limit.min(MAX_EF_SEARCH);
+        let sql = format!(
+            "SELECT m.id, (1 - (m.embedding::vector({d}) <=> $4))::real FROM memories m
+             WHERE {} AND vector_dims(m.embedding) = {d}
+             ORDER BY m.embedding::vector({d}) <=> $4 LIMIT $5",
+            visible("m"),
+            d = dim
+        );
+        let params = self.scope_params(vec![
+            Box::new(Vector::from(query_embedding.to_vec())),
+            Box::new(limit as i64),
+        ]);
+        let found = self.run(|tx| {
+            tx.execute(
+                "SELECT set_config('hnsw.ef_search', $1, true),
+                        set_config('hnsw.iterative_scan', 'relaxed_order', true)",
+                &[&limit.to_string()],
+            )?;
+            tx.query(&sql, &refs(&params))
+        });
+        let mut neighbours: Vec<(String, f32)> = reported(
+            found.map(|rows| rows.iter().map(|row| (row.get(0), row.get(1))).collect()),
+            "approximate neighbours",
+        );
+        neighbours.sort_by(|a, b| b.1.total_cmp(&a.1));
+        neighbours
     }
 
     pub fn set_project_path(&self, name: &str, path: &str) -> Result<(), String> {
@@ -1235,16 +1290,29 @@ impl RecallStore for PgStore {
             .map_err(|e| format!("Vector Search error: {}", pg_error(e)))
     }
 
-    fn approximate_neighbours(
-        &self,
-        _query_embedding: &[f32],
-        _limit: usize,
-    ) -> Vec<(String, f32)> {
-        Vec::new()
+    /// Through the HNSW index of the model's dimension (migration 0007),
+    /// only for scopes large enough for search to use it: below, a small
+    /// tenant would walk the index of the whole table for nothing.
+    fn approximate_neighbours(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f32)> {
+        if self.approximate_index_len() < memorypilot_core::db::ANN_BYPASS_THRESHOLD {
+            return Vec::new();
+        }
+        self.hnsw_search(query_embedding, limit)
     }
 
     fn approximate_index_len(&self) -> usize {
-        0
+        let dim = memorypilot_core::embedding::vector_dim();
+        let sql = format!(
+            "SELECT count(*) FROM (SELECT 1 FROM memories m
+             WHERE {} AND vector_dims(m.embedding) = {} LIMIT {}) capped",
+            visible("m"),
+            dim,
+            memorypilot_core::db::ANN_BYPASS_THRESHOLD
+        );
+        let count = self
+            .query(&sql, Vec::new())
+            .map(|rows| rows[0].get::<_, i64>(0) as usize);
+        reported(count, "approximate index size")
     }
 
     fn link_relations(&self, target_ids: Option<&[&String]>) -> Vec<(String, String)> {

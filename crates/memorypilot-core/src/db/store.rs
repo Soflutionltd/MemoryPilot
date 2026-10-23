@@ -109,7 +109,8 @@ pub trait RecallStore {
     /// the store has none.
     fn approximate_neighbours(&self, query_embedding: &[f32], limit: usize) -> Vec<(String, f32)>;
 
-    /// Number of vectors in the approximate index (0 without one).
+    /// Number of vectors in the approximate index (0 without one). A store
+    /// may stop counting at [`super::ANN_BYPASS_THRESHOLD`], all search needs.
     fn approximate_index_len(&self) -> usize;
 
     /// (target id, relation) of the links pointing at these memories; every

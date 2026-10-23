@@ -36,6 +36,10 @@ impl Database {
     }
 }
 
+/// Vectors in the approximate index from which a search scores only the
+/// approximate neighbours and the keyword hits, instead of every memory.
+pub const ANN_BYPASS_THRESHOLD: usize = 5_000;
+
 /// The search pipeline of [`Database::search_at`] on any store: the SQLite
 /// database or the server mode's Postgres store.
 #[allow(clippy::too_many_arguments)]
@@ -175,7 +179,6 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     // of ANN top-K and BM25 hits — avoids loading every embedding blob just to
     // score it. Below the threshold the full scan is kept (provably no recall
     // regression).
-    const ANN_BYPASS_THRESHOLD: usize = 5_000;
     let ann_active_for_bypass =
         store.approximate_index_len() >= ANN_BYPASS_THRESHOLD && !ann_hits.is_empty();
     let restricted_ids: Option<Vec<String>> = if ann_active_for_bypass {

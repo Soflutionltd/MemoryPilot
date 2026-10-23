@@ -97,7 +97,7 @@ pub mod store_contract;
 pub use store::{GraphStore, MemoryStore, RecallStore};
 pub use memories::{add_memory_to, update_memory_in, WriteOutcome};
 pub use knowledge::rebuild_memory_links;
-pub use search::hybrid_search;
+pub use search::{hybrid_search, ANN_BYPASS_THRESHOLD};
 pub use benchmark_fr::{fr_scenarios, score_fr_queries, FrScenario};
 use ranking::RankingSignals;
 
