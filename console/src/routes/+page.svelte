@@ -71,21 +71,37 @@
 
   async function exportUser() {
     if (!client) return;
-    const data = await client.exportSubject();
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "memorypilot-export.json";
-    link.click();
-    URL.revokeObjectURL(url);
+    busy = true;
+    error = "";
+    try {
+      const data = await client.exportSubject();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "memorypilot-export.json";
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (caught) {
+      error = caught instanceof ApiError ? caught.message : "Export impossible";
+    } finally {
+      busy = false;
+    }
   }
 
   async function eraseUser() {
     if (!client || !session.subject) return;
     if (!confirm(`Effacer toutes les mémoires de ${session.subject} ? Irréversible.`)) return;
-    await client.deleteSubject();
-    memories = await client.list();
+    busy = true;
+    error = "";
+    try {
+      await client.deleteSubject();
+      memories = [];
+    } catch (caught) {
+      error = caught instanceof ApiError ? caught.message : "Effacement impossible";
+    } finally {
+      busy = false;
+    }
   }
 </script>
 
@@ -127,8 +143,8 @@
     </form>
     {#if session.subject}
       <div class="row">
-        <button class="ghost" type="button" onclick={exportUser}>Exporter (RGPD)</button>
-        <button class="danger" type="button" onclick={eraseUser}>Effacer cet utilisateur</button>
+        <button class="ghost" type="button" onclick={exportUser} disabled={busy}>Exporter (RGPD)</button>
+        <button class="danger" type="button" onclick={eraseUser} disabled={busy}>Effacer cet utilisateur</button>
       </div>
     {/if}
     {#if error}<p class="alert" role="alert">{error}</p>{/if}
