@@ -567,12 +567,23 @@ pub(crate) fn masked_label(content: &str) -> String {
 }
 
 impl Database {
+    /// Reads the vault key on a background thread when the database holds
+    /// credentials, so a Keychain prompt shows at startup without blocking
+    /// requests. Without credentials the Keychain is never read.
+    pub fn warm_vault_key(&self) {
+        let has_credentials = self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM memories WHERE kind = 'credential')", [], |r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+        if has_credentials {
+            std::thread::spawn(|| {
+                let _ = key();
+            });
+        }
+    }
+
     /// Encrypt every credential still stored in clear. Idempotent.
     pub fn seal_credentials(&self) -> Result<usize, String> {
-        if key().is_none() {
-            eprintln!("[MemoryPilot] Vault: no encryption key available, credentials left as is.");
-            return Ok(0);
-        }
         let rows: Vec<(String, String, Option<String>, Option<String>, String)> = {
             let mut stmt = self
                 .conn
@@ -589,6 +600,14 @@ impl Database {
                 .map_err(|e| format!("seal query: {}", e))?;
             rows.flatten().collect()
         };
+        // Nothing in clear: the Keychain is not read, so no access prompt.
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        if key().is_none() {
+            eprintln!("[MemoryPilot] Vault: no encryption key available, credentials left as is.");
+            return Ok(0);
+        }
         let mut sealed = 0usize;
         for (id, content, metadata, project, created_at) in rows {
             if content.starts_with(SEAL_PREFIX) {
