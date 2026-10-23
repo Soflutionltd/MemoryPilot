@@ -1,11 +1,11 @@
-//! Postgres implementation of `MemoryStore` and `RecallStore`, bound to one
+//! Postgres implementation of `MemoryStore`, `GraphStore` and `RecallStore`, bound to one
 //! scope. Every statement runs in a transaction that first sets
 //! `app.tenant_id` (row level security) and filters by tenant and space
 //! itself; links and entities are reached through memories the scope can
 //! see, so nothing of another tenant, space or end user leaks through them.
 
 use chrono::{DateTime, Utc};
-use memorypilot_core::db::{Memory, MemoryStore, RecallStore};
+use memorypilot_core::db::{GraphStore, Memory, MemoryStore, RecallStore};
 use pgvector::Vector;
 use postgres::types::{Json, ToSql};
 use postgres::{Client, NoTls, Row, Transaction};
@@ -411,6 +411,174 @@ impl PgStore {
             )
         })?;
         Ok(())
+    }
+}
+
+impl PgStore {
+    /// Runs `work` only when the scope may change memory `id`.
+    fn on_owned_memory(
+        &self,
+        id: &str,
+        what: &str,
+        work: impl FnOnce(&mut Transaction<'_>) -> Result<(), postgres::Error>,
+    ) -> Result<(), String> {
+        let scope = self.scope;
+        let check = format!(
+            "SELECT EXISTS(SELECT 1 FROM memories m WHERE {} AND m.id = $4)",
+            owned("m")
+        );
+        let done = self.run(|tx| {
+            let owned: bool = tx
+                .query_one(&check, &[&scope.tenant, &scope.space, &scope.subject, &id])?
+                .get(0);
+            if owned {
+                work(tx)?;
+            }
+            Ok(owned)
+        })?;
+        if !done {
+            return Err(format!("{}: no memory {} this scope can change", what, id));
+        }
+        Ok(())
+    }
+}
+
+impl GraphStore for PgStore {
+    fn ensure_project(&self, name: &str) -> Result<(), String> {
+        let params: Vec<Param> = vec![
+            Box::new(self.scope.tenant),
+            Box::new(self.scope.space),
+            Box::new(name.to_string()),
+        ];
+        self.run(|tx| {
+            tx.execute(
+                "INSERT INTO projects (tenant_id, space_id, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                &refs(&params),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn replace_entities(
+        &self,
+        memory_id: &str,
+        entities: &[(String, String)],
+    ) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        let (kinds, values): (Vec<String>, Vec<String>) = entities
+            .iter()
+            .filter(|entity| seen.insert(*entity))
+            .cloned()
+            .unzip();
+        let tenant = self.scope.tenant;
+        self.on_owned_memory(memory_id, "Entities", |tx| {
+            tx.execute(
+                "DELETE FROM memory_entities WHERE tenant_id = $1 AND memory_id = $2",
+                &[&tenant, &memory_id],
+            )?;
+            tx.execute(
+                "INSERT INTO memory_entities (tenant_id, memory_id, entity_kind, entity_value)
+                 SELECT $1, $2, n.kind, n.value FROM unnest($3::text[], $4::text[]) AS n(kind, value)",
+                &[&tenant, &memory_id, &kinds, &values],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn memories_with_entity(
+        &self,
+        kind: &str,
+        value: &str,
+        exclude_id: &str,
+        project: Option<&str>,
+        any_project: bool,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut extra: Vec<Param> = vec![
+            Box::new(kind.to_string()),
+            Box::new(value.to_string()),
+            Box::new(exclude_id.to_string()),
+            Box::new(limit as i64),
+        ];
+        let project_filter = match project {
+            Some(_) if any_project => "",
+            Some(name) => {
+                extra.push(Box::new(name.to_string()));
+                " AND (m.project = $8 OR m.project IS NULL)"
+            }
+            None => " AND m.project IS NULL",
+        };
+        let rows = self
+            .query(
+                &format!(
+                    // Oldest first, as SQLite's scan of its entity index returns them.
+                    "SELECT m.id, m.kind FROM memory_entities e
+                     JOIN memories m ON m.tenant_id = e.tenant_id AND m.id = e.memory_id
+                     WHERE {} AND lower(e.entity_value) = lower($5) AND e.entity_kind = $4
+                       AND e.entity_value = $5 AND e.memory_id <> $6{}
+                     GROUP BY m.id, m.kind, m.created_at ORDER BY m.created_at, m.id LIMIT $7",
+                    visible("m"),
+                    project_filter
+                ),
+                extra,
+            )
+            .map_err(|e| format!("Related memories: {}", e))?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// Only the links whose other end the scope sees are replaced: the
+    /// space rewriting a shared memory keeps its end users' links to it.
+    fn replace_links(
+        &self,
+        memory_id: &str,
+        links: &[(String, String, String)],
+    ) -> Result<(), String> {
+        let mut sources = Vec::with_capacity(links.len());
+        let mut targets = Vec::with_capacity(links.len());
+        let mut relations = Vec::with_capacity(links.len());
+        for (source, target, relation) in links {
+            sources.push(source.clone());
+            targets.push(target.clone());
+            relations.push(relation.clone());
+        }
+        let scope = self.scope;
+        let delete = format!(
+            "DELETE FROM memory_links AS l WHERE l.tenant_id = $1 AND (
+                 (l.source_id = $4 AND EXISTS (SELECT 1 FROM memories m WHERE {0} AND m.id = l.target_id))
+              OR (l.target_id = $4 AND EXISTS (SELECT 1 FROM memories m WHERE {0} AND m.id = l.source_id)))",
+            visible("m")
+        );
+        let insert = format!(
+            "INSERT INTO memory_links (tenant_id, source_id, target_id, relation_type)
+             SELECT $1, s.id, t.id, n.relation
+             FROM unnest($5::text[], $6::text[], $7::text[]) WITH ORDINALITY AS n(source, target, relation, position)
+             JOIN memories s ON s.tenant_id = $1 AND s.id = n.source
+             JOIN memories t ON t.tenant_id = $1 AND t.id = n.target
+             WHERE {} AND {} AND (n.source = $4 OR n.target = $4)
+             ORDER BY n.position
+             ON CONFLICT (tenant_id, source_id, target_id) DO NOTHING",
+            visible("s"),
+            visible("t")
+        );
+        self.on_owned_memory(memory_id, "Links", |tx| {
+            tx.execute(
+                &delete,
+                &[&scope.tenant, &scope.space, &scope.subject, &memory_id],
+            )?;
+            tx.execute(
+                &insert,
+                &[
+                    &scope.tenant,
+                    &scope.space,
+                    &scope.subject,
+                    &memory_id,
+                    &sources,
+                    &targets,
+                    &relations,
+                ],
+            )?;
+            Ok(())
+        })
     }
 }
 

@@ -3,17 +3,18 @@
 //! in parallel on a shared database.
 
 use memorypilot_core::db::store_contract::{
-    assert_memory_store_contract, assert_recall_store_contract,
+    assert_graph_store_contract, assert_memory_store_contract, assert_recall_store_contract,
 };
 use memorypilot_core::db::{
-    fr_scenarios, hybrid_search, score_fr_queries, Memory, MemoryStore, RecallStore,
+    add_memory_to, fr_scenarios, hybrid_search, score_fr_queries, update_memory_in, Memory,
+    MemoryScope, MemoryStore, RecallStore, WriteOutcome,
 };
 use memorypilot_server::{PgAdmin, PgStore, Scope};
 use uuid::Uuid;
 
 const NEEDS_POSTGRES: &str = "needs Postgres with pgvector: scripts/test-postgres.sh";
 
-/// Measured 100% (SQLite: 100%); one near-tied query may slip.
+/// Measured 100% through the full write path (SQLite: 100%); one near-tied query may slip.
 const MIN_FR_RECALL_AT_10: f64 = 99.0;
 
 fn url() -> String {
@@ -125,6 +126,163 @@ fn postgres_store_meets_the_memory_store_contract_as_an_end_user() {
             .expect("subject"),
     );
     assert_memory_store_contract(&store(scope));
+}
+
+fn end_user(admin: &mut PgAdmin, space: Scope, name: &str) -> Scope {
+    Scope {
+        subject: Some(
+            admin
+                .create_subject(space.tenant, space.space, name)
+                .expect("subject"),
+        ),
+        ..space
+    }
+}
+
+fn add(store: &PgStore, id: &str, content: &str) -> WriteOutcome {
+    add_memory_to(
+        store,
+        Some(id),
+        content,
+        "fact",
+        Some("acme"),
+        &[],
+        "test",
+        3,
+        None,
+        None,
+        &MemoryScope::default(),
+    )
+    .expect("add")
+}
+
+fn neighbours(store: &PgStore, id: &str) -> Vec<String> {
+    let mut reached: Vec<String> = store
+        .graph_neighbours(&[id.to_string()], 1)
+        .expect("graph")
+        .into_iter()
+        .collect();
+    reached.sort();
+    reached
+}
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn postgres_store_meets_the_graph_store_contract() {
+    let mut admin = admin();
+    assert_graph_store_contract(&store(new_space(&mut admin)));
+}
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn postgres_store_meets_the_graph_store_contract_as_an_end_user() {
+    let mut admin = admin();
+    let space = new_space(&mut admin);
+    assert_graph_store_contract(&store(end_user(&mut admin, space, "user-1")));
+}
+
+/// End users link their memories to the shared ones, never to each other's;
+/// the space rewriting a shared memory keeps the links it cannot see; a
+/// duplicate of a shared memory becomes the end user's own.
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn end_users_link_only_to_what_they_see() {
+    let mut admin = admin();
+    let space = new_space(&mut admin);
+    let (alice_scope, bob_scope) = (
+        end_user(&mut admin, space, "alice"),
+        end_user(&mut admin, space, "bob"),
+    );
+    let (shared, alice, bob) = (store(space), store(alice_scope), store(bob_scope));
+
+    add(
+        &shared,
+        "s-rules",
+        "Ledger rounding lives in notes/ledger/rounding.md",
+    );
+    add(&alice, "a-note", "Alice reviewed notes/ledger/rounding.md");
+    add(&bob, "b-note", "Bob annotated notes/ledger/rounding.md");
+    assert_eq!(neighbours(&alice, "a-note"), vec!["a-note", "s-rules"]);
+    assert_eq!(neighbours(&bob, "b-note"), vec!["b-note", "s-rules"]);
+    assert_eq!(
+        neighbours(&alice, "s-rules"),
+        vec!["a-note", "s-rules"],
+        "Bob's memory stays hidden from Alice"
+    );
+    assert_eq!(
+        neighbours(&shared, "s-rules"),
+        vec!["s-rules"],
+        "the space sees no end user's memory"
+    );
+
+    update_memory_in(
+        &shared,
+        "s-rules",
+        Some("Ledger rounding lives in notes/ledger/rounding.md, half up"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("update")
+    .expect("exists");
+    assert_eq!(
+        neighbours(&alice, "s-rules"),
+        vec!["a-note", "s-rules"],
+        "the space's rewrite keeps Alice's link"
+    );
+    assert_eq!(neighbours(&bob, "s-rules"), vec!["b-note", "s-rules"]);
+
+    let copy = add(
+        &alice,
+        "a-copy",
+        "Ledger rounding lives in notes/ledger/rounding.md, half up",
+    );
+    assert!(
+        !copy.merged,
+        "an end user never merges into a shared memory"
+    );
+    assert!(shared.fetch_memory("a-copy").expect("fetch").is_none());
+    assert!(
+        update_memory_in(
+            &alice,
+            "s-rules",
+            Some("Alice's version"),
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+        .is_err(),
+        "nor rewrites one"
+    );
+}
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn a_secret_is_refused_by_the_write_path() {
+    let mut admin = admin();
+    let store = store(new_space(&mut admin));
+    let refused = add_memory_to(
+        &store,
+        None,
+        "Staging password: Zq8!vT3#pLm2",
+        "fact",
+        None,
+        &[],
+        "test",
+        3,
+        None,
+        None,
+        &MemoryScope::default(),
+    );
+    assert!(
+        refused.is_err(),
+        "detected as a credential, refused until the per-tenant key exists"
+    );
+    assert_eq!(store.memory_count(None), 0);
 }
 
 #[test]
@@ -311,9 +469,8 @@ fn the_search_pipeline_runs_on_postgres() {
     assert_eq!(store.embed_pending(64).expect("embed"), 1);
 }
 
-/// The French benchmark replayed on Postgres. Memories are inserted as
-/// rows (no entity extraction, links or triples yet), so the gap with the
-/// SQLite benchmark measures what the write path still lacks.
+/// The French benchmark replayed on Postgres through the same write path
+/// as SQLite (dedup, entities, links).
 #[test]
 #[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
 fn the_french_benchmark_runs_on_postgres() {
@@ -321,15 +478,22 @@ fn the_french_benchmark_runs_on_postgres() {
     let store = store(new_space(&mut admin));
     let mut id_map = std::collections::HashMap::new();
     for scenario in fr_scenarios() {
-        let id = format!("fr-bench:{}", scenario.id);
-        let mut row = memory(&id, scenario.content);
-        row.kind = scenario.kind.into();
-        row.project = Some(scenario.project.into());
-        row.tags = scenario.tags.iter().map(|tag| tag.to_string()).collect();
-        row.source = "bench-fr".into();
-        row.importance = 3;
-        store.insert_memory(&row, &id).expect("insert");
-        id_map.insert(scenario.id.to_string(), id);
+        let tags: Vec<String> = scenario.tags.iter().map(|tag| tag.to_string()).collect();
+        let outcome = add_memory_to(
+            &store,
+            Some(&format!("fr-bench:{}", scenario.id)),
+            scenario.content,
+            scenario.kind,
+            Some(scenario.project),
+            &tags,
+            "bench-fr",
+            3,
+            None,
+            None,
+            &MemoryScope::default(),
+        )
+        .expect("add");
+        id_map.insert(scenario.id.to_string(), outcome.memory.id);
     }
     embed_everything(&store);
     memorypilot_core::reranking::warmup_cross_reranker();
@@ -351,6 +515,14 @@ fn the_french_benchmark_runs_on_postgres() {
     })
     .expect("benchmark");
     println!("postgres fr benchmark: {}", report["metrics"]);
+    for query in report["per_query"].as_array().into_iter().flatten() {
+        if query["rank"] != 1 {
+            println!(
+                "  rank {} for {} ({})",
+                query["rank"], query["query_id"], query["target"]
+            );
+        }
+    }
     let percent = |key: &str| -> f64 {
         report["metrics"][key]
             .as_str()
