@@ -19,7 +19,10 @@ pub fn rebuild_memory_links<S: GraphStore + ?Sized>(store: &S, memory: &Memory) 
     }
     store.replace_entities(&memory.id, &entity_rows)?;
 
-    let mut targets = std::collections::HashSet::new();
+    // In entity order: when a memory is reached through several entities,
+    // the first one gives the link its relation, the same on every rebuild.
+    let mut targets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for entity in &entities {
         if !crate::graph::is_reliable_link_entity(entity) {
             continue;
@@ -40,7 +43,9 @@ pub fn rebuild_memory_links<S: GraphStore + ?Sized>(store: &S, memory: &Memory) 
             limit,
         )?;
         for (target_id, target_kind) in related {
-            targets.insert((target_id, target_kind, relation_hint));
+            if seen.insert(target_id.clone()) {
+                targets.push((target_id, target_kind, relation_hint));
+            }
         }
     }
 
