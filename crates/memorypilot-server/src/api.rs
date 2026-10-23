@@ -60,6 +60,8 @@ pub struct Response {
     pub body: Value,
     /// Extra headers (rate limit state, Retry-After).
     pub headers: Headers,
+    /// When set, sent as `text/html` instead of `body`.
+    pub html: Option<String>,
 }
 
 impl Response {
@@ -68,10 +70,20 @@ impl Response {
             status,
             body,
             headers: Vec::new(),
+            html: None,
         }
     }
 
-    fn ok(body: Value) -> Self {
+    pub fn html(status: u16, page: String) -> Self {
+        Self {
+            status,
+            body: Value::Null,
+            headers: vec![("Content-Type", "text/html; charset=utf-8".into())],
+            html: Some(page),
+        }
+    }
+
+    pub(crate) fn ok(body: Value) -> Self {
         Self::new(200, body)
     }
 }
@@ -96,7 +108,7 @@ impl Failure {
     /// Database failures are logged, not shown: they can name tables and
     /// constraints. Anything else from the write path is a refusal the
     /// caller can act on (a secret in the content, a credential edit).
-    fn from_store(error: String) -> Self {
+    pub(crate) fn from_store(error: String) -> Self {
         if error.contains("Postgres:") || error.contains("connection lock") {
             eprintln!("[memorypilot-server] {}", error);
             Self::new(500, "Internal error")
@@ -235,12 +247,13 @@ fn route<'a>(method: &str, path: &'a str) -> Option<Route<'a>> {
 
 #[derive(Clone)]
 pub struct Api {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
     allowed_origins: Vec<String>,
     rate: Arc<RateLimiter>,
     meter: Arc<Meter>,
     default_requests_per_minute: u32,
     default_max_memories: u64,
+    public_url: String,
 }
 
 impl Api {
@@ -252,7 +265,17 @@ impl Api {
             meter: Arc::default(),
             default_requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
             default_max_memories: DEFAULT_MAX_MEMORIES,
+            public_url: String::new(),
         }
+    }
+
+    pub fn with_public_url(mut self, url: String) -> Self {
+        self.public_url = url.trim_end_matches('/').to_string();
+        self
+    }
+
+    pub(crate) fn public_url(&self) -> &str {
+        &self.public_url
     }
 
     /// Limits of tenants that have none of their own.
@@ -344,6 +367,9 @@ impl Api {
                 json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }),
             ));
         }
+        if let Some(response) = crate::oauth::handle(self, request) {
+            return Ok(response);
+        }
         if path == "/mcp" {
             return self.mcp(request);
         }
@@ -381,7 +407,9 @@ impl Api {
             ));
         }
         let store = match route {
-            Route::ExportSubject | Route::DeleteSubject => self.existing_end_user(key, request)?,
+            Route::ExportSubject | Route::DeleteSubject if key.subject.is_none() => {
+                self.existing_end_user(key, request)?
+            }
             _ => self.store(key, request.header(SUBJECT_HEADER))?,
         };
         let response = match route {
@@ -459,6 +487,15 @@ impl Api {
     }
 
     pub(crate) fn store(&self, key: &ApiKey, subject: Option<&str>) -> Result<PgStore, Failure> {
+        if let Some(bound) = key.subject {
+            if subject.is_some() {
+                return Err(Failure::invalid(
+                    "This token already acts for one end user; omit X-MemoryPilot-Subject",
+                ));
+            }
+            return PgStore::from_pool(&self.pool, key.scope(Some(bound)))
+                .map_err(Failure::from_store);
+        }
         let subject = match subject {
             None => None,
             Some(_) if !key.allows(Permission::Subjects) => {

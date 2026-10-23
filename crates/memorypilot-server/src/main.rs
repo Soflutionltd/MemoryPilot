@@ -51,6 +51,7 @@ Environment:
                           browser origins allowed on /mcp, comma separated (default none)
   MEMORYPILOT_MASTER_KEY  32-byte key (base64) that wraps each tenant's data key;
                           required to store credentials. Generate with generate-master-key
+  MEMORYPILOT_PUBLIC_URL  public origin of this server (OAuth issuer, e.g. https://memory.example)
 
 Endpoints: GET /health; REST /v1/memories, /v1/search; MCP (Streamable HTTP) POST /mcp.
 Authorization: Bearer <key>. X-MemoryPilot-Subject: <end user id> acts for one end user.";
@@ -87,7 +88,10 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         ["prefetch-models"] => {
             memorypilot_core::embedding::prefetch()?;
-            eprintln!("models ready in {}", memorypilot_core::embedding::fastembed_cache_dir().display());
+            eprintln!(
+                "models ready in {}",
+                memorypilot_core::embedding::fastembed_cache_dir().display()
+            );
             Ok(())
         }
         ["generate-master-key"] => {
@@ -315,6 +319,7 @@ fn serve() -> Result<(), String> {
     }
     let api = Api::new(pool)
         .with_allowed_origins(origins)
+        .with_public_url(env("MEMORYPILOT_PUBLIC_URL").unwrap_or_default())
         .with_default_limits(
             number_env("MEMORYPILOT_DEFAULT_RPM", DEFAULT_REQUESTS_PER_MINUTE)?,
             number_env("MEMORYPILOT_DEFAULT_MAX_MEMORIES", DEFAULT_MAX_MEMORIES)?,
@@ -454,15 +459,22 @@ fn answer(api: &Api, mut request: tiny_http::Request) {
     let path = request.url().split('?').next().unwrap_or("").to_string();
     let method = request.method().as_str().to_string();
     let status = response.status;
-    let mut reply = match response.body {
-        Value::Null => tiny_http::Response::from_string(String::new()),
-        body => tiny_http::Response::from_string(body.to_string())
-            .with_header(fixed_header("Content-Type: application/json")),
+    let mut reply = if let Some(html) = &response.html {
+        tiny_http::Response::from_string(html.clone())
+            .with_header(fixed_header("Content-Type: text/html; charset=utf-8"))
+    } else {
+        match &response.body {
+            Value::Null => tiny_http::Response::from_string(String::new()),
+            body => tiny_http::Response::from_string(body.to_string())
+                .with_header(fixed_header("Content-Type: application/json")),
+        }
     }
     .with_status_code(status)
     .with_header(fixed_header("Cache-Control: no-store"));
     if status == 401 {
-        reply = reply.with_header(fixed_header("WWW-Authenticate: Bearer"));
+        reply = reply.with_header(fixed_header(
+            "WWW-Authenticate: Bearer realm=\"MemoryPilot\", resource_metadata=\"/.well-known/oauth-protected-resource\"",
+        ));
     }
     for (name, value) in &response.headers {
         match tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {

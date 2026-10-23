@@ -41,7 +41,7 @@ impl Permission {
     }
 }
 
-fn parse_all(names: Vec<String>) -> Result<Vec<Permission>, String> {
+pub(crate) fn parse_all(names: Vec<String>) -> Result<Vec<Permission>, String> {
     names.iter().map(|name| Permission::parse(name)).collect()
 }
 
@@ -53,6 +53,8 @@ pub struct ApiKey {
     pub space: Uuid,
     pub permissions: Vec<Permission>,
     pub limits: TenantLimits,
+    /// Set on an OAuth access token that was issued for one end user.
+    pub subject: Option<Uuid>,
 }
 
 impl ApiKey {
@@ -118,7 +120,7 @@ pub(crate) fn generate_key() -> Result<GeneratedKey, String> {
     })
 }
 
-fn key_hash(secret: &str) -> Vec<u8> {
+pub(crate) fn key_hash(secret: &str) -> Vec<u8> {
     ring::digest::digest(&ring::digest::SHA256, secret.as_bytes())
         .as_ref()
         .to_vec()
@@ -160,6 +162,9 @@ impl PgPool {
     /// The live key matching `presented`, if any. A malformed or unknown
     /// key and a revoked one are all `None`.
     pub fn authenticate(&self, presented: &str) -> Result<Option<ApiKey>, String> {
+        if crate::oauth::well_formed_token(presented) {
+            return crate::oauth::resolve_token(self, presented);
+        }
         if !well_formed(presented) {
             return Ok(None);
         }
@@ -186,6 +191,7 @@ impl PgPool {
                             .get::<_, Option<i64>>("max_memories")
                             .map(|n| n.max(0) as u64),
                     },
+                    subject: None,
                 })
             })
             .transpose()

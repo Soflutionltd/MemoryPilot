@@ -15,6 +15,7 @@ mod embedder;
 mod limits;
 mod mcp;
 mod metering;
+mod oauth;
 mod pg_store;
 mod pool;
 mod schema;

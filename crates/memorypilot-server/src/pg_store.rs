@@ -563,9 +563,7 @@ impl PgStore {
         };
         let tenant = self.scope.tenant;
         let wrapped: Option<Vec<u8>> = self
-            .run(|tx| {
-                tx.query_opt("SELECT wrapped_dek FROM tenants WHERE id = $1", &[&tenant])
-            })?
+            .run(|tx| tx.query_opt("SELECT wrapped_dek FROM tenants WHERE id = $1", &[&tenant]))?
             .and_then(|row| row.get(0));
         match wrapped {
             Some(wrapped) => unwrap_key(master.bytes(), &wrapped)

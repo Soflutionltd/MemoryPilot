@@ -1219,3 +1219,114 @@ fn a_credential_is_sealed_and_the_secret_never_leaves_the_api() {
     assert!(!listed.body.to_string().contains("Zq8"));
     assert!(listed.body.to_string().contains(id));
 }
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn oauth_issues_one_token_per_end_user_with_pkce() {
+    let app = app();
+    let api = Api::new(PgPool::new(plain(), 2)).with_public_url("http://127.0.0.1:8080".into());
+    let metadata = api.handle(&Request {
+        method: "GET",
+        url: "/.well-known/oauth-authorization-server",
+        headers: &[],
+        body: b"",
+    });
+    assert_eq!(metadata.status, 200, "{}", metadata.body);
+    assert_eq!(
+        metadata.body["code_challenge_methods_supported"],
+        json!(["S256"])
+    );
+
+    let registered = api.handle(&Request {
+        method: "POST",
+        url: "/register",
+        headers: &[("content-type", "application/json")],
+        body: br#"{"client_name":"Claude","redirect_uris":["http://127.0.0.1/cb"]}"#,
+    });
+    assert_eq!(registered.status, 201, "{}", registered.body);
+    let client_id = registered.body["client_id"].as_str().expect("client_id");
+
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let form = format!(
+        "client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb&state=xyz&code_challenge={}&code_challenge_method=S256&api_key={}&subject=alice",
+        client_id, challenge, app.full
+    );
+    let consent = api.handle(&Request {
+        method: "POST",
+        url: "/oauth/authorize",
+        headers: &[("content-type", "application/x-www-form-urlencoded")],
+        body: form.as_bytes(),
+    });
+    assert_eq!(consent.status, 302, "{}", consent.body);
+    let location = consent
+        .headers
+        .iter()
+        .find(|(name, _)| *name == "Location")
+        .map(|(_, value)| value.as_str())
+        .expect("Location");
+    assert!(location.contains("state=xyz"), "{location}");
+    let code = location
+        .split("code=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("code");
+
+    let wrong = api.handle(&Request {
+        method: "POST",
+        url: "/oauth/token",
+        headers: &[("content-type", "application/x-www-form-urlencoded")],
+        body: format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb&code_verifier=wrong-verifier&client_id={client_id}"
+        )
+        .as_bytes(),
+    });
+    assert_eq!(wrong.status, 400, "{}", wrong.body);
+
+    let token = api.handle(&Request {
+        method: "POST",
+        url: "/oauth/token",
+        headers: &[("content-type", "application/x-www-form-urlencoded")],
+        body: format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb&code_verifier={verifier}&client_id={client_id}"
+        )
+        .as_bytes(),
+    });
+    assert_eq!(token.status, 200, "{}", token.body);
+    let access = token.body["access_token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+    assert!(access.starts_with("mpt_"));
+
+    let authorization = format!("Bearer {}", access);
+    let created = api.handle(&Request {
+        method: "POST",
+        url: "/v1/memories",
+        headers: &[
+            ("authorization", authorization.as_str()),
+            ("content-type", "application/json"),
+        ],
+        body: br#"{"content":"Alice prefers green tea in the morning"}"#,
+    });
+    assert_eq!(created.status, 201, "{}", created.body);
+    let listed = api.handle(&Request {
+        method: "GET",
+        url: "/v1/memories",
+        headers: &[("authorization", authorization.as_str())],
+        body: b"",
+    });
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    assert_eq!(listed.body["count"], json!(1));
+
+    let reused = api.handle(&Request {
+        method: "POST",
+        url: "/oauth/token",
+        headers: &[("content-type", "application/x-www-form-urlencoded")],
+        body: format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb&code_verifier={verifier}&client_id={client_id}"
+        )
+        .as_bytes(),
+    });
+    assert_eq!(reused.status, 400, "a code is single use");
+}
