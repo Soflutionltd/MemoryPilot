@@ -444,10 +444,31 @@ fn is_email(core: &str) -> bool {
     }
 }
 
+/// Words joined by '+' or '/' (`BM25+vector`, `iOS+Android`): every part is
+/// letters then at most digits, and one is a lowercase word of 4+ letters.
+fn joined_words(core: &str) -> bool {
+    let parts: Vec<&str> = core.split(['+', '/']).filter(|part| !part.is_empty()).collect();
+    parts.len() >= 2
+        && parts.iter().all(|part| {
+            let letters = part.trim_end_matches(|c: char| c.is_ascii_digit());
+            !letters.is_empty() && letters.chars().all(|c| c.is_ascii_alphabetic())
+        })
+        && parts
+            .iter()
+            .any(|part| part.len() >= 4 && part.chars().all(|c| c.is_ascii_lowercase()))
+}
+
 pub(crate) fn looks_secret(token: &str) -> bool {
     let core = token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c));
     if is_email(core) || core.contains("://") {
         return false; // keep emails and URLs: they are what you search for
+    }
+    // A setting (`SameSite=Lax`, `max-age=60`, `API_KEY=…`): only its value can be secret.
+    if let Some((key, value)) = core.split_once('=') {
+        let setting_name = key.len() >= 3 && key.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_');
+        if setting_name && !value.is_empty() {
+            return looks_secret(value);
+        }
     }
     let len = core.chars().count();
     let digits = core.chars().filter(|c| c.is_ascii_digit()).count();
@@ -456,9 +477,18 @@ pub(crate) fn looks_secret(token: &str) -> bool {
     let has_lower = core.chars().any(|c| c.is_lowercase());
     let has_symbol = core.chars().any(|c| PASSWORD_SYMBOLS.contains(&c));
     let classes = [has_upper, has_lower, digits > 0, has_symbol].iter().filter(|b| **b).count();
-    // Typical password ("Hx9!kLm2pQ", "0550…aA@!"): short but mixes a symbol with 2 other classes.
-    let password_like = len >= 8 && has_symbol && classes >= 3;
-    (len >= 16 && digits > 0 && letters > 0 && !core.contains('/'))
+    // Typical password ("Hx9!kLm2pQ", "0550…aA@!"): short but mixes a symbol, a digit
+    // and another class. Words joined by '+' or '/' (`BM25+vector`) are not one.
+    let password_like = len >= 8 && has_symbol && digits > 0 && classes >= 3 && !joined_words(core);
+    // Long random token. Lowercase words joined by separators
+    // (`multilingual-e5-small`, `x86_64-unknown-linux-musl`) are names, not keys.
+    let separated = core.contains(['-', '_', '.', ':']);
+    let random_token = len >= 16
+        && digits > 0
+        && letters > 0
+        && !core.contains('/')
+        && (!separated || (has_upper && has_lower));
+    random_token
         || password_like
         || core.starts_with("sk-")
         || core.starts_with("sk_")
@@ -1241,6 +1271,11 @@ mod tests {
             "Mews démo: login antoine@example.fr. MDP stocké 1Password.",
             "Team ID = TB8CC687M3, Bundle ID = com.soflution.prive, commit 6052ff30",
             "Docix MCP déployé (commit b9c6836), projet Supabase lpspvwjybttpueaydwmp.",
+            // Technical notes the detector used to seal (2026-10-23).
+            "Modèle multilingual-e5-small via fastembed, cible x86_64-unknown-linux-musl ou wasm32-unknown-unknown.",
+            "Rerank avec jina-reranker-v2 après BM25+vector, cartes avec hover:-translate-y-1.",
+            "Cookie SameSite=Lax, header stale-while-revalidate=60, FCM pour iOS+Android.",
+            "FAISS pour C++/Python, charger via load() plutôt que onMount/$effect.",
         ] {
             assert!(!contains_secret_value(prose), "false positive: {}", prose);
         }
@@ -1255,6 +1290,12 @@ mod tests {
             "Resend key re_AbCdEf123456GhIjKl789",
             "GitHub token ghp_abcdefghijklmnopqrstuvwxyz0123",
             "MDP = soleil-corse",
+            "Accès staging Zq8!vT3#pLm2",
+            "Code Kx7+mP2q",
+            "Jeton tok_51HxYzAbCdEfGh12345678",
+            "Clé QWERTYZXCV7ASDFGHJKL",
+            "env token=4f9c2a8e1b7d6c5f3a2e",
+            "API_KEY=sk-abc123def456ghi789",
         ] {
             assert!(contains_secret_value(secret), "missed: {}", secret);
         }
