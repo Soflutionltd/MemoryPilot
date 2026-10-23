@@ -7,6 +7,7 @@ BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
 REPO_OWNER="Soflutionltd"
 REPO_NAME="MemoryPilot"
 REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
+TEAM_ID="TB8CC687M3"
 
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -47,6 +48,23 @@ detect_target() {
     esac
 }
 
+# macOS lets a binary read its Keychain item without a prompt only when it is
+# signed by the team that created the item: Soflution's Developer ID.
+check_macos_signature() {
+    local binary="$1" team
+    [ "$(uname)" = "Darwin" ] || return 0
+    team="$(codesign -dv "$binary" 2>&1 | sed -n 's/^TeamIdentifier=//p' || true)"
+    if [ "$team" = "$TEAM_ID" ] && codesign --verify --strict "$binary" 2>/dev/null; then
+        ok "Signed by Soflution (Developer ID ${TEAM_ID})"
+    elif [ -z "$team" ] || [ "$team" = "not set" ]; then
+        warn "Unsigned build: if you store credentials, macOS will ask for your"
+        warn "Keychain password after each update. Signed releases avoid it."
+    else
+        fail "Binary signed by another team (${team}): refusing to install it."
+        return 1
+    fi
+}
+
 try_download_prebuilt() {
     local target="$1" asset_url
     if ! command -v curl &>/dev/null; then
@@ -56,8 +74,21 @@ try_download_prebuilt() {
     info "Trying pre-built binary for ${target}..."
     local tmp
     tmp="$(mktemp -d)"
-    if curl -fsSL "$asset_url" -o "$tmp/MemoryPilot.tar.gz" 2>/dev/null; then
+    if curl -fsSL "$asset_url" -o "$tmp/MemoryPilot.tar.gz" 2>/dev/null \
+        && curl -fsSL "$asset_url.sha256" -o "$tmp/MemoryPilot.tar.gz.sha256" 2>/dev/null; then
+        local expected actual
+        expected="$(cut -d' ' -f1 "$tmp/MemoryPilot.tar.gz.sha256")"
+        actual="$(shasum -a 256 "$tmp/MemoryPilot.tar.gz" | cut -d' ' -f1)"
+        if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            fail "Checksum mismatch for $asset_url: download corrupted or tampered."
+            rm -rf "$tmp"
+            exit 1
+        fi
         tar -xzf "$tmp/MemoryPilot.tar.gz" -C "$tmp"
+        if [ -f "$tmp/$BINARY_NAME" ] && ! check_macos_signature "$tmp/$BINARY_NAME"; then
+            rm -rf "$tmp"
+            exit 1
+        fi
         if [ -f "$tmp/$BINARY_NAME" ]; then
             mkdir -p "$INSTALL_DIR"
             mv "$tmp/$BINARY_NAME" "$BINARY_PATH"
@@ -88,6 +119,7 @@ build_from_source() {
     chmod +x "$BINARY_PATH"
     if [ "$(uname)" = "Darwin" ]; then
         xattr -cr "$BINARY_PATH" 2>/dev/null || true
+        check_macos_signature "$BINARY_PATH"
     fi
 }
 
