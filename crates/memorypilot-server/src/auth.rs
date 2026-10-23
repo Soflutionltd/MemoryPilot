@@ -187,12 +187,12 @@ impl PgPool {
         if !key.allows(Permission::Subjects) {
             return Err("This key cannot act for end users".into());
         }
-        if external_id.is_empty()
+        if external_id.trim().is_empty()
             || external_id.len() > MAX_EXTERNAL_ID
             || external_id.chars().any(char::is_control)
         {
             return Err(format!(
-                "An end user id is 1 to {} characters, without control characters",
+                "An end user id is 1 to {} characters, not only spaces, without control characters",
                 MAX_EXTERNAL_ID
             ));
         }

@@ -259,6 +259,7 @@ fn keys_with_the_subjects_permission_act_for_end_users() {
         "no subjects permission"
     );
     assert!(pool.subject(&app, "").is_err());
+    assert!(pool.subject(&app, "   ").is_err(), "only spaces");
     assert!(pool.subject(&app, "line\nbreak").is_err());
     assert!(pool.subject(&app, &"x".repeat(201)).is_err());
 
