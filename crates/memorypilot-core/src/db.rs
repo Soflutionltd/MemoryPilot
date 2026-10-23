@@ -289,7 +289,7 @@ pub enum RecallMode {
 }
 
 impl RecallMode {
-    pub fn from_str(value: Option<&str>) -> Result<Self, String> {
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.unwrap_or("safe").trim().to_ascii_lowercase().as_str() {
             "safe" => Ok(Self::Safe),
             "default" => Ok(Self::Default),

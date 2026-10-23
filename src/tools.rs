@@ -951,7 +951,7 @@ fn handle_recall(db: &Database, args: &Value) -> Value {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let scope = scope_from_args(args);
-    let mode = match RecallMode::from_str(args.get("mode").and_then(|v| v.as_str())) {
+    let mode = match RecallMode::parse(args.get("mode").and_then(|v| v.as_str())) {
         Ok(mode) => mode,
         Err(error) => return tool_error(&error),
     };
@@ -1558,7 +1558,7 @@ fn handle_project_context(db: &Database, args: &Value) -> Value {
     let project = args.get("project").and_then(|v| v.as_str());
     let working_dir = args.get("working_dir").and_then(|v| v.as_str());
     let scope = scope_from_args(args);
-    let mode = match RecallMode::from_str(args.get("mode").and_then(|v| v.as_str())) {
+    let mode = match RecallMode::parse(args.get("mode").and_then(|v| v.as_str())) {
         Ok(mode) => mode,
         Err(error) => return tool_error(&error),
     };

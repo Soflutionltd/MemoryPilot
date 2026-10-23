@@ -1,41 +1,17 @@
 #![recursion_limit = "256"]
-mod ann;
-mod chunker;
-mod connectors;
-mod onepassword;
-mod code_chunker;
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
 /// (c) SOFLUTION LTD — Apache 2.0 License
-mod db;
-mod diversity;
-mod embedding;
-mod facts;
-mod fts;
-mod gc;
-mod graph;
 mod hooks;
 #[cfg(feature = "http")]
 mod http;
-mod onnx_external;
-mod pool;
 mod protocol;
-mod reader;
-mod reranking;
-mod temporal;
-mod tokenizer;
-mod session_capsule;
-mod session_export;
-mod session_fusion;
-mod splitter;
-mod stemming;
-mod telemetry;
-mod text;
 mod tools;
-mod verify;
 mod watcher;
-mod working_memory;
 
+use memorypilot_core::{
+    db, embedding, gc, graph, reader, reranking, verify, working_memory,
+};
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde_json::json;
 use std::io::{self, BufRead, Write};
@@ -43,9 +19,6 @@ use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub static WATCHER_STATE: OnceLock<Arc<Mutex<watcher::FileWatcherState>>> = OnceLock::new();
-pub static PROMPT_CACHE: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<String, (std::time::SystemTime, String)>>,
-> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_NAME: &str = "MemoryPilot";

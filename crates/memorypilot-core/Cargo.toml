@@ -1,0 +1,50 @@
+[package]
+name = "memorypilot-core"
+version.workspace = true
+edition = "2021"
+authors = ["SOFLUTION LTD"]
+description = "MemoryPilot core: SQLite storage, hybrid search (BM25 + vectors + cross-encoder), recall, temporal knowledge graph, encrypted credentials."
+license-file = "../../LICENSE"
+repository = "https://github.com/Soflutionltd/MemoryPilot"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+fastembed = { version = "7.0.1", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+# Pinned to the exact `ort` release fastembed 7.0.1 links against: two
+# `ort-sys` versions in one binary would fail to link (duplicate symbols).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "api-24"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
+# Lean tokenizers (src/tokenizer.rs): tiktoken's rank BPE for jina, a
+# hand-rolled Unigram for XLM-R. The `tokenizers` crate (pulled in by
+# fastembed for the legacy models) costs 205 MB + 330 MB resident for
+# these two vocabularies; this pair costs ~65 MB for identical output.
+tiktoken-rs = { version = "0.12", default-features = false }
+rustc-hash = "2"
+unicode-normalization = "0.1"
+tree-sitter = "0.26.8"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-swift = "0.7.2"
+rust-stemmers = "1.2.0"
+usearch = "2"
+chacha20poly1305 = "0.10"
+base64 = "0.22"
+toml = "1.1.8"
+yaml-rust2 = "0.13.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[dev-dependencies]
+# Reference implementation the lean tokenizers are asserted against.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }

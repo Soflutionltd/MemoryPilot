@@ -196,7 +196,7 @@ impl Database {
     /// sentences that only make sense in context ("It…", "That leaves…") and
     /// markdown scaffolding are not durable knowledge. `lowered` must be
     /// lowercase. User sentences never go through this filter.
-    pub(crate) fn is_agent_narration(lowered: &str) -> bool {
+    pub fn is_agent_narration(lowered: &str) -> bool {
         const OPENERS: [&str; 58] = [
             "checking", "let me", "let's", "i'll", "i will", "i'm going", "i am going",
             "i'm now", "i'm checking", "i'm looking", "i'm holding", "i need to", "i see",

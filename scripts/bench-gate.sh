@@ -4,11 +4,12 @@
 #
 #   scripts/bench-gate.sh snapshot          freeze a copy of ~/.MemoryPilot/memory.db
 #   scripts/bench-gate.sh run BINARY NAME   run the benchmarks into $WORK/NAME
-#   python3 scripts/bench_gate.py $WORK CANDIDATE BASE1 BASE2 BASE3
+#   python3 scripts/bench_gate.py $WORK CANDIDATE BASE1 BASE2
 #
 # Runs happen on the frozen copy, in an isolated HOME, with the vault, the
-# network connectors and Git verification off. Run the baseline binary three
-# times: what varies between those runs is ignored by bench_gate.py.
+# network connectors and Git verification off. Recency scores depend on the
+# clock, so run baseline, candidate, baseline back to back: what varies
+# between the two baseline runs is ignored by bench_gate.py.
 set -u
 WORK="${WORK:-/tmp/mp-bench}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,7 +48,7 @@ run)
 	bench longmemeval --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --limit 60
 	;;
 *)
-	sed -n '2,13p' "$0"
+	sed -n '2,14p' "$0"
 	exit 1
 	;;
 esac

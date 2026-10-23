@@ -1502,13 +1502,27 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 name = "memory-pilot"
 version = "4.10.0"
 dependencies = [
+ "chacha20poly1305",
+ "chrono",
+ "dirs",
+ "memorypilot-core",
+ "notify",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tiny_http",
+]
+
+[[package]]
+name = "memorypilot-core"
+version = "4.10.0"
+dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
  "dirs",
  "fastembed",
  "hf-hub",
- "notify",
  "ort",
  "rusqlite",
  "rust-stemmers",
@@ -1517,7 +1531,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tiktoken-rs",
- "tiny_http",
  "tokenizers",
  "toml",
  "tree-sitter",
