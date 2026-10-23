@@ -21,6 +21,9 @@ tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 webpki-roots = "1"
 ring = "0.17"
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+form_urlencoded = "1"
+tiny_http = "0.12"
 
 [dev-dependencies]
 memorypilot-core = { path = "../memorypilot-core", features = ["store-contract"] }

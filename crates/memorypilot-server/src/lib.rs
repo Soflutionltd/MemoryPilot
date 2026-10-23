@@ -7,6 +7,7 @@
 //! `memorypilot_app` role, `app.tenant_id` set per transaction) rejects
 //! any row of another tenant.
 
+pub mod api;
 mod auth;
 mod connection;
 mod pg_store;

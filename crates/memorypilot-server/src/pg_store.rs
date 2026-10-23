@@ -325,6 +325,19 @@ impl PgStore {
             .collect())
     }
 
+    /// Whether this scope may change or delete memory `id`: an end user
+    /// sees the space's shared memories but changes only their own.
+    pub fn can_change(&self, id: &str) -> Result<bool, String> {
+        let rows = self.query(
+            &format!(
+                "SELECT 1 FROM memories m WHERE {} AND m.id = $4",
+                owned("m")
+            ),
+            vec![Box::new(id.to_string())],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
     /// Computes the embeddings of up to `batch` memories of the scope that
     /// have none (new or edited), with the same encoder input as SQLite.
     /// Returns how many were stored; 0 once everything is embedded.
