@@ -582,8 +582,20 @@ impl Database {
         }
     }
 
-    /// Encrypt every credential still stored in clear. Idempotent.
+    /// Encrypt every credential still stored in clear. Idempotent. Waits
+    /// for the vault key: for a request that just stored a credential.
     pub fn seal_credentials(&self) -> Result<usize, String> {
+        self.seal_in_clear(true)
+    }
+
+    /// Same, but only once the key is loaded: startup and background passes
+    /// never wait on a Keychain prompt. What is left is sealed by the next
+    /// pass after `warm_vault_key` has loaded the key.
+    pub fn seal_pending_credentials(&self) -> Result<usize, String> {
+        self.seal_in_clear(false)
+    }
+
+    fn seal_in_clear(&self, wait_for_key: bool) -> Result<usize, String> {
         let rows: Vec<(String, String, Option<String>, Option<String>, String)> = {
             let mut stmt = self
                 .conn
@@ -602,6 +614,9 @@ impl Database {
         };
         // Nothing in clear: the Keychain is not read, so no access prompt.
         if rows.is_empty() {
+            return Ok(0);
+        }
+        if !wait_for_key && KEY.get().is_none() {
             return Ok(0);
         }
         if key().is_none() {
@@ -1161,6 +1176,21 @@ mod tests {
         let after = enc_of(&db);
         assert_ne!(after, before);
         assert_eq!(decrypt(&after).as_deref(), Some(clear));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_credentials_are_sealed_once_the_key_is_loaded() {
+        use super::super::MemoryStore;
+        let dir = std::env::temp_dir().join(format!("mp-pending-seal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open_at(&dir.join("memory.db")).unwrap();
+        db.insert_memory(&credential("Admin demo : password: Hx9!kLm2pQ", None), "hash").unwrap();
+        assert!(key().is_some());
+        assert_eq!(db.seal_pending_credentials().unwrap(), 1);
+        assert_eq!(db.seal_pending_credentials().unwrap(), 0, "idempotent");
+        let stored = db.stored_content("c1").unwrap();
+        assert!(stored.starts_with(SEAL_PREFIX) && !stored.contains("Hx9!kLm2pQ"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
