@@ -1,0 +1,21 @@
+{
+  "name": "@memorypilot/sdk",
+  "version": "0.1.0",
+  "description": "MemoryPilot server REST client (not published).",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Soflutionltd/MemoryPilot.git",
+    "directory": "sdks/typescript"
+  },
+  "files": ["src"],
+  "scripts": {
+    "test": "node --test test/client.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
