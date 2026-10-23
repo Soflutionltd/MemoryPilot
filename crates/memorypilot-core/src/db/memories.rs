@@ -38,28 +38,6 @@ impl Database {
         }
     }
 
-    /// Find a near-duplicate in the same project/scope.
-    pub(super) fn find_duplicate(
-        &self,
-        content: &str,
-        project: Option<&str>,
-    ) -> Result<Option<Memory>, String> {
-        // Fast path: exact content match via hash
-        if let Some(mem) = self.find_by_content_hash(&content_hash(content), project) {
-            return Ok(Some(mem));
-        }
-
-        // Slow path: Jaccard fuzzy match on recent memories
-        let norm = Self::normalize(content);
-        for mem in self.recent_memories(project, 200)? {
-            let mem_norm = Self::normalize(&mem.content);
-            if Self::similarity(&norm, &mem_norm) >= DEDUP_THRESHOLD {
-                return Ok(Some(mem));
-            }
-        }
-        Ok(None)
-    }
-
     // ─── CRUD ────────────────────────────────────────
 
     /// Add memory with dedup check. Returns (memory, was_merged).
@@ -100,85 +78,33 @@ impl Database {
         metadata: Option<&serde_json::Value>,
         scope: &MemoryScope,
     ) -> Result<(Memory, bool), String> {
-        // A secret value is sealed and hidden from safe recall whatever kind the caller chose.
-        let forced_credential = kind != "credential" && vault::contains_secret_value(content);
-        let kind = if forced_credential { "credential" } else { kind };
-        let canonical_project = Self::canonical_project(project);
-        let scoped_metadata = Self::apply_scope_to_metadata(metadata, scope);
-        // Check for near-duplicate
-        if let Some(existing) = self.find_duplicate(content, canonical_project.as_deref())? {
-            // Merge: update content if newer is longer, bump updated_at
-            // A credential is read masked: keeping it means not rewriting it.
-            let new_content = if content.len() > existing.content.len() {
-                Some(content)
-            } else if existing.kind == "credential" {
-                None
-            } else {
-                Some(existing.content.as_str())
-            };
-            let new_importance = importance.max(existing.importance);
-            let mut merged_tags: Vec<String> = existing.tags.clone();
-            for t in tags {
-                if !merged_tags.contains(t) {
-                    merged_tags.push(t.clone());
-                }
-            }
-            let merged_metadata =
-                Self::merge_metadata(existing.metadata.as_ref(), scoped_metadata.as_ref());
-            let updated = self.update_memory_full(
-                &existing.id,
-                new_content,
-                forced_credential.then_some("credential"),
-                Some(&merged_tags),
-                Some(new_importance),
-                expires_at,
-                merged_metadata.as_ref(),
-            )?;
-            return Ok((updated.unwrap_or(existing), true));
+        let outcome = add_memory_to(
+            self, explicit_id, content, kind, project, tags, source, importance, expires_at, metadata, scope,
+        )?;
+        self.after_write(&outcome)?;
+        if !outcome.merged {
+            // Auto-compaction: trigger GC when memory count exceeds threshold
+            self.maybe_auto_compact();
         }
+        Ok((outcome.memory, outcome.merged))
+    }
 
-        let id = explicit_id
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let now = Utc::now().to_rfc3339();
-        let mem = Memory {
-            id,
-            content: content.into(),
-            kind: kind.into(),
-            project: canonical_project,
-            tags: tags.to_vec(),
-            source: source.into(),
-            importance: importance.clamp(1, 5),
-            expires_at: expires_at.map(String::from),
-            created_at: now.clone(),
-            updated_at: now,
-            metadata: scoped_metadata,
-            last_accessed_at: None,
-            access_count: 0,
-        };
-        self.insert_memory(&mem, &content_hash(content))?;
-
-        // Queue embedding for background computation
-        queue_embedding_job(
-            &mem.id,
-            content,
-            &Self::embedding_input(kind, mem.project.as_deref(), &mem.created_at, content),
-        );
-
-        if let Some(proj) = mem.project.as_deref() {
-            let _ = self.ensure_project(proj);
+    /// What the local store schedules after a write: the embedding of new
+    /// content, and sealing a credential now (the server runs for days, a
+    /// credential must not wait for a restart in clear).
+    fn after_write(&self, outcome: &WriteOutcome) -> Result<(), String> {
+        let memory = &outcome.memory;
+        if outcome.content_changed {
+            queue_embedding_job(
+                &memory.id,
+                &memory.content,
+                &Self::embedding_input(&memory.kind, memory.project.as_deref(), &memory.created_at, &memory.content),
+            );
         }
-
-        let _ = self.rebuild_links(&mem);
-        // Seal now: the server runs for days, a credential must not wait for a restart in clear.
-        if kind == "credential" {
+        if memory.kind == "credential" {
             self.seal_credentials()?;
         }
-
-        // Auto-compaction: trigger GC when memory count exceeds threshold
-        self.maybe_auto_compact();
-
-        Ok((mem, false))
+        Ok(())
     }
 
     /// Trigger auto-compaction if memory count exceeds threshold.
@@ -198,112 +124,11 @@ impl Database {
         expires_at: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> Result<Option<Memory>, String> {
-        let mut existing = match self.get_memory(id)? {
-            Some(m) => m,
-            None => return Ok(None),
+        let Some(outcome) = update_memory_in(self, id, content, kind, tags, importance, expires_at, metadata)? else {
+            return Ok(None);
         };
-        if existing.kind == "credential" {
-            // Reads are masked: work on what is stored, never on the masked copy.
-            existing.content = self.stored_content(id)?;
-        }
-        let sealed = existing.kind == "credential" && existing.content.starts_with(vault::SEAL_PREFIX);
-        if let (Some(text), true) = (content, existing.kind == "credential") {
-            let masked = text.contains("••••");
-            // Sealed: a 🔒 label edit keeps the ciphertext. Not sealed: the stored text is the secret.
-            let loses_secret = if sealed {
-                masked && !text.starts_with(vault::SEAL_PREFIX)
-            } else {
-                masked || text.starts_with(vault::SEAL_PREFIX)
-            };
-            if loses_secret {
-                return Err(format!(
-                    "Memory {} is a credential and this text is its masked copy (••••): saving it would replace the secret with the mask. Send the full text with the real values{}.",
-                    id,
-                    if sealed { ", or keep the 🔒 prefix to edit the label only" } else { "" }
-                ));
-            }
-        }
-        let now = Utc::now().to_rfc3339();
-        let requested_kind = kind.unwrap_or(&existing.kind);
-        if existing.kind == "credential" && requested_kind != "credential" && content.is_none() {
-            // Reads would then return the value: that is a reveal without confirmation.
-            return Err(format!(
-                "Memory {} is a credential: changing its kind alone would expose its value. Send the new text with it (reveal_secret first if needed, the user confirms).",
-                id
-            ));
-        }
-        let new_content = content.unwrap_or(existing.content.as_str());
-        let new_kind = if requested_kind != "credential" && vault::contains_secret_value(new_content) {
-            "credential"
-        } else {
-            requested_kind
-        };
-        let new_tags = tags
-            .map(|t| t.to_vec())
-            .unwrap_or_else(|| existing.tags.clone());
-        let new_imp = importance.unwrap_or(existing.importance).clamp(1, 5);
-        let new_exp = if expires_at.is_some() {
-            expires_at.map(String::from)
-        } else {
-            existing.expires_at.clone()
-        };
-        let mut new_metadata = metadata.cloned().or_else(|| existing.metadata.clone());
-        if new_kind == "credential" && metadata.is_some() {
-            // Replacing the metadata must not drop the ciphertext of the secret.
-            if let Some(old) = existing.metadata.as_ref().and_then(|m| m.as_object()) {
-                let target = new_metadata.get_or_insert_with(|| serde_json::json!({}));
-                if !target.is_object() {
-                    *target = serde_json::json!({ "previous_metadata": target.clone() });
-                }
-                if let Some(object) = target.as_object_mut() {
-                    for key in ["enc", "sealed"] {
-                        if let Some(value) = old.get(key) {
-                            object.insert(key.into(), value.clone());
-                        }
-                    }
-                }
-            }
-        }
-        if new_kind != "credential" {
-            // No longer a credential: drop the ciphertext of the old secret.
-            if let Some(object) = new_metadata.as_mut().and_then(|m| m.as_object_mut()) {
-                object.remove("enc");
-                object.remove("sealed");
-            }
-        }
-        // Leaving the vault swaps the stored masked label for the clear text: hash and embedding must follow.
-        let leaves_vault = existing.kind == "credential" && new_kind != "credential";
-        let content_changed = (content.is_some() && new_content != existing.content) || leaves_vault;
-
-        let mem = Memory {
-            id: id.into(),
-            content: new_content.into(),
-            kind: new_kind.into(),
-            project: existing.project,
-            tags: new_tags,
-            source: existing.source,
-            importance: new_imp,
-            expires_at: new_exp,
-            created_at: existing.created_at,
-            updated_at: now,
-            metadata: new_metadata,
-            last_accessed_at: existing.last_accessed_at,
-            access_count: existing.access_count,
-        };
-        self.write_memory(&mem, &content_hash(&mem.content), content_changed)?;
-        if content_changed {
-            queue_embedding_job(
-                id,
-                &mem.content,
-                &Self::embedding_input(&mem.kind, mem.project.as_deref(), &mem.created_at, &mem.content),
-            );
-        }
-        let _ = self.rebuild_links(&mem);
-        // A credential rewritten with its real values is stored in clear: seal it now.
-        if new_kind == "credential" {
-            self.seal_credentials()?;
-        }
-        Ok(Some(mem))
+        self.after_write(&outcome)?;
+        Ok(Some(outcome.memory))
     }
 
     pub fn delete_memory(&self, id: &str) -> Result<bool, String> {
@@ -469,4 +294,240 @@ impl Database {
         }
         self.import_batch(&batch)
     }
+}
+
+/// What a write did, so the store's owner can schedule what follows it
+/// (embedding, vault sealing, compaction).
+#[derive(Debug, Clone)]
+pub struct WriteOutcome {
+    pub memory: Memory,
+    /// Folded into an existing near-duplicate instead of inserted.
+    pub merged: bool,
+    /// The stored content changed: its embedding must be computed again.
+    pub content_changed: bool,
+}
+
+/// A near-duplicate in the same project: same content hash, or a Jaccard
+/// match among the 200 most recent memories.
+fn find_duplicate<S: MemoryStore + ?Sized>(
+    store: &S,
+    content: &str,
+    project: Option<&str>,
+) -> Result<Option<Memory>, String> {
+    if let Some(mem) = store.find_by_content_hash(&content_hash(content), project) {
+        return Ok(Some(mem));
+    }
+    let norm = Database::normalize(content);
+    for mem in store.recent_memories(project, 200)? {
+        let mem_norm = Database::normalize(&mem.content);
+        if Database::similarity(&norm, &mem_norm) >= DEDUP_THRESHOLD {
+            return Ok(Some(mem));
+        }
+    }
+    Ok(None)
+}
+
+/// Links are derived data: a failure leaves the memory stored, unlinked
+/// until its next write, and is printed.
+fn report_link_failure(rebuilt: Result<(), String>, memory_id: &str) {
+    if let Err(error) = rebuilt {
+        eprintln!("[MemoryPilot] Links of memory {} not rebuilt: {}", memory_id, error);
+    }
+}
+
+/// Adds a memory to any store: a secret value forces the credential kind,
+/// a near-duplicate is merged into instead (longest content, highest
+/// importance, union of tags), a new memory gets its project, entities and
+/// links. Embedding and sealing are left to the caller ([`WriteOutcome`]).
+#[allow(clippy::too_many_arguments)]
+pub fn add_memory_to<S: MemoryStore + GraphStore + ?Sized>(
+    store: &S,
+    explicit_id: Option<&str>,
+    content: &str,
+    kind: &str,
+    project: Option<&str>,
+    tags: &[String],
+    source: &str,
+    importance: i32,
+    expires_at: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+    scope: &MemoryScope,
+) -> Result<WriteOutcome, String> {
+    // A secret value is sealed and hidden from safe recall whatever kind the caller chose.
+    let forced_credential = kind != "credential" && vault::contains_secret_value(content);
+    let kind = if forced_credential { "credential" } else { kind };
+    let canonical_project = Database::canonical_project(project);
+    let scoped_metadata = Database::apply_scope_to_metadata(metadata, scope);
+    if let Some(existing) = find_duplicate(store, content, canonical_project.as_deref())? {
+        // Merge: update content if newer is longer, bump updated_at
+        // A credential is read masked: keeping it means not rewriting it.
+        let new_content = if content.len() > existing.content.len() {
+            Some(content)
+        } else if existing.kind == "credential" {
+            None
+        } else {
+            Some(existing.content.as_str())
+        };
+        let new_importance = importance.max(existing.importance);
+        let mut merged_tags: Vec<String> = existing.tags.clone();
+        for t in tags {
+            if !merged_tags.contains(t) {
+                merged_tags.push(t.clone());
+            }
+        }
+        let merged_metadata = Database::merge_metadata(existing.metadata.as_ref(), scoped_metadata.as_ref());
+        let updated = update_memory_in(
+            store,
+            &existing.id,
+            new_content,
+            forced_credential.then_some("credential"),
+            Some(&merged_tags),
+            Some(new_importance),
+            expires_at,
+            merged_metadata.as_ref(),
+        )?;
+        return Ok(match updated {
+            Some(outcome) => WriteOutcome { merged: true, ..outcome },
+            None => WriteOutcome { memory: existing, merged: true, content_changed: false },
+        });
+    }
+
+    let id = explicit_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let now = Utc::now().to_rfc3339();
+    let mem = Memory {
+        id,
+        content: content.into(),
+        kind: kind.into(),
+        project: canonical_project,
+        tags: tags.to_vec(),
+        source: source.into(),
+        importance: importance.clamp(1, 5),
+        expires_at: expires_at.map(String::from),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: scoped_metadata,
+        last_accessed_at: None,
+        access_count: 0,
+    };
+    store.insert_memory(&mem, &content_hash(content))?;
+    if let Some(proj) = mem.project.as_deref() {
+        if let Err(error) = store.ensure_project(proj) {
+            eprintln!("[MemoryPilot] Project {} not registered: {}", proj, error);
+        }
+    }
+    report_link_failure(rebuild_memory_links(store, &mem), &mem.id);
+    Ok(WriteOutcome { memory: mem, merged: false, content_changed: true })
+}
+
+/// Rewrites the given fields of a memory in any store, guarding a
+/// credential's secret against its masked copy; `None` when the memory
+/// does not exist. Embedding and sealing are left to the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn update_memory_in<S: MemoryStore + GraphStore + ?Sized>(
+    store: &S,
+    id: &str,
+    content: Option<&str>,
+    kind: Option<&str>,
+    tags: Option<&[String]>,
+    importance: Option<i32>,
+    expires_at: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+) -> Result<Option<WriteOutcome>, String> {
+    let mut existing = match store.fetch_memory(id)? {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    if existing.kind == "credential" {
+        // Reads are masked: work on what is stored, never on the masked copy.
+        existing.content = store.stored_content(id)?;
+    }
+    let sealed = existing.kind == "credential" && existing.content.starts_with(vault::SEAL_PREFIX);
+    if let (Some(text), true) = (content, existing.kind == "credential") {
+        let masked = text.contains("••••");
+        // Sealed: a 🔒 label edit keeps the ciphertext. Not sealed: the stored text is the secret.
+        let loses_secret = if sealed {
+            masked && !text.starts_with(vault::SEAL_PREFIX)
+        } else {
+            masked || text.starts_with(vault::SEAL_PREFIX)
+        };
+        if loses_secret {
+            return Err(format!(
+                "Memory {} is a credential and this text is its masked copy (••••): saving it would replace the secret with the mask. Send the full text with the real values{}.",
+                id,
+                if sealed { ", or keep the 🔒 prefix to edit the label only" } else { "" }
+            ));
+        }
+    }
+    let now = Utc::now().to_rfc3339();
+    let requested_kind = kind.unwrap_or(&existing.kind);
+    if existing.kind == "credential" && requested_kind != "credential" && content.is_none() {
+        // Reads would then return the value: that is a reveal without confirmation.
+        return Err(format!(
+            "Memory {} is a credential: changing its kind alone would expose its value. Send the new text with it (reveal_secret first if needed, the user confirms).",
+            id
+        ));
+    }
+    let new_content = content.unwrap_or(existing.content.as_str());
+    let new_kind = if requested_kind != "credential" && vault::contains_secret_value(new_content) {
+        "credential"
+    } else {
+        requested_kind
+    };
+    let new_tags = tags
+        .map(|t| t.to_vec())
+        .unwrap_or_else(|| existing.tags.clone());
+    let new_imp = importance.unwrap_or(existing.importance).clamp(1, 5);
+    let new_exp = if expires_at.is_some() {
+        expires_at.map(String::from)
+    } else {
+        existing.expires_at.clone()
+    };
+    let mut new_metadata = metadata.cloned().or_else(|| existing.metadata.clone());
+    if new_kind == "credential" && metadata.is_some() {
+        // Replacing the metadata must not drop the ciphertext of the secret.
+        if let Some(old) = existing.metadata.as_ref().and_then(|m| m.as_object()) {
+            let target = new_metadata.get_or_insert_with(|| serde_json::json!({}));
+            if !target.is_object() {
+                *target = serde_json::json!({ "previous_metadata": target.clone() });
+            }
+            if let Some(object) = target.as_object_mut() {
+                for key in ["enc", "sealed"] {
+                    if let Some(value) = old.get(key) {
+                        object.insert(key.into(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+    if new_kind != "credential" {
+        // No longer a credential: drop the ciphertext of the old secret.
+        if let Some(object) = new_metadata.as_mut().and_then(|m| m.as_object_mut()) {
+            object.remove("enc");
+            object.remove("sealed");
+        }
+    }
+    // Leaving the vault swaps the stored masked label for the clear text: hash and embedding must follow.
+    let leaves_vault = existing.kind == "credential" && new_kind != "credential";
+    let content_changed = (content.is_some() && new_content != existing.content) || leaves_vault;
+
+    let mem = Memory {
+        id: id.into(),
+        content: new_content.into(),
+        kind: new_kind.into(),
+        project: existing.project,
+        tags: new_tags,
+        source: existing.source,
+        importance: new_imp,
+        expires_at: new_exp,
+        created_at: existing.created_at,
+        updated_at: now,
+        metadata: new_metadata,
+        last_accessed_at: existing.last_accessed_at,
+        access_count: existing.access_count,
+    };
+    store.write_memory(&mem, &content_hash(&mem.content), content_changed)?;
+    report_link_failure(rebuild_memory_links(store, &mem), &mem.id);
+    Ok(Some(WriteOutcome { memory: mem, merged: false, content_changed }))
 }

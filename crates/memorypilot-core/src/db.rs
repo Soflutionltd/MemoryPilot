@@ -94,7 +94,9 @@ mod sqlite_store;
 #[cfg(any(test, feature = "store-contract"))]
 #[path = "db/store_contract.rs"]
 pub mod store_contract;
-pub use store::{MemoryStore, RecallStore};
+pub use store::{GraphStore, MemoryStore, RecallStore};
+pub use memories::{add_memory_to, update_memory_in, WriteOutcome};
+pub use knowledge::rebuild_memory_links;
 pub use search::hybrid_search;
 pub use benchmark_fr::{fr_scenarios, score_fr_queries, FrScenario};
 use ranking::RankingSignals;

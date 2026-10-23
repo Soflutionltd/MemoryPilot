@@ -2,126 +2,69 @@
 
 use super::*;
 
+/// Re-extracts a memory's entities (and the calendar dates it names), then
+/// links it, both ways, to the memories sharing a reliable entity with it.
+pub fn rebuild_memory_links<S: GraphStore + ?Sized>(store: &S, memory: &Memory) -> Result<(), String> {
+    let entities = crate::graph::extract_entities(&memory.content, memory.project.as_deref());
+    let mut entity_rows: Vec<(String, String)> = entities
+        .iter()
+        .map(|entity| (entity.kind.to_string(), entity.value.clone()))
+        .collect();
+    // Calendar dates named in the text, resolved against the memory's
+    // own day. Not a link entity (two memories sharing a date are not
+    // related); read by the temporal window in `search`.
+    let own_day = crate::temporal::day_of_timestamp(&memory.created_at);
+    for date in crate::temporal::extract_dates(&memory.content, own_day) {
+        entity_rows.push(("date".into(), date.format("%Y-%m-%d").to_string()));
+    }
+    store.replace_entities(&memory.id, &entity_rows)?;
+
+    let mut targets = std::collections::HashSet::new();
+    for entity in &entities {
+        if !crate::graph::is_reliable_link_entity(entity) {
+            continue;
+        }
+        let relation_hint = crate::graph::relation_for_entity_kind(entity.kind);
+        let limit = match entity.kind {
+            "topic" => 8,
+            "agent" => 6,
+            "platform" | "origin" => 4,
+            _ => 10,
+        };
+        let related = store.memories_with_entity(
+            entity.kind,
+            &entity.value,
+            &memory.id,
+            memory.project.as_deref(),
+            entity.kind == "topic",
+            limit,
+        )?;
+        for (target_id, target_kind) in related {
+            targets.insert((target_id, target_kind, relation_hint));
+        }
+    }
+
+    let mut links = Vec::with_capacity(targets.len() * 2);
+    for (target_id, target_kind, relation_hint) in targets {
+        let (relation, reverse) = if relation_hint == "relates_to" {
+            (
+                crate::graph::infer_relation(&memory.kind, &target_kind),
+                crate::graph::infer_relation(&target_kind, &memory.kind),
+            )
+        } else {
+            (relation_hint, relation_hint)
+        };
+        links.push((memory.id.clone(), target_id.clone(), relation.to_string()));
+        links.push((target_id, memory.id.clone(), reverse.to_string()));
+    }
+    store.replace_links(&memory.id, &links)
+}
+
 impl Database {
     // ─── KNOWLEDGE GRAPH ──────────────────────────────
 
     pub fn rebuild_links(&self, memory: &Memory) -> Result<(), String> {
-        let entities = crate::graph::extract_entities(&memory.content, memory.project.as_deref());
-
-        // 1. Update entities table
-        let _ = self.conn.execute(
-            "DELETE FROM memory_entities WHERE memory_id = ?1",
-            params![memory.id],
-        );
-        for entity in &entities {
-            let _ = self.conn.execute(
-                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_kind, entity_value) VALUES (?1, ?2, ?3)",
-                params![memory.id, entity.kind, entity.value],
-            );
-        }
-        // Calendar dates named in the text, resolved against the memory's
-        // own day. Not a link entity (two memories sharing a date are not
-        // related); read by the temporal window in `search`.
-        let own_day = crate::temporal::day_of_timestamp(&memory.created_at);
-        for date in crate::temporal::extract_dates(&memory.content, own_day) {
-            let _ = self.conn.execute(
-                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_kind, entity_value) VALUES (?1, 'date', ?2)",
-                params![memory.id, date.format("%Y-%m-%d").to_string()],
-            );
-        }
-
-        // 2. Find related memories via shared entities
-        let mut target_ids = std::collections::HashSet::new();
-        for entity in &entities {
-            if !crate::graph::is_reliable_link_entity(entity) {
-                continue;
-            }
-
-            let relation_hint = crate::graph::relation_for_entity_kind(entity.kind);
-            let limit = match entity.kind {
-                "topic" => 8,
-                "agent" => 6,
-                "platform" | "origin" => 4,
-                _ => 10,
-            };
-            let cross_project_topic = entity.kind == "topic";
-
-            if let Some(project_name) = memory.project.as_deref() {
-                if let Ok(mut stmt) = self.conn.prepare(
-                    "SELECT DISTINCT m.id, m.kind FROM memory_entities e
-                     JOIN memories m ON e.memory_id = m.id
-                     WHERE e.entity_kind = ?1
-                       AND e.entity_value = ?2
-                       AND e.memory_id != ?3
-                       AND (?4 = 1 OR m.project = ?5 OR m.project IS NULL)
-                     LIMIT ?6",
-                ) {
-                    let allow_cross_project = if cross_project_topic { 1 } else { 0 };
-                    if let Ok(rows) = stmt.query_map(
-                        params![
-                            entity.kind,
-                            entity.value,
-                            memory.id,
-                            allow_cross_project,
-                            project_name,
-                            limit
-                        ],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                    ) {
-                        for row in rows.flatten() {
-                            target_ids.insert((row.0, row.1, relation_hint.to_string()));
-                        }
-                    }
-                }
-            } else {
-                if let Ok(mut stmt) = self.conn.prepare(
-                    "SELECT DISTINCT m.id, m.kind FROM memory_entities e
-                     JOIN memories m ON e.memory_id = m.id
-                     WHERE e.entity_kind = ?1
-                       AND e.entity_value = ?2
-                       AND e.memory_id != ?3
-                       AND m.project IS NULL
-                     LIMIT ?4",
-                ) {
-                    if let Ok(rows) = stmt.query_map(
-                        params![entity.kind, entity.value, memory.id, limit],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                    ) {
-                        for row in rows.flatten() {
-                            target_ids.insert((row.0, row.1, relation_hint.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-
-        let _ = self.conn.execute(
-            "DELETE FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
-            params![memory.id],
-        );
-
-        let created_at = Utc::now().to_rfc3339();
-        for (target_id, target_kind, relation_hint) in target_ids {
-            let rel = if relation_hint == "relates_to" {
-                crate::graph::infer_relation(&memory.kind, &target_kind)
-            } else {
-                relation_hint.as_str()
-            };
-            let _ = self.conn.execute(
-                "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation_type, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![memory.id, target_id, rel, &created_at]
-            );
-            let rev_rel = if relation_hint == "relates_to" {
-                crate::graph::infer_relation(&target_kind, &memory.kind)
-            } else {
-                relation_hint.as_str()
-            };
-            let _ = self.conn.execute(
-                "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation_type, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![target_id, memory.id, rev_rel, &created_at]
-            );
-        }
-        Ok(())
+        rebuild_memory_links(self, memory)
     }
 
     // ─── KNOWLEDGE TRIPLES ─────────────────────────────

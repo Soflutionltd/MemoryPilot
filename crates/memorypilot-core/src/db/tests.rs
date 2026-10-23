@@ -895,6 +895,16 @@ fn search_reports_lexical_candidate_sources() {
 }
 
 #[test]
+fn sqlite_store_meets_the_graph_store_contract() {
+    let path = temp_db_path("graph-contract");
+    {
+        let db = Database::open_at(&path).expect("db");
+        super::store_contract::assert_graph_store_contract(&db);
+    }
+    cleanup_db_files(&path);
+}
+
+#[test]
 fn sqlite_store_meets_the_recall_store_contract() {
     let path = temp_db_path("recall-contract");
     {

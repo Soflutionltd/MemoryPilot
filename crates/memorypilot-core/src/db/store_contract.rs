@@ -2,7 +2,7 @@
 //! store and the server mode's Postgres store run the same assertions.
 //! Each check expects an empty store and leaves its own rows behind.
 
-use super::{content_hash, Memory, MemoryStore, RecallStore};
+use super::{add_memory_to, content_hash, update_memory_in, GraphStore, Memory, MemoryScope, MemoryStore, RecallStore};
 
 fn contract_memory(id: &str, content: &str, kind: &str, project: Option<&str>, updated_at: &str) -> Memory {
     Memory {
@@ -128,4 +128,46 @@ pub fn assert_recall_store_contract<S: MemoryStore + RecallStore>(store: &S) {
     let reached = store.graph_neighbours(&["r-critical".to_string()], 1).expect("graph");
     assert_eq!(reached.into_iter().collect::<Vec<_>>(), vec!["r-critical"], "no link: only the root");
     assert!(store.triple_counts(&[&"r-critical".to_string()]).is_empty());
+}
+
+/// The write path on any store: entities and dates extracted, links to
+/// memories sharing an entity (never across projects for a file), near-
+/// duplicates merged, entities replaced on an edit, projects registered.
+pub fn assert_graph_store_contract<S: MemoryStore + GraphStore + RecallStore>(store: &S) {
+    let add = |id: &str, content: &str, project: &str, tags: &[&str], importance: i32| {
+        let tags: Vec<String> = tags.iter().map(|tag| tag.to_string()).collect();
+        add_memory_to(store, Some(id), content, "fact", Some(project), &tags, "test", importance, None, None, &MemoryScope::default())
+            .expect("add")
+    };
+    let neighbours = |id: &str| -> Vec<String> {
+        let mut reached: Vec<String> = store.graph_neighbours(&[id.to_string()], 1).expect("graph").into_iter().collect();
+        reached.sort();
+        reached
+    };
+    let dates = |id: &str| store.memory_date_values(&[&id.to_string()]).remove(id).unwrap_or_default();
+
+    let first = add("g-one", "Ledger rounding lives in notes/ledger/rounding.md since 2026-03-14", "Acme", &["ledger"], 3);
+    assert!(!first.merged && first.content_changed);
+    assert_eq!(first.memory.project.as_deref(), Some("acme"), "project name canonical");
+    add("g-two", "Rounding rules were rewritten in notes/ledger/rounding.md", "acme", &[], 3);
+    add("g-other", "Globex copied notes/ledger/rounding.md too", "globex", &[], 3);
+    assert_eq!(neighbours("g-one"), vec!["g-one", "g-two"], "linked within the project, not across");
+    assert_eq!(neighbours("g-two"), vec!["g-one", "g-two"], "links go both ways");
+    assert_eq!(dates("g-one"), vec!["2026-03-14".to_string()]);
+    assert_eq!(store.project_count(), 2);
+
+    let again = add("g-dup", "Ledger rounding lives in notes/ledger/rounding.md since 2026-03-14", "acme", &["bug"], 5);
+    assert!(again.merged && !again.content_changed, "a duplicate is merged, its content unchanged");
+    assert_eq!(again.memory.id, "g-one");
+    assert_eq!((again.memory.tags.clone(), again.memory.importance), (vec!["ledger".to_string(), "bug".to_string()], 5));
+    assert_eq!(store.memory_count(None), 3);
+    assert_eq!(neighbours("g-one"), vec!["g-one", "g-two"], "a merge keeps the links");
+
+    let edited = update_memory_in(store, "g-one", Some("Ledger rounding lives in notes/ledger/rounding.md"), None, None, None, None, None)
+        .expect("update")
+        .expect("exists");
+    assert!(edited.content_changed && !edited.merged);
+    assert!(dates("g-one").is_empty(), "an edit replaces the entities");
+    assert_eq!(neighbours("g-one"), vec!["g-one", "g-two"], "and rebuilds the links");
+    assert!(update_memory_in(store, "missing", Some("text"), None, None, None, None, None).expect("update").is_none());
 }

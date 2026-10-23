@@ -2,7 +2,8 @@
 //!
 //! `Database` keeps the logic (dedup, vault sealing, embedding jobs, links,
 //! scope); a `MemoryStore` only persists rows and keeps its own indexes in
-//! step (full-text entry, vector index). SQLite implements it in
+//! step (full-text entry, vector index), a `GraphStore` the entities and
+//! links. SQLite implements it in
 //! `sqlite_store.rs`; the server mode's Postgres store implements the same
 //! contract.
 
@@ -47,6 +48,34 @@ pub trait MemoryStore {
 
     /// The most recently updated memories of a project (`None`: no project).
     fn recent_memories(&self, project: Option<&str>, limit: usize) -> Result<Vec<Memory>, String>;
+}
+
+/// What the write path keeps beside the rows: project names, the entities
+/// extracted from each memory and the links derived from shared entities.
+/// The extraction and linking rules stay in `Database`.
+pub trait GraphStore {
+    /// Registers a project name (already canonical) when it is unknown.
+    fn ensure_project(&self, name: &str) -> Result<(), String>;
+
+    /// Replaces the (kind, value) entities of a memory the store may change.
+    fn replace_entities(&self, memory_id: &str, entities: &[(String, String)]) -> Result<(), String>;
+
+    /// (id, kind) of other memories carrying this exact entity, at most
+    /// `limit`: in `project` or without a project (any project when
+    /// `any_project`); with no `project`, only memories without one.
+    fn memories_with_entity(
+        &self,
+        kind: &str,
+        value: &str,
+        exclude_id: &str,
+        project: Option<&str>,
+        any_project: bool,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String>;
+
+    /// Replaces the links of a memory, in both directions, with these
+    /// (source, target, relation) links.
+    fn replace_links(&self, memory_id: &str, links: &[(String, String, String)]) -> Result<(), String>;
 }
 
 /// What search, ranking and recall read. The pipeline (fusion, boosts,

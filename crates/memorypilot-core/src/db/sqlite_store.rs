@@ -1,4 +1,4 @@
-//! SQLite implementation of [`MemoryStore`] and [`RecallStore`]: `memories`
+//! SQLite implementation of [`MemoryStore`], [`GraphStore`] and [`RecallStore`]: `memories`
 //! rows, their `memories_fts` entries, the in-process ANN index, links,
 //! knowledge triples and entities.
 
@@ -198,6 +198,86 @@ impl MemoryStore for Database {
                 .map_err(|e| format!("Dedup: {}", e))?;
             Ok(rows.flatten().collect())
         }
+    }
+}
+
+impl GraphStore for Database {
+    fn ensure_project(&self, name: &str) -> Result<(), String> {
+        Database::ensure_project(self, name)
+    }
+
+    fn replace_entities(&self, memory_id: &str, entities: &[(String, String)]) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM memory_entities WHERE memory_id = ?1", params![memory_id])
+            .map_err(|e| format!("Entities: {}", e))?;
+        for (kind, value) in entities {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO memory_entities (memory_id, entity_kind, entity_value) VALUES (?1, ?2, ?3)",
+                    params![memory_id, kind, value],
+                )
+                .map_err(|e| format!("Entities: {}", e))?;
+        }
+        Ok(())
+    }
+
+    fn memories_with_entity(
+        &self,
+        kind: &str,
+        value: &str,
+        exclude_id: &str,
+        project: Option<&str>,
+        any_project: bool,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let read = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<Vec<(String, String)>> {
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map(values, |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect()
+        };
+        let limit = limit as i64;
+        match project {
+            Some(project_name) => read(
+                "SELECT DISTINCT m.id, m.kind FROM memory_entities e
+                 JOIN memories m ON e.memory_id = m.id
+                 WHERE e.entity_kind = ?1
+                   AND e.entity_value = ?2
+                   AND e.memory_id != ?3
+                   AND (?4 = 1 OR m.project = ?5 OR m.project IS NULL)
+                 LIMIT ?6",
+                params![kind, value, exclude_id, i64::from(any_project), project_name, limit],
+            ),
+            None => read(
+                "SELECT DISTINCT m.id, m.kind FROM memory_entities e
+                 JOIN memories m ON e.memory_id = m.id
+                 WHERE e.entity_kind = ?1
+                   AND e.entity_value = ?2
+                   AND e.memory_id != ?3
+                   AND m.project IS NULL
+                 LIMIT ?4",
+                params![kind, value, exclude_id, limit],
+            ),
+        }
+        .map_err(|e| format!("Related memories: {}", e))
+    }
+
+    fn replace_links(&self, memory_id: &str, links: &[(String, String, String)]) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
+                params![memory_id],
+            )
+            .map_err(|e| format!("Links: {}", e))?;
+        let created_at = Utc::now().to_rfc3339();
+        for (source, target, relation) in links {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation_type, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![source, target, relation, &created_at],
+                )
+                .map_err(|e| format!("Links: {}", e))?;
+        }
+        Ok(())
     }
 }
 
