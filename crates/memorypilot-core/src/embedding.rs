@@ -183,7 +183,7 @@ fn intra_threads() -> usize {
         .clamp(1, available.max(1))
 }
 
-pub(crate) fn fastembed_cache_dir() -> PathBuf {
+pub fn fastembed_cache_dir() -> PathBuf {
     let cache_dir = std::env::var("FASTEMBED_CACHE_PATH").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         format!("{}/.cache/fastembed", home)
@@ -491,6 +491,21 @@ pub fn embed_text(text: &str) -> Vec<f32> {
     embed_prefixed(vec![with_prefix(text, JINA_DOCUMENT_PREFIX)])
         .pop()
         .unwrap_or_else(|| vec![0.0; vector_dim()])
+}
+
+/// Downloads the active model's files into the cache (Docker image, first
+/// boot). Does not run inference.
+pub fn prefetch() -> Result<(), String> {
+    let model = selected_model();
+    if model.is_jina() {
+        let onnx = model.jina_onnx_file();
+        hf_file(JINA_REPO, onnx, true)?;
+        hf_file(JINA_REPO, &format!("{}_data", onnx), true)?;
+        hf_file(JINA_REPO, "tokenizer.json", true)?;
+        return Ok(());
+    }
+    let _ = embed_batch(&["prefetch"]);
+    Ok(())
 }
 
 /// Embed a batch of stored memories (document side).

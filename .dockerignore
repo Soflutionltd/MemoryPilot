@@ -1,0 +1,14 @@
+.git
+.github
+target
+**/target
+**/.DS_Store
+.fastembed_cache
+benchmarks
+*.md
+!README.md
+console/node_modules
+console/.svelte-kit
+sdks/**/node_modules
+sdks/**/.dart_tool
+sdks/**/__pycache__

@@ -34,6 +34,7 @@ Commands:
   delete-tenant <tenant> <exact name>       erases the tenant and all its data, irreversibly
   generate-master-key                       32-byte key, printed once; put it in MEMORYPILOT_MASTER_KEY
   provision-key <tenant>                    wrap a data key for a tenant created before the master key
+  prefetch-models                           download the embedding model into FASTEMBED_CACHE_PATH
 
 Environment:
   MEMORYPILOT_PG_URL      postgres://user:password@host:port/database (required)
@@ -82,6 +83,11 @@ fn run(args: &[String]) -> Result<(), String> {
         ["migrate"] => {
             let applied = admin()?.migrate()?;
             println!("applied migrations: {:?}", applied);
+            Ok(())
+        }
+        ["prefetch-models"] => {
+            memorypilot_core::embedding::prefetch()?;
+            eprintln!("models ready in {}", memorypilot_core::embedding::fastembed_cache_dir().display());
             Ok(())
         }
         ["generate-master-key"] => {

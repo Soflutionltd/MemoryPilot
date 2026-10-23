@@ -1,0 +1,38 @@
+# Local server mode: Postgres with pgvector + MemoryPilot.
+# TLS is off: the database is on the compose network only.
+#   docker compose up --build
+#   docker compose exec memorypilot memorypilot-server create-tenant demo
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: memorypilot
+      POSTGRES_PASSWORD: memorypilot
+      POSTGRES_DB: memorypilot
+    volumes:
+      - memorypilot-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memorypilot -d memorypilot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  memorypilot:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      MEMORYPILOT_PG_URL: postgres://memorypilot:memorypilot@postgres:5432/memorypilot
+      MEMORYPILOT_PG_TLS: "off"
+      MEMORYPILOT_BIND: 0.0.0.0:8080
+      MEMORYPILOT_VAULT: "off"
+      MEMORYPILOT_ALLOWED_ORIGINS: ${MEMORYPILOT_ALLOWED_ORIGINS:-https://claude.ai,https://chatgpt.com}
+      MEMORYPILOT_MASTER_KEY: ${MEMORYPILOT_MASTER_KEY:-}
+      MEMORYPILOT_PUBLIC_URL: ${MEMORYPILOT_PUBLIC_URL:-http://127.0.0.1:8080}
+
+volumes:
+  memorypilot-pg:
