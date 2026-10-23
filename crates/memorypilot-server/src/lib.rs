@@ -10,6 +10,7 @@
 pub mod api;
 mod auth;
 mod connection;
+mod crypto;
 mod embedder;
 mod limits;
 mod mcp;
@@ -21,6 +22,7 @@ pub mod text;
 
 pub use auth::{ApiKey, ApiKeyInfo, NewApiKey, Permission};
 pub use connection::PgConnection;
+pub use crypto::MasterKey;
 pub use embedder::embed_scopes;
 pub use limits::{TenantLimits, DEFAULT_MAX_MEMORIES, DEFAULT_REQUESTS_PER_MINUTE};
 pub use metering::DailyUsage;

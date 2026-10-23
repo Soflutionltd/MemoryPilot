@@ -2,7 +2,7 @@
 //! without the HTTP layer. Each test works in tenants it creates.
 
 use memorypilot_server::api::{Api, Request, Response};
-use memorypilot_server::{Permission, PgAdmin, PgConnection, PgPool, TenantLimits};
+use memorypilot_server::{MasterKey, Permission, PgAdmin, PgConnection, PgPool, TenantLimits};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -1167,4 +1167,55 @@ fn a_tenant_is_exported_then_deleted_only_with_its_exact_name() {
         response.status, 401,
         "the deleted tenant's keys no longer work"
     );
+}
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn a_credential_is_sealed_and_the_secret_never_leaves_the_api() {
+    let master = MasterKey::generate().expect("rng");
+    let mut admin = PgAdmin::connect(&plain()).expect("admin connection");
+    admin.migrate().expect("migrations");
+    admin.set_master_key(master.clone());
+    let tenant = admin
+        .create_tenant(&format!("sealed-{}", Uuid::new_v4()))
+        .expect("tenant");
+    let space = admin.create_space(tenant, "app").expect("space");
+    let key = admin
+        .create_api_key(tenant, space, "test", &Permission::ALL)
+        .expect("key")
+        .secret;
+    let api = Api::new(PgPool::new(plain(), 2).with_master_key(master));
+    let authorization = format!("Bearer {}", key);
+    let headers = [
+        ("authorization", authorization.as_str()),
+        ("content-type", "application/json"),
+    ];
+    let body = json!({
+        "content": "Staging password: Zq8!vT3#pLm2",
+        "kind": "credential"
+    })
+    .to_string();
+    let created = api.handle(&Request {
+        method: "POST",
+        url: "/v1/memories",
+        headers: &headers,
+        body: body.as_bytes(),
+    });
+    assert_eq!(created.status, 201, "{}", created.body);
+    let content = created.body["memory"]["content"].as_str().expect("content");
+    assert!(content.contains("••••"), "{content}");
+    assert!(!content.contains("Zq8"), "{content}");
+    assert!(created.body["memory"]["metadata"].get("enc").is_none());
+    assert!(!created.body.to_string().contains("Zq8"));
+
+    let id = created.body["memory"]["id"].as_str().expect("id");
+    let listed = api.handle(&Request {
+        method: "GET",
+        url: "/v1/memories",
+        headers: &headers,
+        body: b"",
+    });
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    assert!(!listed.body.to_string().contains("Zq8"));
+    assert!(listed.body.to_string().contains(id));
 }

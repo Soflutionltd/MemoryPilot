@@ -5,11 +5,14 @@
 use memorypilot_core::db::store_contract::{
     assert_graph_store_contract, assert_memory_store_contract, assert_recall_store_contract,
 };
+use memorypilot_core::db::SEAL_PREFIX;
 use memorypilot_core::db::{
     add_memory_to, fr_scenarios, hybrid_search, score_fr_queries, update_memory_in, Memory,
     MemoryScope, MemoryStore, RecallStore, WriteOutcome,
 };
-use memorypilot_server::{embed_scopes, Permission, PgAdmin, PgConnection, PgPool, PgStore, Scope};
+use memorypilot_server::{
+    embed_scopes, MasterKey, Permission, PgAdmin, PgConnection, PgPool, PgStore, Scope,
+};
 use uuid::Uuid;
 
 const NEEDS_POSTGRES: &str = "needs Postgres with pgvector: scripts/test-postgres.sh";
@@ -323,6 +326,10 @@ fn store(scope: Scope) -> PgStore {
     PgStore::connect(&plain(), scope).expect("store connection")
 }
 
+fn store_sealed(scope: Scope, master: &MasterKey) -> PgStore {
+    PgStore::connect_with_master(&plain(), scope, Some(master)).expect("store connection")
+}
+
 fn memory(id: &str, content: &str) -> Memory {
     Memory {
         id: id.into(),
@@ -561,6 +568,51 @@ fn a_secret_is_refused_by_the_write_path() {
         "detected as a credential, refused until the per-tenant key exists"
     );
     assert_eq!(store.memory_count(None), 0);
+}
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn credentials_are_sealed_per_tenant_and_never_read_in_clear() {
+    let master = MasterKey::generate().expect("rng");
+    let mut admin = PgAdmin::connect(&plain())
+        .expect("admin")
+        .with_master_key(master.clone());
+    admin.migrate().expect("migrations");
+    let space = new_space(&mut admin);
+    let ours = end_user(&mut admin, space, "alice");
+    let theirs = new_space(&mut admin);
+    assert!(admin.has_wrapped_key(ours.tenant).expect("ours"));
+    assert!(admin.has_wrapped_key(theirs.tenant).expect("theirs"));
+
+    let secret = "Staging password: Zq8!vT3#pLm2";
+    let stored = add(&store_sealed(ours, &master), "secret", secret);
+    assert_eq!(stored.memory.kind, "credential");
+
+    let read = store_sealed(ours, &master)
+        .fetch_memory("secret")
+        .expect("fetch")
+        .expect("found");
+    assert!(read.content.starts_with(SEAL_PREFIX));
+    assert!(!read.content.contains("Zq8"));
+    assert!(
+        read.metadata
+            .as_ref()
+            .and_then(|meta| meta.get("enc"))
+            .is_none(),
+        "ciphertext stays out of reads"
+    );
+    assert!(store_sealed(theirs, &master)
+        .fetch_memory("secret")
+        .expect("fetch")
+        .is_none());
+
+    let exported = store_sealed(ours, &master)
+        .export_subject()
+        .expect("export");
+    let dump = exported.to_string();
+    assert!(dump.contains("secret"), "the memory id is exported");
+    assert!(!dump.contains("Zq8"), "{}", dump);
+    assert!(!dump.contains("\"enc\""), "{}", dump);
 }
 
 #[test]

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use memorypilot_server::api::{Api, Request, Response, MAX_BODY_BYTES};
 use memorypilot_server::{
-    embed_scopes, Permission, PgAdmin, PgConnection, PgPool, TenantLimits, DEFAULT_MAX_MEMORIES,
-    DEFAULT_REQUESTS_PER_MINUTE,
+    embed_scopes, MasterKey, Permission, PgAdmin, PgConnection, PgPool, TenantLimits,
+    DEFAULT_MAX_MEMORIES, DEFAULT_REQUESTS_PER_MINUTE,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -32,6 +32,8 @@ Commands:
   list-keys <tenant>
   export-tenant <tenant>                    every memory as JSON lines on stdout (portability)
   delete-tenant <tenant> <exact name>       erases the tenant and all its data, irreversibly
+  generate-master-key                       32-byte key, printed once; put it in MEMORYPILOT_MASTER_KEY
+  provision-key <tenant>                    wrap a data key for a tenant created before the master key
 
 Environment:
   MEMORYPILOT_PG_URL      postgres://user:password@host:port/database (required)
@@ -46,6 +48,8 @@ Environment:
                           (keep it on in one replica at least)
   MEMORYPILOT_ALLOWED_ORIGINS
                           browser origins allowed on /mcp, comma separated (default none)
+  MEMORYPILOT_MASTER_KEY  32-byte key (base64) that wraps each tenant's data key;
+                          required to store credentials. Generate with generate-master-key
 
 Endpoints: GET /health; REST /v1/memories, /v1/search; MCP (Streamable HTTP) POST /mcp.
 Authorization: Bearer <key>. X-MemoryPilot-Subject: <end user id> acts for one end user.";
@@ -80,6 +84,20 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("applied migrations: {:?}", applied);
             Ok(())
         }
+        ["generate-master-key"] => {
+            println!("{}", MasterKey::generate()?.to_base64());
+            eprintln!(
+                "Put this in MEMORYPILOT_MASTER_KEY (1Password). Losing it loses every credential."
+            );
+            Ok(())
+        }
+        ["provision-key", tenant] => match admin()?.provision_key(uuid(tenant)?)? {
+            true => {
+                println!("key provisioned");
+                Ok(())
+            }
+            false => Err("no master key, unknown tenant, or a key already exists".into()),
+        },
         ["create-tenant", name] => {
             println!("{}", admin()?.create_tenant(name)?);
             Ok(())
@@ -236,7 +254,11 @@ fn limit<T: std::str::FromStr>(value: &str, what: &str) -> Result<Option<T>, Str
 }
 
 fn admin() -> Result<PgAdmin, String> {
-    PgAdmin::connect(&connection()?)
+    let mut admin = PgAdmin::connect(&connection()?)?;
+    if let Some(key) = MasterKey::from_env()? {
+        admin.set_master_key(key);
+    }
+    Ok(admin)
 }
 
 fn serve() -> Result<(), String> {
@@ -262,7 +284,16 @@ fn serve() -> Result<(), String> {
                 .collect()
         })
         .unwrap_or_default();
-    let pool = PgPool::new(connection.clone(), workers);
+    let pool = {
+        let pool = PgPool::new(connection.clone(), workers);
+        match MasterKey::from_env()? {
+            Some(key) => {
+                eprintln!("[memorypilot-server] tenant encryption on");
+                pool.with_master_key(key)
+            }
+            None => pool,
+        }
+    };
     match env("MEMORYPILOT_EMBEDDER").as_deref() {
         None | Some("on") => {
             let (connection, pool) = (connection.clone(), pool.clone());

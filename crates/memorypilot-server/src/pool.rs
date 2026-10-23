@@ -8,7 +8,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::{pg_error, PgConnection, Scope};
+use crate::{pg_error, MasterKey, PgConnection, Scope};
 
 /// Last expiry pass per scope, shared by the stores of one pool.
 pub(crate) type ExpiryClock = Arc<Mutex<HashMap<Scope, Instant>>>;
@@ -23,6 +23,7 @@ struct PoolInner {
     idle: Mutex<Vec<Client>>,
     max_idle: usize,
     expiries: ExpiryClock,
+    master: Option<MasterKey>,
 }
 
 impl PgPool {
@@ -34,8 +35,26 @@ impl PgPool {
                 idle: Mutex::new(Vec::new()),
                 max_idle,
                 expiries: ExpiryClock::default(),
+                master: None,
             }),
         }
+    }
+
+    /// The master key that unwraps each tenant's data key (credentials).
+    pub fn with_master_key(self, key: MasterKey) -> Self {
+        Self {
+            inner: Arc::new(PoolInner {
+                connection: self.inner.connection.clone(),
+                idle: Mutex::new(Vec::new()),
+                max_idle: self.inner.max_idle,
+                expiries: Arc::clone(&self.inner.expiries),
+                master: Some(key),
+            }),
+        }
+    }
+
+    pub(crate) fn master_key(&self) -> Option<&MasterKey> {
+        self.inner.master.as_ref()
     }
 
     pub(crate) fn checkout(&self) -> Result<PooledClient, String> {

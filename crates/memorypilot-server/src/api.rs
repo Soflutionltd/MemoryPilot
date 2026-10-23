@@ -512,12 +512,6 @@ fn check_known_kind(kind: &str) -> Result<(), Failure> {
 }
 
 fn check_kind(kind: &str) -> Result<(), Failure> {
-    if kind == "credential" {
-        return Err(Failure::new(
-            422,
-            "Credentials are not accepted by the server yet (they need a per-tenant encryption key)",
-        ));
-    }
     check_known_kind(kind)
 }
 
@@ -609,9 +603,10 @@ pub(crate) fn add(store: &PgStore, body: &[u8], max_memories: u64) -> Result<Res
         &MemoryScope::default(),
     )
     .map_err(Failure::from_store)?;
+    let memory = stored_memory(store, &outcome.memory.id)?;
     Ok(Response::new(
         if outcome.merged { 200 } else { 201 },
-        json!({ "memory": outcome.memory, "merged": outcome.merged }),
+        json!({ "memory": memory, "merged": outcome.merged }),
     ))
 }
 
@@ -678,6 +673,15 @@ fn found(memory: Option<Memory>, id: &str) -> Result<Memory, Failure> {
     memory.ok_or_else(|| Failure::new(404, format!("No memory '{}'", id)))
 }
 
+/// The row as stored (masked credential, no ciphertext), after a write that
+/// still holds the caller's plaintext in [`WriteOutcome`].
+fn stored_memory(store: &PgStore, id: &str) -> Result<Memory, Failure> {
+    store
+        .fetch_memory(id)
+        .map_err(Failure::from_store)?
+        .ok_or_else(|| Failure::new(500, "Internal error"))
+}
+
 pub(crate) fn get(store: &PgStore, id: &str) -> Result<Response, Failure> {
     let memory = found(store.fetch_memory(id).map_err(Failure::from_store)?, id)?;
     Ok(Response::ok(json!({ "memory": memory })))
@@ -726,8 +730,8 @@ pub(crate) fn update(store: &PgStore, id: &str, body: &[u8]) -> Result<Response,
         changes.metadata.as_ref(),
     )
     .map_err(Failure::from_store)?;
-    let memory = found(outcome.map(|outcome| outcome.memory), id)?;
-    Ok(Response::ok(json!({ "memory": memory })))
+    found(outcome.map(|outcome| outcome.memory), id)?;
+    Ok(Response::ok(json!({ "memory": stored_memory(store, id)? })))
 }
 
 pub(crate) fn delete(store: &PgStore, id: &str) -> Result<Response, Failure> {

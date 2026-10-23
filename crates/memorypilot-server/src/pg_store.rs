@@ -14,10 +14,12 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 use crate::auth::{generate_key, info_from_row, permission_names};
+use crate::crypto::random_bytes;
 use crate::pool::{app_session, ExpiryClock, PooledClient};
 use crate::text::{fts5_to_tsquery, index_text};
-use crate::{pg_error, PgConnection, PgPool};
+use crate::{pg_error, MasterKey, PgConnection, PgPool};
 use crate::{ApiKeyInfo, DailyUsage, NewApiKey, Permission, TenantLimits};
+use memorypilot_core::db::{seal_text, unwrap_key, wrap_key, SEAL_PREFIX};
 
 /// Where a store reads and writes. With a subject it sees that end user's
 /// memories plus the ones shared by the space, and writes as that end
@@ -68,11 +70,17 @@ fn optional_timestamp(value: Option<&str>, field: &str) -> Result<Option<DateTim
     value.map(|v| timestamp(v, field)).transpose()
 }
 
-fn refuse_credential(memory: &Memory) -> Result<(), String> {
-    if memory.kind == "credential" {
-        return Err("Credentials are not stored in server mode yet: they need the per-tenant encryption key".into());
+fn public_metadata(metadata: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let mut value = metadata?;
+    let Some(object) = value.as_object_mut() else {
+        return Some(value);
+    };
+    object.remove("enc");
+    if object.is_empty() {
+        None
+    } else {
+        Some(value)
     }
-    Ok(())
 }
 
 fn row_to_memory(row: &Row) -> Result<Memory, postgres::Error> {
@@ -92,7 +100,7 @@ fn row_to_memory(row: &Row) -> Result<Memory, postgres::Error> {
         expires_at: expires_at.map(|t| t.to_rfc3339()),
         created_at: created_at.to_rfc3339(),
         updated_at: updated_at.to_rfc3339(),
-        metadata: row.try_get(8)?,
+        metadata: public_metadata(row.try_get(8)?),
         last_accessed_at: last_accessed_at.map(|t| t.to_rfc3339()),
         access_count: row.try_get(12)?,
     })
@@ -124,13 +132,24 @@ pub struct AuditEntry {
 /// row level security (it owns the tables), so never handed to request code.
 pub struct PgAdmin {
     client: Client,
+    master: Option<MasterKey>,
 }
 
 impl PgAdmin {
     pub fn connect(connection: &PgConnection) -> Result<Self, String> {
         Ok(Self {
             client: connection.connect()?,
+            master: None,
         })
+    }
+
+    pub fn with_master_key(mut self, key: MasterKey) -> Self {
+        self.master = Some(key);
+        self
+    }
+
+    pub fn set_master_key(&mut self, key: MasterKey) {
+        self.master = Some(key);
     }
 
     /// Whether this session runs over TLS, as the server sees it.
@@ -155,7 +174,41 @@ impl PgAdmin {
                 &[&name],
             )
             .map_err(pg_error)?;
-        Ok(row.get(0))
+        let id: Uuid = row.get(0);
+        if self.master.is_some() {
+            self.provision_key(id)?;
+        }
+        Ok(id)
+    }
+
+    /// Wraps a new data key for `tenant` when it has none. False if it
+    /// already has one, or if this admin has no master key.
+    pub fn provision_key(&mut self, tenant: Uuid) -> Result<bool, String> {
+        let Some(master) = &self.master else {
+            return Ok(false);
+        };
+        let dek = random_bytes::<32>()?;
+        let wrapped = wrap_key(master.bytes(), &dek)
+            .ok_or_else(|| "Could not wrap the tenant key".to_string())?;
+        let changed = self
+            .client
+            .execute(
+                "UPDATE tenants SET wrapped_dek = $2 WHERE id = $1 AND wrapped_dek IS NULL",
+                &[&tenant, &wrapped],
+            )
+            .map_err(pg_error)?;
+        Ok(changed == 1)
+    }
+
+    pub fn has_wrapped_key(&mut self, tenant: Uuid) -> Result<bool, String> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT wrapped_dek IS NOT NULL FROM tenants WHERE id = $1",
+                &[&tenant],
+            )
+            .map_err(pg_error)?;
+        Ok(row.map(|row| row.get(0)).unwrap_or(false))
     }
 
     pub fn create_space(&mut self, tenant: Uuid, name: &str) -> Result<Uuid, String> {
@@ -443,6 +496,7 @@ pub struct PgStore {
     client: Mutex<PooledClient>,
     scope: Scope,
     expiries: ExpiryClock,
+    dek: Option<[u8; 32]>,
 }
 
 /// Expired memories are dropped at most this often per store.
@@ -453,20 +507,34 @@ impl PgStore {
     /// a member) and checks that the space, and the subject when given,
     /// belong to the tenant.
     pub fn connect(connection: &PgConnection, scope: Scope) -> Result<Self, String> {
+        Self::connect_with_master(connection, scope, None)
+    }
+
+    pub fn connect_with_master(
+        connection: &PgConnection,
+        scope: Scope,
+        master: Option<&MasterKey>,
+    ) -> Result<Self, String> {
         let client = PooledClient::standalone(app_session(connection)?);
-        Self::bind(client, scope, ExpiryClock::default())
+        Self::bind(client, scope, ExpiryClock::default(), master)
     }
 
     /// Same, on a session of `pool` that goes back to it when the store is dropped.
     pub fn from_pool(pool: &PgPool, scope: Scope) -> Result<Self, String> {
-        Self::bind(pool.checkout()?, scope, pool.expiries())
+        Self::bind(pool.checkout()?, scope, pool.expiries(), pool.master_key())
     }
 
-    fn bind(client: PooledClient, scope: Scope, expiries: ExpiryClock) -> Result<Self, String> {
+    fn bind(
+        client: PooledClient,
+        scope: Scope,
+        expiries: ExpiryClock,
+        master: Option<&MasterKey>,
+    ) -> Result<Self, String> {
         let store = Self {
             client: Mutex::new(client),
             scope,
             expiries,
+            dek: None,
         };
         let known: bool = store
             .query(
@@ -480,7 +548,56 @@ impl PgStore {
         if !known {
             return Err("Unknown space or subject for this tenant".into());
         }
-        Ok(store)
+        let dek = store.load_dek(master)?;
+        Ok(Self {
+            client: store.client,
+            scope: store.scope,
+            expiries: store.expiries,
+            dek,
+        })
+    }
+
+    fn load_dek(&self, master: Option<&MasterKey>) -> Result<Option<[u8; 32]>, String> {
+        let Some(master) = master else {
+            return Ok(None);
+        };
+        let tenant = self.scope.tenant;
+        let wrapped: Option<Vec<u8>> = self
+            .run(|tx| {
+                tx.query_opt("SELECT wrapped_dek FROM tenants WHERE id = $1", &[&tenant])
+            })?
+            .and_then(|row| row.get(0));
+        match wrapped {
+            Some(wrapped) => unwrap_key(master.bytes(), &wrapped)
+                .map(Some)
+                .ok_or_else(|| "Could not unwrap the tenant key (wrong master key)".into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Seals a credential with the tenant key: searchable masked label,
+    /// ciphertext in `metadata.enc`. Already sealed rows are left as they are.
+    fn seal(&self, memory: &Memory) -> Result<Memory, String> {
+        if memory.kind != "credential" || memory.content.starts_with(SEAL_PREFIX) {
+            return Ok(memory.clone());
+        }
+        let dek = self.dek.as_ref().ok_or_else(|| {
+            "Credentials need the per-tenant encryption key (set MEMORYPILOT_MASTER_KEY)"
+                .to_string()
+        })?;
+        let (masked, enc) = seal_text(dek, &memory.content)
+            .ok_or_else(|| "Could not seal the credential".to_string())?;
+        let mut sealed = memory.clone();
+        sealed.content = masked;
+        let mut meta = sealed
+            .metadata
+            .take()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = meta.as_object_mut() {
+            object.insert("enc".into(), serde_json::json!(enc));
+        }
+        sealed.metadata = Some(meta);
+        Ok(sealed)
     }
 
     pub fn scope(&self) -> Scope {
@@ -1006,7 +1123,8 @@ impl GraphStore for PgStore {
 
 impl MemoryStore for PgStore {
     fn insert_memory(&self, memory: &Memory, content_hash: &str) -> Result<(), String> {
-        refuse_credential(memory)?;
+        let sealed = self.seal(memory)?;
+        let memory = &sealed;
         let created_at = timestamp(&memory.created_at, "created_at")?;
         let updated_at = timestamp(&memory.updated_at, "updated_at")?;
         let expires_at = optional_timestamp(memory.expires_at.as_deref(), "expires_at")?;
@@ -1064,7 +1182,8 @@ impl MemoryStore for PgStore {
         content_hash: &str,
         content_changed: bool,
     ) -> Result<(), String> {
-        refuse_credential(memory)?;
+        let sealed = self.seal(memory)?;
+        let memory = &sealed;
         let updated_at = timestamp(&memory.updated_at, "updated_at")?;
         let expires_at = optional_timestamp(memory.expires_at.as_deref(), "expires_at")?;
         let mut params: Vec<Param> = vec![

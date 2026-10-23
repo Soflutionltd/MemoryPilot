@@ -29,7 +29,7 @@ use rusqlite::params;
 
 use super::{queue_embedding_job, Database, Memory};
 
-pub(crate) const SEAL_PREFIX: &str = "🔒 ";
+pub const SEAL_PREFIX: &str = "🔒 ";
 const KEYCHAIN_SERVICE: &str = "MemoryPilot";
 const KEYCHAIN_ACCOUNT: &str = "credentials-key-v2";
 
@@ -107,12 +107,7 @@ fn key() -> Option<&'static [u8; 32]> {
 }
 
 fn encrypt(plain: &str) -> Option<String> {
-    let cipher = XChaCha20Poly1305::new(key()?.into());
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ct = cipher.encrypt(&nonce, plain.as_bytes()).ok()?;
-    let mut blob = nonce.to_vec();
-    blob.extend_from_slice(&ct);
-    Some(B64.encode(blob))
+    Some(B64.encode(encrypt_bytes(key()?, plain.as_bytes())?))
 }
 
 pub(crate) fn decrypt(encoded: &str) -> Option<String> {
@@ -120,14 +115,40 @@ pub(crate) fn decrypt(encoded: &str) -> Option<String> {
 }
 
 fn decrypt_with(key: &[u8; 32], encoded: &str) -> Option<String> {
-    let blob = B64.decode(encoded).ok()?;
+    String::from_utf8(decrypt_bytes(key, &B64.decode(encoded).ok()?)?).ok()
+}
+
+/// XChaCha20-Poly1305 of `plain` (24-byte nonce then ciphertext).
+pub fn encrypt_bytes(key: &[u8; 32], plain: &[u8]) -> Option<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let ct = cipher.encrypt(&nonce, plain).ok()?;
+    let mut blob = nonce.to_vec();
+    blob.extend_from_slice(&ct);
+    Some(blob)
+}
+
+pub fn decrypt_bytes(key: &[u8; 32], blob: &[u8]) -> Option<Vec<u8>> {
     if blob.len() < 24 {
         return None;
     }
     let (nonce, ct) = blob.split_at(24);
     let cipher = XChaCha20Poly1305::new(key.into());
-    let plain = cipher.decrypt(XNonce::from_slice(nonce), ct).ok()?;
-    String::from_utf8(plain).ok()
+    cipher.decrypt(XNonce::from_slice(nonce), ct).ok()
+}
+
+/// Searchable masked label plus the ciphertext (base64) for `metadata.enc`.
+pub fn seal_text(key: &[u8; 32], plain: &str) -> Option<(String, String)> {
+    Some((masked_label(plain), B64.encode(encrypt_bytes(key, plain.as_bytes())?)))
+}
+
+/// Wraps a tenant data key with the server master key.
+pub fn wrap_key(master: &[u8; 32], dek: &[u8; 32]) -> Option<Vec<u8>> {
+    encrypt_bytes(master, dek)
+}
+
+pub fn unwrap_key(master: &[u8; 32], wrapped: &[u8]) -> Option<[u8; 32]> {
+    decrypt_bytes(master, wrapped)?.try_into().ok()
 }
 
 static REVEAL: AtomicBool = AtomicBool::new(false);

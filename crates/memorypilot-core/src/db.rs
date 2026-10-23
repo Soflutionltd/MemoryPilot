@@ -51,7 +51,7 @@ pub fn set_remote_server(on: bool) {
     vault::set_remote(on);
 }
 
-pub use vault::RevealConfirm;
+pub use vault::{seal_text, unwrap_key, wrap_key, RevealConfirm, SEAL_PREFIX};
 
 /// Put back a vault key (base64) after checking it opens every sealed credential.
 #[cfg(target_os = "macos")]
