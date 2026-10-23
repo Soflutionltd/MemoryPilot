@@ -9,7 +9,10 @@
 # Runs happen on the frozen copy, in an isolated HOME, with the vault, the
 # network connectors and Git verification off. Recency scores depend on the
 # clock, so run baseline, candidate, baseline back to back: what varies
-# between the two baseline runs is ignored by bench_gate.py.
+# between the baseline runs is ignored by bench_gate.py. The fr benchmark has
+# near-tied queries that swap ranks between runs of the same binary (the
+# embedding worker batches by timing): pass every baseline run you have, and
+# rerun the candidate before blaming a difference on one query.
 set -u
 WORK="${WORK:-/tmp/mp-bench}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -48,7 +51,7 @@ run)
 	bench longmemeval --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --limit 60
 	;;
 *)
-	sed -n '2,14p' "$0"
+	sed -n '2,15p' "$0"
 	exit 1
 	;;
 esac
