@@ -1,0 +1,21 @@
+[package]
+name = "memorypilot-server"
+version.workspace = true
+edition = "2021"
+authors = ["SOFLUTION LTD"]
+description = "MemoryPilot server mode: multi-tenant Postgres storage (tsvector + pgvector) behind the core store traits."
+license-file = "../../LICENSE"
+repository = "https://github.com/Soflutionltd/MemoryPilot"
+publish = false
+
+[dependencies]
+memorypilot-core = { path = "../memorypilot-core" }
+postgres = { version = "0.19.14", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+pgvector = { version = "0.4.2", features = ["postgres"] }
+chrono = "0.4"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+memorypilot-core = { path = "../memorypilot-core", features = ["store-contract"] }

@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/memorypilot-core"]
-default-members = [".", "crates/memorypilot-core"]
+members = ["crates/memorypilot-core", "crates/memorypilot-server"]
+default-members = [".", "crates/memorypilot-core", "crates/memorypilot-server"]
 
 [workspace.package]
 version = "4.10.0"
