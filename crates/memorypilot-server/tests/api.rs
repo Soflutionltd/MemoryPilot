@@ -1457,3 +1457,55 @@ fn oauth_token_cannot_read_another_tenant() {
     });
     assert_eq!(steal.status, 400, "{}", steal.body);
 }
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn an_access_token_cannot_be_traded_for_a_wider_one() {
+    let app = app();
+    let api = Api::new(PgPool::new(plain(), 2)).with_public_url("http://127.0.0.1:8080".into());
+    let registered = api.handle(&Request {
+        method: "POST",
+        url: "/register",
+        headers: &[("content-type", "application/json")],
+        body: br#"{"client_name":"Claude","redirect_uris":["http://127.0.0.1/cb?app=1"]}"#,
+    });
+    assert_eq!(registered.status, 201, "{}", registered.body);
+    let client_id = registered.body["client_id"].as_str().expect("client_id");
+    let consent = |api_key: &str, subject: &str| {
+        let form = format!(
+            "client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb%3Fapp%3D1&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&api_key={}&subject={}",
+            client_id, api_key, subject
+        );
+        api.handle(&Request {
+            method: "POST",
+            url: "/oauth/authorize",
+            headers: &[("content-type", "application/x-www-form-urlencoded")],
+            body: form.as_bytes(),
+        })
+    };
+
+    let granted = consent(&app.full, "alice");
+    assert_eq!(granted.status, 302, "{}", granted.body);
+    let location = granted
+        .headers
+        .iter()
+        .find(|(name, _)| *name == "Location")
+        .map(|(_, value)| value.as_str())
+        .expect("Location");
+    assert!(
+        location.starts_with("http://127.0.0.1/cb?app=1&code="),
+        "the registered query is kept: {location}"
+    );
+
+    let alice = oauth_access_token(&api, &app.full, "alice");
+    assert_eq!(
+        consent(&alice, "").status,
+        400,
+        "no space-wide token from Alice's"
+    );
+    assert_eq!(
+        consent(&alice, "bob").status,
+        400,
+        "no token for Bob from Alice's"
+    );
+}

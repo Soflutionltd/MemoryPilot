@@ -174,6 +174,12 @@ fn authorize(api: &Api, request: &Request) -> Response {
             (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
             _ => return Response::html(400, consent_page(&params, Some("Missing fields"))),
         };
+    if well_formed_token(api_key) {
+        return Response::html(
+            400,
+            consent_page(&params, Some("Paste an API key, not an access token")),
+        );
+    }
     if params.get("code_challenge_method").map(String::as_str) != Some("S256") {
         return Response::html(400, consent_page(&params, Some("PKCE must be S256")));
     }
