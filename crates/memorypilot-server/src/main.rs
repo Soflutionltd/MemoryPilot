@@ -27,6 +27,8 @@ Commands:
   set-limits <tenant> <requests per minute> <max memories>
                                             each a whole number or 'default'
   revoke-key <tenant> <key id>
+  usage <tenant> <days>                     daily requests, writes and searches per space
+  audit <tenant> <count>                    latest changes (ids only), newest first
   list-keys <tenant>
 
 Environment:
@@ -53,6 +55,7 @@ const EMBED_BATCH: usize = 32;
 const EMBED_SCOPES_PER_PASS: usize = 100;
 const EMBED_IDLE: Duration = Duration::from_secs(2);
 const EMBED_RETRY: Duration = Duration::from_secs(30);
+const USAGE_FLUSH: Duration = Duration::from_secs(10);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -109,6 +112,40 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
                 false => Err("unknown tenant".into()),
             }
+        }
+        ["usage", tenant, days] => {
+            let days: u32 = days
+                .parse()
+                .map_err(|_| format!("'{}' is not a number of days", days))?;
+            for row in admin()?.usage(uuid(tenant)?, days)? {
+                println!(
+                    "{}  space {}  requests {}  writes {}  searches {}",
+                    row.day, row.space, row.requests, row.writes, row.searches
+                );
+            }
+            Ok(())
+        }
+        ["audit", tenant, limit] => {
+            let limit: usize = limit
+                .parse()
+                .map_err(|_| format!("'{}' is not a number", limit))?;
+            for entry in admin()?.audit_log(uuid(tenant)?, limit)? {
+                let by = match entry.key {
+                    Some(key) => format!("key {}", key),
+                    None => entry.actor.clone(),
+                };
+                println!(
+                    "{}  {}  {}  {}{}",
+                    entry.at.to_rfc3339(),
+                    by,
+                    entry.action,
+                    entry.target.unwrap_or_default(),
+                    entry
+                        .subject
+                        .map_or(String::new(), |subject| format!("  end user {}", subject)),
+                );
+            }
+            Ok(())
         }
         ["revoke-key", tenant, key] => match admin()?.revoke_api_key(uuid(tenant)?, uuid(key)?)? {
             true => {
@@ -212,7 +249,7 @@ fn serve() -> Result<(), String> {
     let pool = PgPool::new(connection.clone(), workers);
     match env("MEMORYPILOT_EMBEDDER").as_deref() {
         None | Some("on") => {
-            let pool = pool.clone();
+            let (connection, pool) = (connection.clone(), pool.clone());
             std::thread::spawn(move || embed_in_background(connection, pool));
         }
         Some("off") => eprintln!("[memorypilot-server] background embedding off"),
@@ -229,6 +266,10 @@ fn serve() -> Result<(), String> {
             number_env("MEMORYPILOT_DEFAULT_RPM", DEFAULT_REQUESTS_PER_MINUTE)?,
             number_env("MEMORYPILOT_DEFAULT_MAX_MEMORIES", DEFAULT_MAX_MEMORIES)?,
         );
+    {
+        let api = api.clone();
+        std::thread::spawn(move || record_usage_in_background(connection, api));
+    }
     let server = Arc::new(
         tiny_http::Server::http(&bind).map_err(|e| format!("cannot listen on {}: {}", bind, e))?,
     );
@@ -277,6 +318,32 @@ fn embed_in_background(connection: PgConnection, pool: PgPool) {
                 eprintln!("[memorypilot-server] background embedding: {}", error);
                 std::thread::sleep(EMBED_RETRY);
             }
+        }
+    }
+}
+
+/// Adds the usage counted in memory to the daily totals every few seconds;
+/// what cannot be stored is kept for the next attempt.
+fn record_usage_in_background(connection: PgConnection, api: Api) {
+    let mut admin: Option<PgAdmin> = None;
+    loop {
+        std::thread::sleep(USAGE_FLUSH);
+        let rows = api.drain_usage();
+        if rows.is_empty() {
+            continue;
+        }
+        let stored = match admin.take() {
+            Some(session) => Ok(session),
+            None => PgAdmin::connect(&connection),
+        }
+        .and_then(|mut session| {
+            session.record_usage(&rows)?;
+            admin = Some(session);
+            Ok(())
+        });
+        if let Err(error) = stored {
+            eprintln!("[memorypilot-server] usage not recorded yet: {}", error);
+            api.restore_usage(rows);
         }
     }
 }

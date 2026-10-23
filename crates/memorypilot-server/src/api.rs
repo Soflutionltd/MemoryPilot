@@ -14,8 +14,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::limits::RateLimiter;
+use crate::metering::{Meter, Usage};
 use crate::{
-    ApiKey, Permission, PgPool, PgStore, DEFAULT_MAX_MEMORIES, DEFAULT_REQUESTS_PER_MINUTE,
+    ApiKey, DailyUsage, Permission, PgPool, PgStore, DEFAULT_MAX_MEMORIES,
+    DEFAULT_REQUESTS_PER_MINUTE,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -110,7 +112,58 @@ impl From<Failure> for Response {
     }
 }
 
-enum Route<'a> {
+pub(crate) enum Event {
+    Search,
+    Change {
+        action: &'static str,
+        target: String,
+    },
+}
+
+impl Event {
+    fn of(route: &Route, response: &Response) -> Option<Self> {
+        let created = || {
+            response.body["memory"]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        match route {
+            Route::Search => Some(Event::Search),
+            Route::AddMemory => Some(Event::Change {
+                action: if response.body["merged"] == json!(true) {
+                    "memory.merge"
+                } else {
+                    "memory.create"
+                },
+                target: created(),
+            }),
+            Route::UpdateMemory(id) => Some(Event::Change {
+                action: "memory.update",
+                target: id.to_string(),
+            }),
+            Route::DeleteMemory(id) => Some(Event::Change {
+                action: "memory.delete",
+                target: id.to_string(),
+            }),
+            Route::ListMemories | Route::GetMemory(_) => None,
+        }
+    }
+
+    /// The event of an MCP tool call, which runs the same handlers.
+    pub(crate) fn of_tool(tool: &str, id: Option<&str>, response: &Response) -> Option<Self> {
+        let route = match tool {
+            "search_memory" => Route::Search,
+            "add_memory" => Route::AddMemory,
+            "update_memory" => Route::UpdateMemory(id?),
+            "delete_memory" => Route::DeleteMemory(id?),
+            _ => return None,
+        };
+        Self::of(&route, response)
+    }
+}
+
+pub(crate) enum Route<'a> {
     AddMemory,
     ListMemories,
     GetMemory(&'a str),
@@ -148,6 +201,7 @@ pub struct Api {
     pool: PgPool,
     allowed_origins: Vec<String>,
     rate: Arc<RateLimiter>,
+    meter: Arc<Meter>,
     default_requests_per_minute: u32,
     default_max_memories: u64,
 }
@@ -158,6 +212,7 @@ impl Api {
             pool,
             allowed_origins: Vec::new(),
             rate: Arc::default(),
+            meter: Arc::default(),
             default_requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
             default_max_memories: DEFAULT_MAX_MEMORIES,
         }
@@ -168,6 +223,34 @@ impl Api {
         self.default_requests_per_minute = requests_per_minute.max(1);
         self.default_max_memories = max_memories;
         self
+    }
+
+    /// Usage counted since the last call, for `PgAdmin::record_usage`.
+    pub fn drain_usage(&self) -> Vec<DailyUsage> {
+        self.meter.drain()
+    }
+
+    /// Puts back usage that could not be recorded.
+    pub fn restore_usage(&self, rows: Vec<DailyUsage>) {
+        self.meter.restore(rows)
+    }
+
+    /// Meters a successful search or change, and audits changes. A failed
+    /// audit insert is reported, not returned: the change itself succeeded.
+    pub(crate) fn record(&self, key: &ApiKey, store: &PgStore, event: Event) {
+        let day = chrono::Utc::now().date_naive();
+        match event {
+            Event::Search => self.meter.count(key.tenant, key.space, day, Usage::Search),
+            Event::Change { action, target } => {
+                self.meter.count(key.tenant, key.space, day, Usage::Write);
+                if let Err(error) = store.record_audit(key.id, action, &target) {
+                    eprintln!(
+                        "[memorypilot-server] audit of {} {}: {}",
+                        action, target, error
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn max_memories(&self, key: &ApiKey) -> u64 {
@@ -184,13 +267,17 @@ impl Api {
             .requests_per_minute
             .unwrap_or(self.default_requests_per_minute);
         match self.rate.take(key.id, limit, Instant::now()) {
-            Ok(remaining) => Ok((
-                key,
-                vec![
-                    ("X-RateLimit-Limit", limit.to_string()),
-                    ("X-RateLimit-Remaining", remaining.to_string()),
-                ],
-            )),
+            Ok(remaining) => {
+                let day = chrono::Utc::now().date_naive();
+                self.meter.count(key.tenant, key.space, day, Usage::Request);
+                Ok((
+                    key,
+                    vec![
+                        ("X-RateLimit-Limit", limit.to_string()),
+                        ("X-RateLimit-Remaining", remaining.to_string()),
+                    ],
+                ))
+            }
             Err(wait) => {
                 let mut response = Response::from(Failure::new(
                     429,
@@ -261,14 +348,18 @@ impl Api {
             ));
         }
         let store = self.store(key, request.header(SUBJECT_HEADER))?;
-        match route {
+        let response = match route {
             Route::AddMemory => add(&store, request.body, self.max_memories(key)),
             Route::ListMemories => list(&store, &query_params(query)),
             Route::GetMemory(id) => get(&store, id),
             Route::UpdateMemory(id) => update(&store, id, request.body),
             Route::DeleteMemory(id) => delete(&store, id),
             Route::Search => search(&store, request.body),
+        }?;
+        if let Some(event) = Event::of(&route, &response) {
+            self.record(key, &store, event);
         }
+        Ok(response)
     }
 
     fn mcp(&self, request: &Request) -> Result<Response, Failure> {

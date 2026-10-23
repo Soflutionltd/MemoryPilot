@@ -899,3 +899,101 @@ fn rate_and_memory_limits_apply_per_tenant() {
     assert_eq!(elsewhere.status, 200, "another tenant keeps its own limits");
     assert_eq!(header(&elsewhere, "X-RateLimit-Limit"), Some("600"));
 }
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn usage_is_metered_and_changes_are_audited_by_id_only() {
+    let app = app();
+    app.send("GET", "/v1/memories", None, Value::Null);
+    let id = app.add(Some("alice"), "Alice moved to Porto last spring");
+    app.send(
+        "POST",
+        "/v1/search",
+        None,
+        json!({ "query": "where does Alice live" }),
+    );
+    let edited = app.send(
+        "PATCH",
+        &format!("/v1/memories/{}", id),
+        Some("alice"),
+        json!({ "importance": 4 }),
+    );
+    assert_eq!(edited.status, 200, "{}", edited.body);
+    let deleted = app.legacy_tool(
+        &app.full,
+        Some("alice"),
+        "delete_memory",
+        json!({ "id": id }),
+    );
+    assert_eq!(deleted["isError"], false, "{}", deleted);
+    assert_eq!(
+        app.send("GET", "/v1/memories/missing", None, Value::Null)
+            .status,
+        404
+    );
+
+    let usage = app.api.drain_usage();
+    assert_eq!(usage.len(), 1, "{:?}", usage);
+    assert_eq!(
+        (usage[0].requests, usage[0].writes, usage[0].searches),
+        (6, 3, 1)
+    );
+    assert!(app.api.drain_usage().is_empty());
+
+    let mut admin = PgAdmin::connect(&plain()).expect("admin connection");
+    admin.record_usage(&usage).expect("record");
+    admin.record_usage(&usage).expect("record again");
+    let stored = admin.usage(app.tenant, 7).expect("usage");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        (stored[0].requests, stored[0].writes, stored[0].searches),
+        (12, 6, 2),
+        "added up"
+    );
+
+    let audit = admin.audit_log(app.tenant, 20).expect("audit");
+    let actions: Vec<&str> = audit.iter().map(|entry| entry.action.as_str()).collect();
+    assert_eq!(
+        actions,
+        [
+            "memory.delete",
+            "memory.update",
+            "memory.create",
+            "key.create",
+            "key.create"
+        ]
+    );
+    let created = &audit[2];
+    assert_eq!(created.target.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        (
+            created.actor.as_str(),
+            created.key.is_some(),
+            created.subject.is_some()
+        ),
+        ("key", true, true)
+    );
+    assert_eq!((audit[3].actor.as_str(), audit[3].key), ("admin", None));
+    assert!(
+        audit
+            .iter()
+            .all(|entry| !entry.target.as_deref().unwrap_or("").contains("Porto")),
+        "ids only"
+    );
+
+    let url = std::env::var("MEMORYPILOT_TEST_PG_URL").expect("url");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("raw connection");
+    client
+        .batch_execute("SET ROLE memorypilot_app")
+        .expect("app role");
+    let mut tx = client.transaction().expect("tx");
+    tx.execute(
+        "SELECT set_config('app.tenant_id', $1, true)",
+        &[&app.tenant.to_string()],
+    )
+    .expect("tenant");
+    assert!(
+        tx.query("SELECT action FROM audit_log", &[]).is_err(),
+        "the application never reads the audit log"
+    );
+}

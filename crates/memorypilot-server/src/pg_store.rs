@@ -17,7 +17,7 @@ use crate::auth::{generate_key, info_from_row, permission_names};
 use crate::pool::{app_session, ExpiryClock, PooledClient};
 use crate::text::{fts5_to_tsquery, index_text};
 use crate::{pg_error, PgConnection, PgPool};
-use crate::{ApiKeyInfo, NewApiKey, Permission, TenantLimits};
+use crate::{ApiKeyInfo, DailyUsage, NewApiKey, Permission, TenantLimits};
 
 /// Where a store reads and writes. With a subject it sees that end user's
 /// memories plus the ones shared by the space, and writes as that end
@@ -103,6 +103,19 @@ fn reported<T: Default>(answer: Result<T, String>, what: &str) -> T {
     })
 }
 
+/// One change, by id only.
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub at: DateTime<Utc>,
+    pub space: Option<Uuid>,
+    pub subject: Option<Uuid>,
+    pub key: Option<Uuid>,
+    /// `key` (a request) or `admin` (a command).
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+}
+
 /// Owner connection: migrations and the tenant hierarchy. Not subject to
 /// row level security (it owns the tables), so never handed to request code.
 pub struct PgAdmin {
@@ -168,6 +181,87 @@ impl PgAdmin {
         Ok(row.get(0))
     }
 
+    fn audit(
+        &mut self,
+        tenant: Uuid,
+        space: Option<Uuid>,
+        action: &str,
+        target: &str,
+    ) -> Result<(), String> {
+        self.client
+            .execute(
+                "INSERT INTO audit_log (tenant_id, space_id, actor, action, target) VALUES ($1, $2, 'admin', $3, $4)",
+                &[&tenant, &space, &action, &target],
+            )
+            .map(|_| ())
+            .map_err(pg_error)
+    }
+
+    /// The tenant's most recent changes, newest first.
+    pub fn audit_log(&mut self, tenant: Uuid, limit: usize) -> Result<Vec<AuditEntry>, String> {
+        Ok(self
+            .client
+            .query(
+                "SELECT at, space_id, subject_id, key_id, actor, action, target FROM audit_log
+                 WHERE tenant_id = $1 ORDER BY at DESC, id DESC LIMIT $2",
+                &[&tenant, &(limit as i64)],
+            )
+            .map_err(pg_error)?
+            .iter()
+            .map(|row| AuditEntry {
+                at: row.get(0),
+                space: row.get(1),
+                subject: row.get(2),
+                key: row.get(3),
+                actor: row.get(4),
+                action: row.get(5),
+                target: row.get(6),
+            })
+            .collect())
+    }
+
+    /// Adds counts to the daily totals, in one transaction. Rows of a space
+    /// deleted meanwhile are dropped.
+    pub fn record_usage(&mut self, rows: &[DailyUsage]) -> Result<(), String> {
+        let to_db = |n: u64| i64::try_from(n).map_err(|_| "usage count too large".to_string());
+        let mut tx = self.client.transaction().map_err(pg_error)?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO usage_daily (tenant_id, space_id, day, requests, writes, searches)
+                 SELECT $1, $2, $3, $4, $5, $6 WHERE EXISTS (SELECT 1 FROM spaces WHERE tenant_id = $1 AND id = $2)
+                 ON CONFLICT (tenant_id, space_id, day) DO UPDATE SET
+                     requests = usage_daily.requests + EXCLUDED.requests,
+                     writes = usage_daily.writes + EXCLUDED.writes,
+                     searches = usage_daily.searches + EXCLUDED.searches",
+                &[&row.tenant, &row.space, &row.day, &to_db(row.requests)?, &to_db(row.writes)?, &to_db(row.searches)?],
+            )
+            .map_err(pg_error)?;
+        }
+        tx.commit().map_err(pg_error)
+    }
+
+    /// Daily usage of the tenant's spaces over the last `days` days, oldest first.
+    pub fn usage(&mut self, tenant: Uuid, days: u32) -> Result<Vec<DailyUsage>, String> {
+        Ok(self
+            .client
+            .query(
+                "SELECT space_id, day, requests, writes, searches FROM usage_daily
+                 WHERE tenant_id = $1 AND day > current_date - $2::integer ORDER BY day, space_id",
+                &[&tenant, &(days as i32)],
+            )
+            .map_err(pg_error)?
+            .iter()
+            .map(|row| DailyUsage {
+                tenant,
+                space: row.get(0),
+                day: row.get(1),
+                requests: row.get::<_, i64>(2).max(0) as u64,
+                writes: row.get::<_, i64>(3).max(0) as u64,
+                searches: row.get::<_, i64>(4).max(0) as u64,
+            })
+            .collect())
+    }
+
     /// Sets a tenant's limits (`None`: the server default); false for an unknown tenant.
     pub fn set_limits(&mut self, tenant: Uuid, limits: TenantLimits) -> Result<bool, String> {
         let requests_per_minute = limits
@@ -185,6 +279,13 @@ impl PgAdmin {
                 &[&tenant, &requests_per_minute, &max_memories],
             )
             .map_err(pg_error)?;
+        if changed == 1 {
+            let target = format!(
+                "requests_per_minute={:?} max_memories={:?}",
+                requests_per_minute, max_memories
+            );
+            self.audit(tenant, None, "limits.set", &target)?;
+        }
         Ok(changed == 1)
     }
 
@@ -227,8 +328,10 @@ impl PgAdmin {
             )
             .map_err(pg_error)?
             .ok_or("Unknown space for this tenant")?;
+        let id: Uuid = row.get(0);
+        self.audit(tenant, Some(space), "key.create", &id.to_string())?;
         Ok(NewApiKey {
-            id: row.get(0),
+            id,
             secret: key.secret,
         })
     }
@@ -243,6 +346,9 @@ impl PgAdmin {
                 &[&tenant, &key],
             )
             .map_err(pg_error)?;
+        if changed == 1 {
+            self.audit(tenant, None, "key.revoke", &key.to_string())?;
+        }
         Ok(changed == 1)
     }
 
@@ -362,6 +468,20 @@ impl PgStore {
             .iter()
             .map(|row| row.get(0))
             .collect())
+    }
+
+    /// Records a change made through API key `key` in this scope.
+    pub fn record_audit(&self, key: Uuid, action: &str, target: &str) -> Result<(), String> {
+        self.execute(
+            "INSERT INTO audit_log (tenant_id, space_id, subject_id, key_id, actor, action, target)
+             VALUES ($1, $2, $3, $4, 'key', $5, $6)",
+            vec![
+                Box::new(key),
+                Box::new(action.to_string()),
+                Box::new(target.to_string()),
+            ],
+        )
+        .map(|_| ())
     }
 
     /// Memories of the whole tenant, every space and end user included.

@@ -121,7 +121,10 @@ fn the_binary_sets_up_a_tenant_and_serves_its_memories() {
     );
     assert!(!listed.contains(&key), "the listing never shows the key");
 
-    assert_eq!(admin(&["set-limits", &tenant, "120", "default"]).trim(), "limits set");
+    assert_eq!(
+        admin(&["set-limits", &tenant, "120", "default"]).trim(),
+        "limits set"
+    );
     let server = serve();
     let (status, _, body) = http(&server, "GET", "/health", None, "");
     assert_eq!((status, body.contains("\"ok\"")), (200, true));
@@ -181,6 +184,12 @@ fn the_binary_sets_up_a_tenant_and_serves_its_memories() {
     admin(&["revoke-key", &tenant, key_id]);
     let (status, _, _) = http(&server, "GET", "/v1/memories", Some(&key), "");
     assert_eq!(status, 401, "a revoked key stops working at once");
+
+    let audit = admin(&["audit", &tenant, "10"]);
+    for action in ["key.revoke", "memory.create", "limits.set", "key.create"] {
+        assert!(audit.contains(action), "{} in {}", action, audit);
+    }
+    admin(&["usage", &tenant, "7"]);
 
     let unknown = command().arg("create-space").output().expect("run");
     assert!(!unknown.status.success());

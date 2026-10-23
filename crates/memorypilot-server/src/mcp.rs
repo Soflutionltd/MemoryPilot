@@ -14,7 +14,7 @@ use base64::Engine;
 use memorypilot_core::db::MEMORY_KINDS;
 use serde_json::{json, Map, Value};
 
-use crate::api::{self, Api, Failure, Request, Response, SUBJECT_HEADER};
+use crate::api::{self, Api, Event, Failure, Request, Response, SUBJECT_HEADER};
 use crate::{ApiKey, Permission};
 
 const MODERN_VERSIONS: &[&str] = &["2026-07-28"];
@@ -469,13 +469,17 @@ fn call_tool(
         );
         return rpc_result(id, tool_result(json!(message), true));
     }
+    let memory_id = arguments
+        .get("id")
+        .and_then(Value::as_str)
+        .map(String::from);
     let outcome = api
         .store(key, request.header(SUBJECT_HEADER))
         .and_then(|store| {
             let body = |arguments: &Map<String, Value>| {
                 Value::Object(arguments.clone()).to_string().into_bytes()
             };
-            match tool.name {
+            let response = match tool.name {
                 "search_memory" => api::search(&store, &body(&arguments)),
                 "add_memory" => api::add(&store, &body(&arguments), api.max_memories(key)),
                 "list_memories" => api::list(&store, &list_params(&arguments)?),
@@ -486,7 +490,11 @@ fn call_tool(
                 }
                 "delete_memory" => api::delete(&store, &take_id(&mut arguments)?),
                 other => unreachable!("tool {} has no handler", other),
+            }?;
+            if let Some(event) = Event::of_tool(tool.name, memory_id.as_deref(), &response) {
+                api.record(key, &store, event);
             }
+            Ok(response)
         });
     let result = match outcome {
         Ok(response) => tool_result(response.body, false),
