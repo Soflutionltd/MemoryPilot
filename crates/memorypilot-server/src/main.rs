@@ -443,7 +443,6 @@ fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, Response> {
     Ok(body)
 }
 
-/// One request: a panic in the handler answers 500 instead of killing the worker.
 fn console_asset(root: &Path, url: &str) -> Option<(String, Vec<u8>)> {
     let rest = url.split('?').next()?.strip_prefix("/console")?;
     let relative = if rest.is_empty() || rest == "/" {
@@ -472,16 +471,19 @@ fn console_asset(root: &Path, url: &str) -> Option<(String, Vec<u8>)> {
     Some((content_type.into(), bytes))
 }
 
+/// One request: a panic in the handler answers 500 instead of killing the worker.
 fn answer(api: &Api, console: &Path, mut request: tiny_http::Request) {
     let started = Instant::now();
     if request.method().as_str() == "GET" {
         if let Some((content_type, bytes)) = console_asset(console, request.url()) {
             let header = format!("Content-Type: {}", content_type);
-            let _ = request.respond(
-                tiny_http::Response::from_data(bytes)
-                    .with_header(fixed_header(&header))
-                    .with_header(fixed_header("Cache-Control: no-store")),
-            );
+            let mut reply = tiny_http::Response::from_data(bytes)
+                .with_header(fixed_header(&header))
+                .with_header(fixed_header("Cache-Control: no-store"));
+            for (name, value) in memorypilot_server::api::FRAME_DENY {
+                reply = reply.with_header(fixed_header(&format!("{}: {}", name, value)));
+            }
+            let _ = request.respond(reply);
             return;
         }
     }

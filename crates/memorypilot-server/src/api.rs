@@ -32,6 +32,12 @@ const MAX_LIST_LIMIT: usize = 100;
 const MAX_SEARCH_LIMIT: usize = 50;
 const SOURCE: &str = "api";
 pub const SUBJECT_HEADER: &str = "X-MemoryPilot-Subject";
+/// Pages where an API key is typed: no other site may frame them.
+pub const FRAME_DENY: [(&str, &str); 3] = [
+    ("X-Frame-Options", "DENY"),
+    ("Content-Security-Policy", "frame-ancestors 'none'"),
+    ("X-Content-Type-Options", "nosniff"),
+];
 
 pub struct Request<'a> {
     pub method: &'a str,
@@ -78,7 +84,10 @@ impl Response {
         Self {
             status,
             body: Value::Null,
-            headers: vec![("Content-Type", "text/html; charset=utf-8".into())],
+            headers: FRAME_DENY
+                .iter()
+                .map(|(name, value)| (*name, value.to_string()))
+                .collect(),
             html: Some(page),
         }
     }
