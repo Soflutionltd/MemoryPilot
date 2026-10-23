@@ -1330,3 +1330,130 @@ fn oauth_issues_one_token_per_end_user_with_pkce() {
     });
     assert_eq!(reused.status, 400, "a code is single use");
 }
+
+/// RFC 7636 appendix B. Same pair as `oauth_issues_one_token_per_end_user_with_pkce`.
+fn oauth_access_token(api: &Api, api_key: &str, subject: &str) -> String {
+    let registered = api.handle(&Request {
+        method: "POST",
+        url: "/register",
+        headers: &[("content-type", "application/json")],
+        body: br#"{"client_name":"Claude","redirect_uris":["http://127.0.0.1/cb"]}"#,
+    });
+    assert_eq!(registered.status, 201, "{}", registered.body);
+    let client_id = registered.body["client_id"].as_str().expect("client_id");
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let form = format!(
+        "client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb&state=xyz&code_challenge={}&code_challenge_method=S256&api_key={}&subject={}",
+        client_id, challenge, api_key, subject
+    );
+    let consent = api.handle(&Request {
+        method: "POST",
+        url: "/oauth/authorize",
+        headers: &[("content-type", "application/x-www-form-urlencoded")],
+        body: form.as_bytes(),
+    });
+    assert_eq!(consent.status, 302, "{}", consent.body);
+    let location = consent
+        .headers
+        .iter()
+        .find(|(name, _)| *name == "Location")
+        .map(|(_, value)| value.as_str())
+        .expect("Location");
+    let code = location
+        .split("code=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("code");
+    let token = api.handle(&Request {
+        method: "POST",
+        url: "/oauth/token",
+        headers: &[("content-type", "application/x-www-form-urlencoded")],
+        body: format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb&code_verifier={verifier}&client_id={client_id}"
+        )
+        .as_bytes(),
+    });
+    assert_eq!(token.status, 200, "{}", token.body);
+    token.body["access_token"]
+        .as_str()
+        .expect("token")
+        .to_string()
+}
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn oauth_token_cannot_read_another_tenant() {
+    let (first, second) = (app(), app());
+    let api = Api::new(PgPool::new(plain(), 2)).with_public_url("http://127.0.0.1:8080".into());
+    let token_a = oauth_access_token(&api, &first.full, "alice");
+    let token_b = oauth_access_token(&api, &second.full, "bob");
+    let auth_a = format!("Bearer {}", token_a);
+    let auth_b = format!("Bearer {}", token_b);
+
+    let created = api.handle(&Request {
+        method: "POST",
+        url: "/v1/memories",
+        headers: &[
+            ("authorization", auth_a.as_str()),
+            ("content-type", "application/json"),
+        ],
+        body: br#"{"content":"Tenant A payroll IBAN FR76"}"#,
+    });
+    assert_eq!(created.status, 201, "{}", created.body);
+    let id = created.body["memory"]["id"].as_str().expect("id");
+
+    let listed = api.handle(&Request {
+        method: "GET",
+        url: "/v1/memories",
+        headers: &[("authorization", auth_b.as_str())],
+        body: b"",
+    });
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    assert_eq!(listed.body["memories"], json!([]));
+    assert!(!listed.body.to_string().contains("FR76"));
+
+    assert_eq!(
+        api.handle(&Request {
+            method: "GET",
+            url: &format!("/v1/memories/{id}"),
+            headers: &[("authorization", auth_b.as_str())],
+            body: b"",
+        })
+        .status,
+        404
+    );
+    assert_eq!(
+        api.handle(&Request {
+            method: "DELETE",
+            url: &format!("/v1/memories/{id}"),
+            headers: &[("authorization", auth_b.as_str())],
+            body: b"",
+        })
+        .status,
+        404
+    );
+
+    let found = api.handle(&Request {
+        method: "POST",
+        url: "/v1/search",
+        headers: &[
+            ("authorization", auth_b.as_str()),
+            ("content-type", "application/json"),
+        ],
+        body: br#"{"query":"payroll IBAN"}"#,
+    });
+    assert_eq!(found.status, 200, "{}", found.body);
+    assert_eq!(found.body["results"], json!([]));
+
+    let steal = api.handle(&Request {
+        method: "GET",
+        url: "/v1/memories",
+        headers: &[
+            ("authorization", auth_b.as_str()),
+            ("x-memorypilot-subject", "alice"),
+        ],
+        body: b"",
+    });
+    assert_eq!(steal.status, 400, "{}", steal.body);
+}
