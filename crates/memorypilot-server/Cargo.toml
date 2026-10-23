@@ -16,6 +16,9 @@ chrono = "0.4"
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 unicode-normalization = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 memorypilot-core = { path = "../memorypilot-core", features = ["store-contract"] }

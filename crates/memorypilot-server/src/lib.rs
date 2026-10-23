@@ -7,13 +7,19 @@
 //! `memorypilot_app` role, `app.tenant_id` set per transaction) rejects
 //! any row of another tenant.
 
+mod connection;
 mod pg_store;
 mod schema;
 pub mod text;
 
+pub use connection::PgConnection;
 pub use pg_store::{PgAdmin, PgStore, Scope};
 
 pub(crate) fn pg_error(error: postgres::Error) -> String {
+    pg_message(&error)
+}
+
+pub(crate) fn pg_message(error: &postgres::Error) -> String {
     match error.as_db_error() {
         Some(db) => format!("Postgres: {}", db.message()),
         None => format!("Postgres: {}", error),

@@ -8,13 +8,13 @@ use chrono::{DateTime, Utc};
 use memorypilot_core::db::{GraphStore, Memory, MemoryStore, RecallStore};
 use pgvector::Vector;
 use postgres::types::{Json, ToSql};
-use postgres::{Client, NoTls, Row, Transaction};
+use postgres::{Client, Row, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use uuid::Uuid;
 
-use crate::pg_error;
 use crate::text::{fts5_to_tsquery, index_text};
+use crate::{pg_error, PgConnection};
 
 /// Where a store reads and writes. With a subject it sees that end user's
 /// memories plus the ones shared by the space, and writes as that end
@@ -107,10 +107,19 @@ pub struct PgAdmin {
 }
 
 impl PgAdmin {
-    pub fn connect(url: &str) -> Result<Self, String> {
+    pub fn connect(connection: &PgConnection) -> Result<Self, String> {
         Ok(Self {
-            client: Client::connect(url, NoTls).map_err(pg_error)?,
+            client: connection.connect()?,
         })
+    }
+
+    /// Whether this session runs over TLS, as the server sees it.
+    pub fn session_encrypted(&mut self) -> Result<bool, String> {
+        let row = self
+            .client
+            .query_one("SELECT coalesce((SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()), false)", &[])
+            .map_err(pg_error)?;
+        Ok(row.get(0))
     }
 
     /// Applies the missing migrations; returns their versions.
@@ -169,8 +178,8 @@ const EXPIRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 impl PgStore {
     /// Connects as `memorypilot_app` (the login role must be a member) and
     /// checks that the space, and the subject when given, belong to the tenant.
-    pub fn connect(url: &str, scope: Scope) -> Result<Self, String> {
-        let mut client = Client::connect(url, NoTls).map_err(pg_error)?;
+    pub fn connect(connection: &PgConnection, scope: Scope) -> Result<Self, String> {
+        let mut client = connection.connect()?;
         client
             .batch_execute("SET ROLE memorypilot_app")
             .map_err(pg_error)?;

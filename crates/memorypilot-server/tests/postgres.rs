@@ -9,7 +9,7 @@ use memorypilot_core::db::{
     add_memory_to, fr_scenarios, hybrid_search, score_fr_queries, update_memory_in, Memory,
     MemoryScope, MemoryStore, RecallStore, WriteOutcome,
 };
-use memorypilot_server::{PgAdmin, PgStore, Scope};
+use memorypilot_server::{PgAdmin, PgConnection, PgStore, Scope};
 use uuid::Uuid;
 
 const NEEDS_POSTGRES: &str = "needs Postgres with pgvector: scripts/test-postgres.sh";
@@ -22,8 +22,90 @@ fn url() -> String {
         .unwrap_or_else(|_| panic!("MEMORYPILOT_TEST_PG_URL is not set ({})", NEEDS_POSTGRES))
 }
 
+fn url_for_host(host: &str) -> String {
+    url().replacen("@127.0.0.1:", &format!("@{}:", host), 1)
+}
+
+fn test_ca() -> std::path::PathBuf {
+    std::env::var("MEMORYPILOT_TEST_PG_TLS_CA")
+        .unwrap_or_else(|_| panic!("MEMORYPILOT_TEST_PG_TLS_CA is not set ({})", NEEDS_POSTGRES))
+        .into()
+}
+
+fn refused(connection: &PgConnection) -> String {
+    let error = PgAdmin::connect(connection)
+        .err()
+        .expect("connection refused");
+    let password = url()
+        .split('@')
+        .next()
+        .and_then(|credentials| credentials.rsplit(':').next())
+        .map(String::from);
+    assert!(
+        password.is_some_and(|password| !error.contains(&password)),
+        "the error never shows the password"
+    );
+    error
+}
+
+/// TLS: the server certificate (signed by the test CA, for "localhost"
+/// only) must chain to a trusted CA and name the host connected to.
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn tls_connections_verify_the_certificate_and_the_host_name() {
+    let verified =
+        PgConnection::verified(&url_for_host("localhost"), Some(&test_ca())).expect("config");
+    assert!(verified.is_encrypted());
+    let mut over_tls = PgAdmin::connect(&verified).expect("verified TLS connection");
+    assert!(
+        over_tls.session_encrypted().expect("ssl"),
+        "the server sees an encrypted session"
+    );
+    let scope = new_space(&mut over_tls);
+    PgStore::connect(&verified, scope).expect("store over TLS");
+
+    let unknown_ca =
+        refused(&PgConnection::verified(&url_for_host("localhost"), None).expect("config"));
+    assert!(unknown_ca.contains("certificate"), "{}", unknown_ca);
+    let other_host = refused(
+        &PgConnection::verified(&url_for_host("127.0.0.1"), Some(&test_ca())).expect("config"),
+    );
+    assert!(other_host.contains("certificate"), "{}", other_host);
+    assert!(
+        !admin().session_encrypted().expect("ssl"),
+        "a plain connection is not encrypted"
+    );
+}
+
+#[test]
+fn a_ca_file_without_certificate_is_an_error() {
+    let url = "postgresql://user:secret@localhost:5432/db";
+    assert!(
+        PgConnection::verified(url, Some(std::path::Path::new("/nonexistent/ca.crt"))).is_err()
+    );
+    let empty = std::env::temp_dir().join(format!("mp-empty-ca-{}.crt", Uuid::new_v4()));
+    std::fs::write(&empty, "not a certificate").expect("write");
+    let error = PgConnection::verified(url, Some(&empty))
+        .err()
+        .expect("no certificate");
+    std::fs::remove_file(&empty).expect("remove");
+    assert!(error.contains("no certificate"), "{}", error);
+    let invalid = PgConnection::plain("postgresql://user:secret@localhost:notaport/db")
+        .err()
+        .expect("invalid URL");
+    assert!(
+        !invalid.contains("secret"),
+        "the URL error never shows the password: {}",
+        invalid
+    );
+}
+
+fn plain() -> PgConnection {
+    PgConnection::plain(&url()).expect("url")
+}
+
 fn admin() -> PgAdmin {
-    let mut admin = PgAdmin::connect(&url()).expect("admin connection");
+    let mut admin = PgAdmin::connect(&plain()).expect("admin connection");
     admin.migrate().expect("migrations");
     admin
 }
@@ -42,7 +124,7 @@ fn new_space(admin: &mut PgAdmin) -> Scope {
 }
 
 fn store(scope: Scope) -> PgStore {
-    PgStore::connect(&url(), scope).expect("store connection")
+    PgStore::connect(&plain(), scope).expect("store connection")
 }
 
 fn memory(id: &str, content: &str) -> Memory {
@@ -641,7 +723,7 @@ fn a_store_cannot_bind_to_another_tenants_space() {
     let theirs = new_space(&mut admin);
     let mine = new_space(&mut admin);
     assert!(PgStore::connect(
-        &url(),
+        &plain(),
         Scope {
             tenant: mine.tenant,
             space: theirs.space,
@@ -653,7 +735,7 @@ fn a_store_cannot_bind_to_another_tenants_space() {
         .create_subject(theirs.tenant, theirs.space, "user-1")
         .expect("subject");
     assert!(PgStore::connect(
-        &url(),
+        &plain(),
         Scope {
             subject: Some(their_user),
             ..mine
