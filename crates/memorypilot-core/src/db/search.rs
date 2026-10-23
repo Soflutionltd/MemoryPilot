@@ -451,6 +451,10 @@ impl Database {
             .map(|weakest| weakest.score * 0.5)
             .unwrap_or(0.0);
         if let Ok(related_ids) = self.graph_neighbours(&top_ids, 1) {
+            // A set iterates in a different order every process: sorted, the
+            // capped expansion picks the same neighbours on every run.
+            let mut related_ids: Vec<String> = related_ids.into_iter().collect();
+            related_ids.sort();
             let mut added = 0usize;
             for rel_id in related_ids {
                 if added >= GRAPH_EXPANSION_MAX {
