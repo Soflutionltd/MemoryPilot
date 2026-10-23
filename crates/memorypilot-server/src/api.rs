@@ -13,7 +13,12 @@ use memorypilot_core::db::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{ApiKey, Permission, PgPool, PgStore};
+use crate::limits::RateLimiter;
+use crate::{
+    ApiKey, Permission, PgPool, PgStore, DEFAULT_MAX_MEMORIES, DEFAULT_REQUESTS_PER_MINUTE,
+};
+use std::sync::Arc;
+use std::time::Instant;
 
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
@@ -44,15 +49,28 @@ impl Request<'_> {
     }
 }
 
+type Headers = Vec<(&'static str, String)>;
+
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
+    /// `Null`: no body.
     pub body: Value,
+    /// Extra headers (rate limit state, Retry-After).
+    pub headers: Headers,
 }
 
 impl Response {
+    pub fn new(status: u16, body: Value) -> Self {
+        Self {
+            status,
+            body,
+            headers: Vec::new(),
+        }
+    }
+
     fn ok(body: Value) -> Self {
-        Self { status: 200, body }
+        Self::new(200, body)
     }
 }
 
@@ -88,10 +106,7 @@ impl Failure {
 
 impl From<Failure> for Response {
     fn from(failure: Failure) -> Self {
-        Response {
-            status: failure.status,
-            body: json!({ "error": failure.message }),
-        }
+        Response::new(failure.status, json!({ "error": failure.message }))
     }
 }
 
@@ -132,6 +147,9 @@ fn route<'a>(method: &str, path: &'a str) -> Option<Route<'a>> {
 pub struct Api {
     pool: PgPool,
     allowed_origins: Vec<String>,
+    rate: Arc<RateLimiter>,
+    default_requests_per_minute: u32,
+    default_max_memories: u64,
 }
 
 impl Api {
@@ -139,6 +157,52 @@ impl Api {
         Self {
             pool,
             allowed_origins: Vec::new(),
+            rate: Arc::default(),
+            default_requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
+            default_max_memories: DEFAULT_MAX_MEMORIES,
+        }
+    }
+
+    /// Limits of tenants that have none of their own.
+    pub fn with_default_limits(mut self, requests_per_minute: u32, max_memories: u64) -> Self {
+        self.default_requests_per_minute = requests_per_minute.max(1);
+        self.default_max_memories = max_memories;
+        self
+    }
+
+    pub(crate) fn max_memories(&self, key: &ApiKey) -> u64 {
+        key.limits.max_memories.unwrap_or(self.default_max_memories)
+    }
+
+    /// Authenticates, then charges the key's rate: 429 with Retry-After once
+    /// the minute's requests are spent. Returns the key and the headers that
+    /// tell the client where it stands.
+    fn admit(&self, authorization: Option<&str>) -> Result<(ApiKey, Headers), Response> {
+        let key = self.authenticate(authorization).map_err(Response::from)?;
+        let limit = key
+            .limits
+            .requests_per_minute
+            .unwrap_or(self.default_requests_per_minute);
+        match self.rate.take(key.id, limit, Instant::now()) {
+            Ok(remaining) => Ok((
+                key,
+                vec![
+                    ("X-RateLimit-Limit", limit.to_string()),
+                    ("X-RateLimit-Remaining", remaining.to_string()),
+                ],
+            )),
+            Err(wait) => {
+                let mut response = Response::from(Failure::new(
+                    429,
+                    format!("Too many requests: {} per minute for this account", limit),
+                ));
+                response.headers = vec![
+                    ("Retry-After", wait.to_string()),
+                    ("X-RateLimit-Limit", limit.to_string()),
+                    ("X-RateLimit-Remaining", "0".into()),
+                ];
+                Err(response)
+            }
         }
     }
 
@@ -169,7 +233,24 @@ impl Api {
                 "Not found. Routes: POST|GET /v1/memories, GET|PATCH|DELETE /v1/memories/{id}, POST /v1/search, POST /mcp",
             )
         })?;
-        let key = self.authenticate(request.header("Authorization"))?;
+        let (key, headers) = match self.admit(request.header("Authorization")) {
+            Ok(admitted) => admitted,
+            Err(response) => return Ok(response),
+        };
+        let mut response = self
+            .serve(&key, route, query, request)
+            .unwrap_or_else(Response::from);
+        response.headers.extend(headers);
+        Ok(response)
+    }
+
+    fn serve(
+        &self,
+        key: &ApiKey,
+        route: Route,
+        query: &str,
+        request: &Request,
+    ) -> Result<Response, Failure> {
         if !key.allows(route.permission()) {
             return Err(Failure::new(
                 403,
@@ -179,9 +260,9 @@ impl Api {
                 ),
             ));
         }
-        let store = self.store(&key, request.header(SUBJECT_HEADER))?;
+        let store = self.store(key, request.header(SUBJECT_HEADER))?;
         match route {
-            Route::AddMemory => add(&store, request.body),
+            Route::AddMemory => add(&store, request.body, self.max_memories(key)),
             Route::ListMemories => list(&store, &query_params(query)),
             Route::GetMemory(id) => get(&store, id),
             Route::UpdateMemory(id) => update(&store, id, request.body),
@@ -199,14 +280,19 @@ impl Api {
         }
         if let Some(origin) = request.header("Origin") {
             if !self.allowed_origins.iter().any(|allowed| allowed == origin) {
-                return Ok(Response {
-                    status: 403,
-                    body: json!({ "jsonrpc": "2.0", "error": { "code": -32600, "message": "Origin not allowed" } }),
-                });
+                return Ok(Response::new(
+                    403,
+                    json!({ "jsonrpc": "2.0", "error": { "code": -32600, "message": "Origin not allowed" } }),
+                ));
             }
         }
-        let key = self.authenticate(request.header("Authorization"))?;
-        Ok(crate::mcp::handle(self, &key, request))
+        let (key, headers) = match self.admit(request.header("Authorization")) {
+            Ok(admitted) => admitted,
+            Err(response) => return Ok(response),
+        };
+        let mut response = crate::mcp::handle(self, &key, request);
+        response.headers.extend(headers);
+        Ok(response)
     }
 
     fn authenticate(&self, authorization: Option<&str>) -> Result<ApiKey, Failure> {
@@ -324,7 +410,7 @@ struct NewMemory {
     metadata: Option<Value>,
 }
 
-pub(crate) fn add(store: &PgStore, body: &[u8]) -> Result<Response, Failure> {
+pub(crate) fn add(store: &PgStore, body: &[u8], max_memories: u64) -> Result<Response, Failure> {
     let input: NewMemory = parse(body)?;
     let content = non_empty("content", &input.content, MAX_CONTENT_BYTES)?;
     let (auto_importance, auto_kind, auto_ttl_days) = memorypilot_core::gc::auto_classify(content);
@@ -347,6 +433,16 @@ pub(crate) fn add(store: &PgStore, body: &[u8]) -> Result<Response, Failure> {
     if let Some(metadata) = &input.metadata {
         check_metadata(metadata)?;
     }
+    let stored = store.tenant_memory_count().map_err(Failure::from_store)?;
+    if stored >= 0 && stored as u64 >= max_memories {
+        return Err(Failure::new(
+            403,
+            format!(
+                "Memory quota reached: {} memories for this account",
+                max_memories
+            ),
+        ));
+    }
     let outcome = add_memory_to(
         store,
         None,
@@ -361,10 +457,10 @@ pub(crate) fn add(store: &PgStore, body: &[u8]) -> Result<Response, Failure> {
         &MemoryScope::default(),
     )
     .map_err(Failure::from_store)?;
-    Ok(Response {
-        status: if outcome.merged { 200 } else { 201 },
-        body: json!({ "memory": outcome.memory, "merged": outcome.merged }),
-    })
+    Ok(Response::new(
+        if outcome.merged { 200 } else { 201 },
+        json!({ "memory": outcome.memory, "merged": outcome.merged }),
+    ))
 }
 
 fn query_params(query: &str) -> HashMap<String, String> {

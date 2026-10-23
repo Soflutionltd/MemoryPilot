@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use memorypilot_server::api::{Api, Request, Response, MAX_BODY_BYTES};
-use memorypilot_server::{embed_scopes, Permission, PgAdmin, PgConnection, PgPool};
+use memorypilot_server::{
+    embed_scopes, Permission, PgAdmin, PgConnection, PgPool, TenantLimits, DEFAULT_MAX_MEMORIES,
+    DEFAULT_REQUESTS_PER_MINUTE,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -21,6 +24,8 @@ Commands:
   create-key <tenant> <space> <name> <permissions>
                                             permissions: comma separated, among read,write,subjects;
                                             the key is printed once and never stored
+  set-limits <tenant> <requests per minute> <max memories>
+                                            each a whole number or 'default'
   revoke-key <tenant> <key id>
   list-keys <tenant>
 
@@ -30,6 +35,9 @@ Environment:
   MEMORYPILOT_PG_TLS      on (default: certificate and host name verified) or off (local only)
   MEMORYPILOT_BIND        address to listen on (default 127.0.0.1:8080)
   MEMORYPILOT_WORKERS     concurrent requests (default 8)
+  MEMORYPILOT_DEFAULT_RPM requests per minute per key for tenants without their own (default 600)
+  MEMORYPILOT_DEFAULT_MAX_MEMORIES
+                          memories per tenant for tenants without their own (default 100000)
   MEMORYPILOT_EMBEDDER    on (default) or off: compute vectors in the background
                           (keep it on in one replica at least)
   MEMORYPILOT_ALLOWED_ORIGINS
@@ -86,6 +94,22 @@ fn run(args: &[String]) -> Result<(), String> {
             eprintln!("Store the key now: only its hash is kept.");
             Ok(())
         }
+        ["set-limits", tenant, requests_per_minute, max_memories] => {
+            let limits = TenantLimits {
+                requests_per_minute: limit(requests_per_minute, "requests per minute")?,
+                max_memories: limit(max_memories, "memory quota")?,
+            };
+            if limits.requests_per_minute == Some(0) {
+                return Err("requests per minute must be at least 1".into());
+            }
+            match admin()?.set_limits(uuid(tenant)?, limits)? {
+                true => {
+                    println!("limits set");
+                    Ok(())
+                }
+                false => Err("unknown tenant".into()),
+            }
+        }
         ["revoke-key", tenant, key] => match admin()?.revoke_api_key(uuid(tenant)?, uuid(key)?)? {
             true => {
                 println!("revoked");
@@ -137,6 +161,27 @@ fn connection() -> Result<PgConnection, String> {
     }
 }
 
+fn number_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
+    match env(name) {
+        None => Ok(default),
+        Some(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| format!("{} is a whole number, not '{}'", name, value)),
+    }
+}
+
+/// `default` (the server's default) or a whole number.
+fn limit<T: std::str::FromStr>(value: &str, what: &str) -> Result<Option<T>, String> {
+    match value {
+        "default" => Ok(None),
+        number => number
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{} is a whole number or 'default', not '{}'", what, number)),
+    }
+}
+
 fn admin() -> Result<PgAdmin, String> {
     PgAdmin::connect(&connection()?)
 }
@@ -178,7 +223,12 @@ fn serve() -> Result<(), String> {
             ))
         }
     }
-    let api = Api::new(pool).with_allowed_origins(origins);
+    let api = Api::new(pool)
+        .with_allowed_origins(origins)
+        .with_default_limits(
+            number_env("MEMORYPILOT_DEFAULT_RPM", DEFAULT_REQUESTS_PER_MINUTE)?,
+            number_env("MEMORYPILOT_DEFAULT_MAX_MEMORIES", DEFAULT_MAX_MEMORIES)?,
+        );
     let server = Arc::new(
         tiny_http::Server::http(&bind).map_err(|e| format!("cannot listen on {}: {}", bind, e))?,
     );
@@ -232,9 +282,11 @@ fn embed_in_background(connection: PgConnection, pool: PgPool) {
 }
 
 fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, Response> {
-    let too_large = || Response {
-        status: 413,
-        body: json!({ "error": format!("The body is larger than {} bytes", MAX_BODY_BYTES) }),
+    let too_large = || {
+        Response::new(
+            413,
+            json!({ "error": format!("The body is larger than {} bytes", MAX_BODY_BYTES) }),
+        )
     };
     if request
         .body_length()
@@ -247,9 +299,11 @@ fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, Response> {
         .as_reader()
         .take(MAX_BODY_BYTES as u64 + 1)
         .read_to_end(&mut body)
-        .map_err(|error| Response {
-            status: 400,
-            body: json!({ "error": format!("Cannot read the body: {}", error) }),
+        .map_err(|error| {
+            Response::new(
+                400,
+                json!({ "error": format!("Cannot read the body: {}", error) }),
+            )
         })?;
     if body.len() > MAX_BODY_BYTES {
         return Err(too_large());
@@ -275,10 +329,7 @@ fn answer(api: &Api, mut request: tiny_http::Request) {
                 body: &body,
             })
         }))
-        .unwrap_or_else(|_| Response {
-            status: 500,
-            body: json!({ "error": "Internal error" }),
-        }),
+        .unwrap_or_else(|_| Response::new(500, json!({ "error": "Internal error" }))),
     };
     let path = request.url().split('?').next().unwrap_or("").to_string();
     let method = request.method().as_str().to_string();
@@ -292,6 +343,12 @@ fn answer(api: &Api, mut request: tiny_http::Request) {
     .with_header(fixed_header("Cache-Control: no-store"));
     if status == 401 {
         reply = reply.with_header(fixed_header("WWW-Authenticate: Bearer"));
+    }
+    for (name, value) in &response.headers {
+        match tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            Ok(header) => reply = reply.with_header(header),
+            Err(()) => eprintln!("[memorypilot-server] header {} not sent", name),
+        }
     }
     if let Err(error) = request.respond(reply) {
         eprintln!(

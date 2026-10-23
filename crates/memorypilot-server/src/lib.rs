@@ -11,6 +11,7 @@ pub mod api;
 mod auth;
 mod connection;
 mod embedder;
+mod limits;
 mod mcp;
 mod pg_store;
 mod pool;
@@ -20,6 +21,7 @@ pub mod text;
 pub use auth::{ApiKey, ApiKeyInfo, NewApiKey, Permission};
 pub use connection::PgConnection;
 pub use embedder::embed_scopes;
+pub use limits::{TenantLimits, DEFAULT_MAX_MEMORIES, DEFAULT_REQUESTS_PER_MINUTE};
 pub use pg_store::{PgAdmin, PgStore, Scope};
 pub use pool::PgPool;
 

@@ -121,6 +121,7 @@ fn the_binary_sets_up_a_tenant_and_serves_its_memories() {
     );
     assert!(!listed.contains(&key), "the listing never shows the key");
 
+    assert_eq!(admin(&["set-limits", &tenant, "120", "default"]).trim(), "limits set");
     let server = serve();
     let (status, _, body) = http(&server, "GET", "/health", None, "");
     assert_eq!((status, body.contains("\"ok\"")), (200, true));
@@ -148,6 +149,7 @@ fn the_binary_sets_up_a_tenant_and_serves_its_memories() {
     );
     assert_eq!(status, 200, "{}", body);
     assert!(head.contains("Content-Type: application/json"));
+    assert!(head.contains("X-RateLimit-Limit: 120"), "{}", head);
 
     let (status, _, _) = http(
         &server,

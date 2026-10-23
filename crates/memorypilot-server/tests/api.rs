@@ -2,7 +2,7 @@
 //! without the HTTP layer. Each test works in tenants it creates.
 
 use memorypilot_server::api::{Api, Request, Response};
-use memorypilot_server::{Permission, PgAdmin, PgConnection, PgPool};
+use memorypilot_server::{Permission, PgAdmin, PgConnection, PgPool, TenantLimits};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -17,6 +17,7 @@ fn plain() -> PgConnection {
 /// One tenant with one space, a key with every permission and a read-only key.
 struct App {
     api: Api,
+    tenant: Uuid,
     full: String,
     reader: String,
 }
@@ -38,6 +39,7 @@ fn app() -> App {
         full: key(&Permission::ALL),
         reader: key(&[Permission::Read]),
         api: Api::new(PgPool::new(plain(), 2)),
+        tenant,
     }
 }
 
@@ -848,4 +850,52 @@ fn mcp_tools_act_for_the_end_user_named_by_the_request() {
         reader_as_alice["isError"], true,
         "acting for an end user needs 'subjects'"
     );
+}
+
+fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+    response
+        .headers
+        .iter()
+        .find(|(field, _)| field.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+#[test]
+#[ignore = "needs Postgres with pgvector: scripts/test-postgres.sh"]
+fn rate_and_memory_limits_apply_per_tenant() {
+    let (app, other) = (app(), app());
+    let mut admin = PgAdmin::connect(&plain()).expect("admin connection");
+    let tight = TenantLimits {
+        requests_per_minute: Some(3),
+        max_memories: Some(1),
+    };
+    assert!(admin.set_limits(app.tenant, tight).expect("limits"));
+    assert!(
+        !admin.set_limits(Uuid::new_v4(), tight).expect("limits"),
+        "unknown tenant"
+    );
+
+    let listed = app.send("GET", "/v1/memories", None, Value::Null);
+    assert_eq!(listed.status, 200);
+    assert_eq!(header(&listed, "X-RateLimit-Limit"), Some("3"));
+    assert_eq!(header(&listed, "X-RateLimit-Remaining"), Some("2"));
+    app.add(None, "The first memory fits the quota");
+    let over_quota = app.send(
+        "POST",
+        "/v1/memories",
+        None,
+        json!({ "content": "The second does not" }),
+    );
+    assert_eq!(over_quota.status, 403, "{}", over_quota.body);
+    assert!(error_of(&over_quota).contains("quota"));
+
+    let throttled = app.send("GET", "/v1/memories", None, Value::Null);
+    assert_eq!(throttled.status, 429);
+    assert_eq!(header(&throttled, "Retry-After"), Some("20"));
+    let mcp_throttled = app.legacy(&app.full, "ping", json!({}));
+    assert_eq!(mcp_throttled.status, 429, "MCP shares the key's rate");
+
+    let elsewhere = other.send("GET", "/v1/memories", None, Value::Null);
+    assert_eq!(elsewhere.status, 200, "another tenant keeps its own limits");
+    assert_eq!(header(&elsewhere, "X-RateLimit-Limit"), Some("600"));
 }

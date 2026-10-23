@@ -61,16 +61,13 @@ fn rpc_error(
     if let Some(id) = id {
         body["id"] = id.clone();
     }
-    Response { status, body }
+    Response::new(status, body)
 }
 
 fn rpc_result(id: &Value, mut result: Value) -> Response {
     result["resultType"] = json!("complete");
     result["_meta"] = json!({ META_SERVER_INFO: server_info() });
-    Response {
-        status: 200,
-        body: json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-    }
+    Response::new(200, json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
 /// `Mcp-Name` and `Mcp-Param-*` values may be sent as `=?base64?…?=`.
@@ -182,10 +179,7 @@ pub(crate) fn handle(api: &Api, key: &ApiKey, request: &Request) -> Response {
         return invalid("method is required (clients send no responses)");
     };
     let Some(id) = object.get("id") else {
-        return Response {
-            status: 202,
-            body: Value::Null,
-        };
+        return Response::new(202, Value::Null);
     };
     if !(id.is_string() || id.is_number()) {
         return invalid("id is a string or a number");
@@ -483,7 +477,7 @@ fn call_tool(
             };
             match tool.name {
                 "search_memory" => api::search(&store, &body(&arguments)),
-                "add_memory" => api::add(&store, &body(&arguments)),
+                "add_memory" => api::add(&store, &body(&arguments), api.max_memories(key)),
                 "list_memories" => api::list(&store, &list_params(&arguments)?),
                 "get_memory" => api::get(&store, &take_id(&mut arguments)?),
                 "update_memory" => {

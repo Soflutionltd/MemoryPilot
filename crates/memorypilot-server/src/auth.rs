@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use ring::rand::{SecureRandom, SystemRandom};
 use uuid::Uuid;
 
-use crate::{pg_error, PgPool, Scope};
+use crate::{pg_error, PgPool, Scope, TenantLimits};
 
 const KEY_PREFIX: &str = "mpk_";
 const KEY_BYTES: usize = 32;
@@ -52,6 +52,7 @@ pub struct ApiKey {
     pub tenant: Uuid,
     pub space: Uuid,
     pub permissions: Vec<Permission>,
+    pub limits: TenantLimits,
 }
 
 impl ApiKey {
@@ -165,7 +166,8 @@ impl PgPool {
         let mut client = self.checkout()?;
         let rows = client
             .query(
-                "SELECT tenant_id, space_id, key_id, permissions FROM memorypilot_resolve_key($1)",
+                "SELECT tenant_id, space_id, key_id, permissions, requests_per_minute, max_memories
+                 FROM memorypilot_resolve_key($1)",
                 &[&key_hash(presented)],
             )
             .map_err(pg_error)?;
@@ -176,6 +178,14 @@ impl PgPool {
                     tenant: row.get("tenant_id"),
                     space: row.get("space_id"),
                     permissions: parse_all(row.get("permissions"))?,
+                    limits: TenantLimits {
+                        requests_per_minute: row
+                            .get::<_, Option<i32>>("requests_per_minute")
+                            .map(|n| n.max(1) as u32),
+                        max_memories: row
+                            .get::<_, Option<i64>>("max_memories")
+                            .map(|n| n.max(0) as u64),
+                    },
                 })
             })
             .transpose()

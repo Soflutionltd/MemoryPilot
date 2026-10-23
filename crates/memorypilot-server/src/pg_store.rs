@@ -17,7 +17,7 @@ use crate::auth::{generate_key, info_from_row, permission_names};
 use crate::pool::{app_session, ExpiryClock, PooledClient};
 use crate::text::{fts5_to_tsquery, index_text};
 use crate::{pg_error, PgConnection, PgPool};
-use crate::{ApiKeyInfo, NewApiKey, Permission};
+use crate::{ApiKeyInfo, NewApiKey, Permission, TenantLimits};
 
 /// Where a store reads and writes. With a subject it sees that end user's
 /// memories plus the ones shared by the space, and writes as that end
@@ -166,6 +166,26 @@ impl PgAdmin {
             )
             .map_err(pg_error)?;
         Ok(row.get(0))
+    }
+
+    /// Sets a tenant's limits (`None`: the server default); false for an unknown tenant.
+    pub fn set_limits(&mut self, tenant: Uuid, limits: TenantLimits) -> Result<bool, String> {
+        let requests_per_minute = limits
+            .requests_per_minute
+            .map(|n| i32::try_from(n).map_err(|_| "requests per minute too large".to_string()))
+            .transpose()?;
+        let max_memories = limits
+            .max_memories
+            .map(|n| i64::try_from(n).map_err(|_| "memory quota too large".to_string()))
+            .transpose()?;
+        let changed = self
+            .client
+            .execute(
+                "UPDATE tenants SET requests_per_minute = $2, max_memories = $3 WHERE id = $1",
+                &[&tenant, &requests_per_minute, &max_memories],
+            )
+            .map_err(pg_error)?;
+        Ok(changed == 1)
     }
 
     /// Scopes (any tenant) holding memories without a vector yet.
@@ -342,6 +362,17 @@ impl PgStore {
             .iter()
             .map(|row| row.get(0))
             .collect())
+    }
+
+    /// Memories of the whole tenant, every space and end user included.
+    pub fn tenant_memory_count(&self) -> Result<i64, String> {
+        self.run(|tx| {
+            tx.query_one(
+                "SELECT count(*) FROM memories WHERE tenant_id = $1",
+                &[&self.scope.tenant],
+            )
+            .map(|row| row.get(0))
+        })
     }
 
     /// Whether this scope may change or delete memory `id`: an end user
