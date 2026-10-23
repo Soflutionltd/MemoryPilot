@@ -542,15 +542,24 @@ pub fn extract_entities(content: &str, project: Option<&str>) -> Vec<Entity> {
         }
     }
 
-    // 4. Components (UI component names)
+    // 4. Components (UI component names). A sentence's first word is
+    // capitalised anyway ("The", "Rewrote"): there only PascalCase counts.
+    // A date ("2026-03-14") is not a name.
+    let content_words: Vec<&str> = content.split_whitespace().collect();
     for hint in COMPONENT_HINTS {
         if lower.contains(hint) {
-            for word in content.split_whitespace() {
+            for (index, word) in content_words.iter().enumerate() {
                 let w = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
+                let capitalised = w.chars().next().is_some_and(|c| c.is_uppercase());
+                let joined = (w.contains('-') || w.contains('_')) && w.chars().any(|c| c.is_alphabetic());
+                let sentence_start = index == 0 || content_words[index - 1].ends_with(['.', '!', '?', ':']);
+                let named = if sentence_start {
+                    joined || (capitalised && w.chars().skip(1).any(|c| c.is_uppercase()))
+                } else {
+                    joined || capitalised
+                };
                 if w.len() > 2
-                    && (w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-                        || w.contains('-')
-                        || w.contains('_'))
+                    && named
                     && lower_contains_near(&lower, hint, &w.to_lowercase(), 50)
                 {
                     push_entity(&mut entities, &mut seen, "component", w.to_string());
@@ -718,4 +727,24 @@ fn lower_contains_near(text: &str, a: &str, b: &str, distance: usize) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_entities;
+
+    fn components(text: &str) -> Vec<String> {
+        extract_entities(text, None)
+            .into_iter()
+            .filter(|entity| entity.kind == "component")
+            .map(|entity| entity.value)
+            .collect()
+    }
+
+    #[test]
+    fn components_skip_sentence_starts_and_dates() {
+        assert!(components("The login form broke on 2026-03-14. Rewrote the login form.").is_empty());
+        assert_eq!(components("SearchBar crashes on the settings page"), vec!["SearchBar"]);
+        assert_eq!(components("The settings page embeds UserCard and nav-drawer"), vec!["UserCard", "nav-drawer"]);
+    }
 }
