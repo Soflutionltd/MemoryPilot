@@ -286,6 +286,35 @@ fn secret_values_are_sealed_at_once_and_stay_sealed_after_update() {
 }
 
 #[test]
+fn a_sealed_label_from_an_older_mask_is_masked_again_on_read() {
+    let path = temp_db_path("stale-label");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let tags: Vec<String> = Vec::new();
+        let secret = "Hx9!kLm2pQ";
+        let (mem, _) = db
+            .add_memory("Compte démo LinkedIn de test", "fact", Some("demo"), &tags, "test", 3, None, None, &MemoryScope::default())
+            .expect("add");
+        let stale = format!("{}Compte démo LinkedIn de test : demo@example.com / {}", super::vault::SEAL_PREFIX, secret);
+        db.conn
+            .execute(
+                "UPDATE memories SET kind='credential', content=?1, metadata='{\"sealed\":true}' WHERE id=?2",
+                params![stale, mem.id],
+            )
+            .expect("stale label");
+
+        let read = db.get_memory(&mem.id).expect("get").expect("mem");
+        assert!(!read.content.contains(secret), "get must mask a stale sealed label");
+        assert!(read.content.contains("demo@example.com"), "the rest of the label stays searchable");
+        assert!(!serde_json::to_string(&read).expect("json").contains(secret));
+        let found = db.search("Compte démo LinkedIn", 10, None, None, None, None).expect("search");
+        assert!(found.iter().any(|hit| hit.memory.id == mem.id));
+        assert!(found.iter().all(|hit| !hit.memory.content.contains(secret)), "search must mask it too");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn recall_safe_excludes_credentials_but_full_keeps_them() {
     let path = temp_db_path("recall-safe");
     {

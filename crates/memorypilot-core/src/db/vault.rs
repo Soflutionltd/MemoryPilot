@@ -177,11 +177,13 @@ pub(crate) fn read_content(kind: &str, raw: String, metadata: Option<&serde_json
     if reveal_enabled() {
         return unseal(&raw, metadata).unwrap_or(raw);
     }
-    if raw.starts_with(SEAL_PREFIX) {
-        raw
-    } else {
-        masked_label(&raw)
-    }
+    shown_label(&raw)
+}
+
+/// A stored credential as shown: the label is masked again on every read, so
+/// a label written by an older, looser mask never shows its secret.
+fn shown_label(stored: &str) -> String {
+    masked_label(stored.trim_start_matches(SEAL_PREFIX))
 }
 
 /// Sealed row → original text, whatever the read mode.
@@ -233,11 +235,7 @@ pub(crate) fn secret_references<'a>(memories: impl Iterator<Item = &'a Memory>) 
     let items: Vec<serde_json::Value> = memories
         .filter(|memory| memory.kind == "credential" && !reveal_enabled() && seen.insert(memory.id.clone()))
         .map(|memory| {
-            let label = if memory.content.starts_with(SEAL_PREFIX) {
-                memory.content.clone()
-            } else {
-                masked_label(&memory.content)
-            };
+            let label = shown_label(&memory.content);
             serde_json::json!({ "id": memory.id, "where": secret_location(&label, memory.metadata.as_ref()), "label": label })
         })
         .collect();
@@ -253,8 +251,8 @@ impl serde::Serialize for Memory {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let masked = self.kind == "credential" && !reveal_enabled();
-        let content = if masked && !self.content.starts_with(SEAL_PREFIX) {
-            std::borrow::Cow::Owned(masked_label(&self.content))
+        let content = if masked {
+            std::borrow::Cow::Owned(shown_label(&self.content))
         } else {
             std::borrow::Cow::Borrowed(self.content.as_str())
         };
