@@ -198,6 +198,25 @@ fn a_project_registered_on_the_home_folder_does_not_swallow_the_others() {
 }
 
 #[test]
+fn detect_project_prefers_the_name_its_memories_already_use() {
+    let path = temp_db_path("known-name");
+    let project_root = std::env::temp_dir().join(Uuid::new_v4().to_string()).join("MemoryPilot");
+    std::fs::create_dir_all(&project_root).expect("mkdir");
+    std::fs::write(project_root.join("Cargo.toml"), "[package]\nname = \"memory-pilot\"\n").expect("write cargo");
+    let root = project_root.to_string_lossy().to_string();
+    {
+        let db = Database::open_at(&path).expect("db");
+        assert_eq!(db.detect_project(&root).expect("detect").as_deref(), Some("memory-pilot"));
+        let tags: Vec<String> = Vec::new();
+        db.add_memory("Vault design note", "fact", Some("MemoryPilot"), &tags, "test", 3, None, None, &MemoryScope::default())
+            .expect("add");
+        assert_eq!(db.detect_project(&root).expect("detect").as_deref(), Some("memorypilot"));
+    }
+    cleanup_db_files(&path);
+    let _ = std::fs::remove_dir_all(project_root.parent().expect("parent"));
+}
+
+#[test]
 fn detect_project_backfills_missing_path_from_root() {
     let path = temp_db_path("detect-project-root");
     let project_root = std::env::temp_dir().join(format!("planify-root-{}", Uuid::new_v4()));

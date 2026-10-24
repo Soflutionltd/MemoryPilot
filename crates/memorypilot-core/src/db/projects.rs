@@ -85,8 +85,11 @@ impl Database {
         normalized_dir
     }
 
-    pub(super) fn infer_project_slug_from_root(project_root: &str) -> Option<String> {
+    /// Names a root may go by, most specific first: Cargo package, npm
+    /// package, folder (`memory-pilot` in Cargo.toml, `MemoryPilot` on disk).
+    pub(super) fn project_slug_candidates(project_root: &str) -> Vec<String> {
         let root = Path::new(project_root);
+        let mut candidates: Vec<String> = Vec::new();
 
         let cargo_manifest = root.join("Cargo.toml");
         if cargo_manifest.exists() {
@@ -103,7 +106,8 @@ impl Database {
                             if let Some(slug) =
                                 Self::canonical_project_name(raw_value.trim().trim_matches('"'))
                             {
-                                return Some(slug);
+                                candidates.push(slug);
+                                break;
                             }
                         }
                     }
@@ -117,16 +121,29 @@ impl Database {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                     if let Some(name) = json.get("name").and_then(|value| value.as_str()) {
                         if let Some(slug) = Self::canonical_project_name(name) {
-                            return Some(slug);
+                            candidates.push(slug);
                         }
                     }
                 }
             }
         }
 
-        root.file_name()
-            .and_then(|name| name.to_str())
-            .and_then(Self::canonical_project_name)
+        if let Some(slug) = root.file_name().and_then(|name| name.to_str()).and_then(Self::canonical_project_name) {
+            candidates.push(slug);
+        }
+        candidates.dedup();
+        candidates
+    }
+
+    fn project_is_known(&self, project_name: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE name = ?1)
+                     OR EXISTS(SELECT 1 FROM memories WHERE project = ?1)",
+                params![project_name],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
     }
 
     /// The home folder, its parents and the temp folders hold every project:
@@ -157,24 +174,7 @@ impl Database {
             return Ok(());
         }
 
-        let known_project: bool = self
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM projects WHERE name = ?1)",
-                params![project_name],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        let known_memories: bool = self
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM memories WHERE project = ?1)",
-                params![project_name],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if !known_project && !known_memories {
+        if !self.project_is_known(project_name) {
             return Ok(());
         }
 
@@ -466,7 +466,12 @@ impl Database {
         if Self::is_generic_folder(&project_root) {
             return Ok(None);
         }
-        let project_name = Self::infer_project_slug_from_root(&project_root);
+        let candidates = Self::project_slug_candidates(&project_root);
+        let project_name = candidates
+            .iter()
+            .find(|candidate| self.project_is_known(candidate))
+            .or(candidates.first())
+            .cloned();
         if let Some(ref project_name) = project_name {
             let _ = self.remember_project_path_if_known(project_name, &project_root);
         }
