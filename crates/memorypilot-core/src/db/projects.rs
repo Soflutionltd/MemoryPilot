@@ -129,6 +129,21 @@ impl Database {
             .and_then(Self::canonical_project_name)
     }
 
+    /// The home folder, its parents and the temp folders hold every project:
+    /// such a path is never the root of one.
+    pub(super) fn is_generic_folder(path: &str) -> bool {
+        if path.is_empty() || path == "/" {
+            return true;
+        }
+        if let Some(home) = dirs::home_dir().map(|home| Self::normalize_path(&home.to_string_lossy())) {
+            if path == home || Self::path_matches(&home, path) {
+                return true;
+            }
+        }
+        let temp = Self::normalize_path(&std::env::temp_dir().to_string_lossy());
+        [temp.as_str(), "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"].contains(&path)
+    }
+
     pub(super) fn path_matches(working_dir: &str, project_path: &str) -> bool {
         if project_path.is_empty() {
             return false;
@@ -439,11 +454,17 @@ impl Database {
             .collect();
         for (name, path) in &projects {
             let normalized_path = Self::normalize_path(path);
+            if Self::is_generic_folder(&normalized_path) {
+                continue;
+            }
             if Self::path_matches(&project_root, &normalized_path)
                 || Self::path_matches(&normalized_dir, &normalized_path)
             {
                 return Ok(Some(name.clone()));
             }
+        }
+        if Self::is_generic_folder(&project_root) {
+            return Ok(None);
         }
         let project_name = Self::infer_project_slug_from_root(&project_root);
         if let Some(ref project_name) = project_name {

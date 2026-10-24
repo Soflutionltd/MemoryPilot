@@ -179,6 +179,25 @@ fn normalize_project_identity_merges_case_variants() {
 }
 
 #[test]
+fn a_project_registered_on_the_home_folder_does_not_swallow_the_others() {
+    let path = temp_db_path("home-project");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let home = dirs::home_dir().expect("home").to_string_lossy().to_string();
+        db.conn
+            .execute(
+                "INSERT INTO projects (name, path, created_at) VALUES ('antoinepinelli', ?1, '2026-01-01T00:00:00Z')",
+                params![home],
+            )
+            .expect("home project");
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        assert_eq!(db.detect_project(crate_dir).expect("detect").as_deref(), Some("memorypilot-core"));
+        assert_eq!(db.detect_project(&home).expect("detect home"), None);
+    }
+    cleanup_db_files(&path);
+}
+
+#[test]
 fn detect_project_backfills_missing_path_from_root() {
     let path = temp_db_path("detect-project-root");
     let project_root = std::env::temp_dir().join(format!("planify-root-{}", Uuid::new_v4()));
