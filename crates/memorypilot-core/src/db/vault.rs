@@ -650,7 +650,7 @@ impl Database {
                 .conn
                 .prepare(
                     "SELECT id, content, metadata, project, created_at FROM memories
-                     WHERE kind = 'credential' AND substr(content, 1, 2) != ?1",
+                     WHERE kind = 'credential' AND substr(content, 1, 1) != ?1",
                 )
                 .map_err(|e| format!("seal prepare: {}", e))?;
             let prefix: String = SEAL_PREFIX.chars().take(1).collect();
