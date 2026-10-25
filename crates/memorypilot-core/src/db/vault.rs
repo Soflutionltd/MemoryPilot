@@ -596,6 +596,10 @@ pub(crate) fn masked_label(content: &str) -> String {
             .iter()
             .any(|k| lower.trim_end_matches([':', '=']).ends_with(k));
         if mask_next > 0 && !keyword {
+            if matches!(token, ":" | "=" | "/" | "-" | "→") {
+                out.push(token.to_string());
+                continue;
+            }
             out.push("••••".to_string());
             mask_next -= 1;
             continue;
@@ -622,7 +626,11 @@ pub(crate) fn masked_label(content: &str) -> String {
         }
         out.push(token.to_string());
     }
-    let label: String = out.join(" ").chars().take(220).collect();
+    let mut label = out.join(" ");
+    if let Some(value) = find_secret_value(content) {
+        label = label.replace(&value, "••••");
+    }
+    let label: String = label.chars().take(220).collect();
     format!("{}{}", SEAL_PREFIX, label)
 }
 
@@ -1333,6 +1341,8 @@ mod tests {
             "GitLab glpat-ab12cd34ef56gh78ij90",
         ] {
             assert!(contains_secret_value(secret), "missed: {}", secret);
+            let value = find_secret_value(secret).expect("value");
+            assert!(!masked_label(secret).contains(&value), "{} shown in the label of {}", value, secret);
         }
     }
 }
