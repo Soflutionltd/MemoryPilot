@@ -999,39 +999,3 @@ fn sqlite_store_meets_the_memory_store_contract() {
     }
     cleanup_db_files(&path);
 }
-
-/// A secret written in clear under another kind (before the detector existed)
-/// is found by the leak scan, and its label never shows the value.
-#[test]
-fn leak_scan_finds_secrets_stored_under_another_kind() {
-    let path = temp_db_path("leak-scan");
-    {
-        let db = Database::open_at(&path).expect("db");
-        // Built at run time: a literal would trip secret scanners on the repository.
-        let token = format!("{}{}", "ghp_", "Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1Wx2");
-        let leaked = format!("Accès CI : jeton GitHub {token} pour le dépôt demo.");
-        let clean = "Le dépôt demo est sauvegardé chaque heure sur GitHub.";
-        let now = chrono::Utc::now().to_rfc3339();
-        let leaked_id = Uuid::new_v4().to_string();
-        for (id, content) in [(leaked_id.clone(), leaked.as_str()), (Uuid::new_v4().to_string(), clean)] {
-            db.conn
-                .execute(
-                    "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
-                     VALUES (?1,?2,'fact','demo','[]','test',3,NULL,NULL,NULL,?3,?4,?4,0)",
-                    params![id, content, super::content_hash(content), &now],
-                )
-                .expect("seed memory");
-        }
-
-        let found = db.seal_leaked_secrets(false).expect("scan");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].0, leaked_id);
-        assert!(!found[0].1.contains(&token), "label shows the token: {}", found[0].1);
-        let kind: String = db
-            .conn
-            .query_row("SELECT kind FROM memories WHERE id=?1", params![leaked_id], |r| r.get(0))
-            .expect("kind");
-        assert_eq!(kind, "fact", "a dry run writes nothing");
-    }
-    cleanup_db_files(&path);
-}

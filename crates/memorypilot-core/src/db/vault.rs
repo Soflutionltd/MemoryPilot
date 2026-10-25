@@ -803,40 +803,6 @@ impl Database {
         Ok(report)
     }
 
-    /// Memories of another kind whose text holds a secret value (written before
-    /// the detector, or missed by an older one) become credentials, hence sealed.
-    /// Returns (id, masked label) of each one.
-    pub fn seal_leaked_secrets(&self, apply: bool) -> Result<Vec<(String, String)>, String> {
-        if apply && key().is_none() {
-            return Err("no encryption key available: nothing would be sealed".into());
-        }
-        let rows: Vec<(String, String)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, content FROM memories WHERE kind != 'credential' ORDER BY created_at")
-                .map_err(|e| format!("leak scan prepare: {}", e))?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(|e| format!("leak scan query: {}", e))?;
-            rows.flatten().collect()
-        };
-        let mut leaked = Vec::new();
-        for (id, content) in rows {
-            if !contains_secret_value(&content) {
-                continue;
-            }
-            leaked.push((id.clone(), masked_label(&content)));
-            if apply {
-                self.update_memory_full(&id, None, Some("credential"), None, None, None, None)?;
-            }
-        }
-        if apply && !leaked.is_empty() {
-            // The clear text may survive in free pages of the file.
-            self.conn.execute_batch("VACUUM;").map_err(|e| format!("vacuum: {}", e))?;
-        }
-        Ok(leaked)
-    }
-
     fn replace_sealed_label(&self, id: &str, label: &str, project: Option<&str>, created_at: &str) -> Result<(), String> {
         self.conn
             .execute(
