@@ -751,7 +751,9 @@ pub(crate) fn find_secret_value(content: &str) -> Option<String> {
     for (index, token) in tokens.iter().enumerate() {
         if looks_secret(token) {
             let core = token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c));
-            if !has_secret_prefix(core) && !core.contains('=') && names_identifier(&tokens, index) {
+            // Identifiers never hold a password symbol: "account: x@y.com Hx9!kLm2" stays secret.
+            let identifier_shape = core.chars().all(|c| c.is_alphanumeric() || "-_.".contains(c));
+            if identifier_shape && !has_secret_prefix(core) && names_identifier(&tokens, index) {
                 continue;
             }
             return Some(core.to_string());
@@ -1589,6 +1591,7 @@ mod tests {
             format!("POWENS_CLIENT_ID=37447765. POWENS_CLIENT_{}=AbCdEf123456GhIjKl789", "SECRET"),
             "Secret posé : CF_API_KEY=\"AbCdEf123456GhIjKl789\"".to_string(),
             "Compte admin@example.com / Lavillart2026!".to_string(),
+            "Cloudflare account: admin@example.com Hx9!kLm2pQ Pages project: alto".to_string(),
         ] {
             assert!(contains_secret_value(&secret), "missed: {}", secret);
             let value = find_secret_value(&secret).expect("value");
