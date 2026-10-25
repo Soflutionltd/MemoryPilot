@@ -211,6 +211,35 @@ fn main() {
         }
         return;
     }
+    if args.iter().any(|a| a == "--seal-leaked") {
+        let apply = args.iter().any(|a| a == "--apply");
+        let db = match db::Database::open() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("DB error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        match db.seal_leaked_secrets(apply) {
+            Ok(leaked) => {
+                for (id, label) in &leaked {
+                    let preview: String = label.chars().take(90).collect();
+                    println!("{}  {}", &id[..8.min(id.len())], preview);
+                }
+                println!(
+                    "{} : {} mémoire(s) contenant une valeur secrète {}.",
+                    if apply { "Appliqué" } else { "À blanc (--apply pour écrire)" },
+                    leaked.len(),
+                    if apply { "chiffrée(s) en credential" } else { "à chiffrer" }
+                );
+            }
+            Err(e) => {
+                eprintln!("✗ {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--repair-credentials") {
         let apply = args.iter().any(|a| a == "--apply");
         let db = match db::Database::open() {
@@ -1064,6 +1093,7 @@ fn print_help() {
     println!("  MemoryPilot --reseal-recovered [--apply]  Re-encrypt with the current key credentials recovered in clear (JSON id → text on stdin), each checked against its label");
     println!("  MemoryPilot --sync-1password [--apply]  Point every credential to 1Password (Soflution vault), creating missing items; back up the vault key");
     println!("  MemoryPilot --repair-credentials [--apply]  Re-mask leaking labels, reclassify credentials holding no secret");
+    println!("  MemoryPilot --seal-leaked [--apply]         Seal memories of another kind that hold a secret value");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop auto-ingest");
     println!("  MemoryPilot --hook session-start|stop  (called by Cursor, JSON on stdin)");
