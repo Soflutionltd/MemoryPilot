@@ -289,6 +289,8 @@ fn secret_values_are_sealed_at_once_and_stay_sealed_after_update() {
             )
             .expect("add");
         assert_eq!(mem.kind, "credential");
+        let sealed_flag = |memory: &super::Memory| memory.metadata.as_ref().and_then(|m| m.get("sealed")).and_then(|v| v.as_bool());
+        assert_eq!(sealed_flag(&mem), Some(true), "add answers with the row as sealed");
         let stored = |db: &Database| -> String {
             db.conn
                 .query_row("SELECT content FROM memories WHERE id=?1", params![mem.id], |r| r.get(0))

@@ -81,18 +81,19 @@ impl Database {
         let outcome = add_memory_to(
             self, explicit_id, content, kind, project, tags, source, importance, expires_at, metadata, scope,
         )?;
-        self.after_write(&outcome)?;
+        let memory = self.after_write(&outcome)?;
         if !outcome.merged {
             // Auto-compaction: trigger GC when memory count exceeds threshold
             self.maybe_auto_compact();
         }
-        Ok((outcome.memory, outcome.merged))
+        Ok((memory, outcome.merged))
     }
 
     /// What the local store schedules after a write: the embedding of new
     /// content, and sealing a credential now (the server runs for days, a
-    /// credential must not wait for a restart in clear).
-    fn after_write(&self, outcome: &WriteOutcome) -> Result<(), String> {
+    /// credential must not wait for a restart in clear). Returns the memory
+    /// as stored, sealing included.
+    fn after_write(&self, outcome: &WriteOutcome) -> Result<Memory, String> {
         let memory = &outcome.memory;
         if outcome.content_changed {
             queue_embedding_job(
@@ -103,8 +104,11 @@ impl Database {
         }
         if memory.kind == "credential" {
             self.seal_credentials()?;
+            return self
+                .get_memory(&memory.id)?
+                .ok_or_else(|| format!("Memory {} vanished while being sealed", memory.id));
         }
-        Ok(())
+        Ok(memory.clone())
     }
 
     /// Trigger auto-compaction if memory count exceeds threshold.
@@ -127,8 +131,7 @@ impl Database {
         let Some(outcome) = update_memory_in(self, id, content, kind, tags, importance, expires_at, metadata)? else {
             return Ok(None);
         };
-        self.after_write(&outcome)?;
-        Ok(Some(outcome.memory))
+        Ok(Some(self.after_write(&outcome)?))
     }
 
     pub fn delete_memory(&self, id: &str) -> Result<bool, String> {
