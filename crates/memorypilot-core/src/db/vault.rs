@@ -490,6 +490,15 @@ pub(crate) fn looks_secret(token: &str) -> bool {
     if let Some((key, value)) = core.split_once('=') {
         let setting_name = key.len() >= 3 && key.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_');
         if setting_name && !value.is_empty() {
+            // `license_key=<uuid>`, `client_secret=…`: the name says it, whatever the value looks like.
+            let name = key.to_lowercase();
+            let names_secret = ["key", "secret", "token", "password", "passwd", "pwd"]
+                .iter()
+                .any(|word| name.ends_with(word));
+            let reference = value.starts_with(['$', '<', '(', '[', '•']);
+            if names_secret && !reference && value.chars().count() >= 8 {
+                return true;
+            }
             return looks_secret(value);
         }
     }
@@ -1315,6 +1324,7 @@ mod tests {
             "Cookie SameSite=Lax, header stale-while-revalidate=60, FCM pour iOS+Android.",
             "FAISS pour C++/Python, charger via load() plutôt que onMount/$effect.",
             "D1 uuid bd40952d-15fc-434c-89af-f274846c5d25, migration 20260930120000_admin_guard.sql.",
+            "Appel avec max_tokens=4096, clé lue par op-sof.",
         ] {
             assert!(!contains_secret_value(prose), "false positive: {}", prose);
         }
@@ -1325,6 +1335,7 @@ mod tests {
         // Built at run time: a literal would trip secret scanners on the repository.
         let supabase = format!("Supabase access token: sbp_{}01234567", "0123456789abcdef".repeat(2));
         let gitlab = format!("GitLab {}-ab12cd34ef56gh78ij90", "glpat");
+        let license = format!("plan=ultra, license_{}=1f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9", "key");
         for secret in [
             "password: villacalvi",
             "mot de passe : Calvi2026",
@@ -1340,6 +1351,7 @@ mod tests {
             "API_KEY=sk-abc123def456ghi789",
             supabase.as_str(),
             gitlab.as_str(),
+            license.as_str(),
         ] {
             assert!(contains_secret_value(secret), "missed: {}", secret);
             let value = find_secret_value(secret).expect("value");
