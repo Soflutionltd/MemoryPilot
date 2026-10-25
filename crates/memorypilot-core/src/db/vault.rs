@@ -463,6 +463,176 @@ fn is_email(core: &str) -> bool {
     }
 }
 
+/// Words naming a public identifier: the value next to them is looked up, not secret.
+const IDENTIFIER_WORDS: &[&str] = &[
+    "id", "ids", "sid", "uuid", "guid", "account", "zone", "tag", "team", "project", "projet", "folder",
+    "dossier", "parent", "doc", "kv", "d1", "namespace", "bucket", "database", "commit", "sha", "hash",
+    "ref", "item", "build", "workspace", "org", "ruleset", "rule",
+];
+
+/// Words that make a nearby identifier word irrelevant: the value is a secret.
+const SECRET_CONTEXT_WORDS: &[&str] = &["bearer", "credential", "credentials", "apikey", "signing"];
+
+/// Public object ids that only point at a resource (Stripe, Vercel).
+const PUBLIC_ID_PREFIXES: &[&str] = &["acct_", "prod_", "price_", "plink_", "cus_", "sub_", "evt_", "we_", "prj_", "team_"];
+
+/// Prefixes of known credential formats: secret whatever the surrounding words say.
+const SECRET_PREFIXES: &[&str] = &[
+    "sk-", "sk_", "rk_live_", "rk_test_", "whsec_", "ghp_", "gho_", "github_pat_", "glpat-", "sbp_", "xox", "AKIA", "AIza",
+];
+
+const FILE_EXTENSIONS: &[&str] = &[
+    "p8", "p12", "pem", "pdf", "json", "rs", "ts", "js", "py", "dart", "swift", "svelte", "sql", "sh", "md", "txt",
+    "png", "jpg", "jpeg", "webp", "svg", "zip", "dmg", "app", "csv", "yml", "yaml", "toml", "html", "css", "mp4",
+    "mov", "log", "plist", "ipa", "apk", "aab", "tar", "gz", "icc", "icm",
+];
+
+/// A known prefix followed by a value: the prefix alone (`sk_live`, « AIza ») is a mention.
+fn has_secret_prefix(core: &str) -> bool {
+    SECRET_PREFIXES
+        .iter()
+        .any(|prefix| core.strip_prefix(prefix).is_some_and(|rest| rest.chars().filter(|c| c.is_alphanumeric()).count() >= 12))
+        || (core.starts_with("eyJ") && core.matches('.').count() >= 2)
+}
+
+/// An amount or a measure (`19,99€/mois`, `~$20/mo`, `£500`, `~50-60ms`).
+fn is_quantity(core: &str) -> bool {
+    let core = core.trim_start_matches(['~', '≈', '<', '>', '+', '±']);
+    let (amount, unit) = core.split_once('/').unwrap_or((core, ""));
+    if !unit.chars().all(char::is_alphabetic) {
+        return false;
+    }
+    let amount = amount.trim_matches(['$', '€', '£', '¥', '%']);
+    let number = amount.trim_end_matches(char::is_alphabetic);
+    amount.chars().count() - number.chars().count() <= 3
+        && number.starts_with(|c: char| c.is_ascii_digit())
+        && number.chars().all(|c| c.is_ascii_digit() || ".,-".contains(c))
+}
+
+/// A benchmark result or a conversion (`R@5=97.4%`, `R@5=62.4%->68.8%`, `80%=12MB`).
+fn is_metric(core: &str) -> bool {
+    let operators = ['=', '<', '>', ':'];
+    let mut parts = core.split(operators).filter(|part| !part.is_empty());
+    let first = parts.next().unwrap_or_default();
+    core.contains(operators)
+        && core.rsplit(operators).next().is_some_and(is_quantity)
+        && (core.ends_with('%') || is_quantity(first))
+}
+
+/// An Apple app identifier, Team ID then bundle (`AB12CD345E.com.soflution.app`).
+fn is_apple_app_id(core: &str) -> bool {
+    let core = core.rsplit(':').next().unwrap_or(core); // `applinks:…`, `webcredentials:…`
+    core.split_once('.').is_some_and(|(team, bundle)| {
+        team.len() == 10
+            && team.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            && bundle.contains('.')
+            && bundle.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || ".-".contains(c))
+    })
+}
+
+/// A package with its version (`mcp-remote@0.15.1`, `@scope/pkg@1.2.0`, `actions/checkout@v4`).
+fn is_package_spec(core: &str) -> bool {
+    let Some((name, version)) = core.rsplit_once('@') else { return false };
+    let name = name.strip_prefix('@').unwrap_or(name);
+    let version = version.trim_start_matches(['^', '~', 'v']);
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_./".contains(c))
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && version.chars().all(|c| c.is_ascii_alphanumeric() || ".-+".contains(c))
+}
+
+fn is_file_name(core: &str) -> bool {
+    core.rsplit_once('.')
+        .is_some_and(|(stem, extension)| !stem.is_empty() && FILE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+}
+
+/// Splits capitalised words, each optionally followed by digits (`OnlystParrains`,
+/// `Qwen3Attention`, `buildStripeCheckoutUrl2024`), into (words, letters); a number
+/// gives (0, 0). None when the part does not follow this pattern, as random keys
+/// do within a few characters.
+fn camel_words(part: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = part.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    if chars.iter().all(|c| c.is_ascii_digit()) {
+        return Some((0, 0));
+    }
+    let (mut words, mut letters, mut index) = (0, 0, 0);
+    while index < chars.len() {
+        if chars[index].is_ascii_uppercase() {
+            index += 1;
+        } else if index > 0 {
+            return None;
+        }
+        let start = index;
+        while index < chars.len() && chars[index].is_ascii_lowercase() {
+            index += 1;
+        }
+        if index == start {
+            return None;
+        }
+        words += 1;
+        letters += index - start + usize::from(start > 0 && chars[start - 1].is_ascii_uppercase());
+        while index < chars.len() && chars[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    Some((words, letters))
+}
+
+/// Real words average three letters or more; `AbCdEf12GhIj` does not.
+fn made_of_words<'a>(parts: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut total = (0, 0);
+    for part in parts {
+        let Some((words, letters)) = camel_words(part) else { return false };
+        total = (total.0 + words, total.1 + letters);
+    }
+    total.1 >= 3 * total.0
+}
+
+/// Lowercase words of a label, split on punctuation and camelCase (`(zoneId` -> zone, id).
+fn label_words(token: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for c in token.chars() {
+        if !c.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            previous_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && previous_lower && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.extend(c.to_lowercase());
+        previous_lower = c.is_lowercase() || c.is_ascii_digit();
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// True when the words just before `index` (same clause, three tokens at most)
+/// announce an identifier ("Account ID CF:", "(zoneId", "KV FLIGHTS_KV id")
+/// and none of them announces a secret.
+fn names_identifier(tokens: &[&str], index: usize) -> bool {
+    let mut words = Vec::new();
+    for token in tokens[..index].iter().rev().take(3) {
+        if !words.is_empty() && token.ends_with(['.', ';', ',']) {
+            break;
+        }
+        words.extend(label_words(token));
+    }
+    let secret = words.iter().any(|word| {
+        SECRET_KEYWORDS.contains(&word.as_str()) || SECRET_CONTEXT_WORDS.contains(&word.as_str())
+    });
+    !secret && words.iter().any(|word| IDENTIFIER_WORDS.contains(&word.as_str()))
+}
+
 /// Words joined by '+' or '/' (`BM25+vector`, `iOS+Android`): every part is
 /// letters then at most digits, and one is a lowercase word of 4+ letters.
 fn joined_words(core: &str) -> bool {
@@ -488,19 +658,41 @@ pub(crate) fn looks_secret(token: &str) -> bool {
     }
     // A setting (`SameSite=Lax`, `max-age=60`, `API_KEY=…`): only its value can be secret.
     if let Some((key, value)) = core.split_once('=') {
-        let setting_name = key.len() >= 3 && key.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_');
+        let setting_name = key.chars().count() >= 2 && key.chars().all(|c| c.is_alphabetic() || c == '-' || c == '_');
+        let value = value.trim_matches(['"', '\'', '`']);
         if setting_name && !value.is_empty() {
-            // `license_key=<uuid>`, `client_secret=…`: the name says it, whatever the value looks like.
             let name = key.to_lowercase();
-            let names_secret = ["key", "secret", "token", "password", "passwd", "pwd"]
-                .iter()
-                .any(|word| name.ends_with(word));
-            let reference = value.starts_with(['$', '<', '(', '[', '•']);
-            if names_secret && !reference && value.chars().count() >= 8 {
+            if ["id", "sid", "uuid", "guid"].iter().any(|word| name.ends_with(word)) {
+                return has_secret_prefix(value); // `projectId=prj_…`, `CLOUDFLARE_ACCOUNT_ID=…`
+            }
+            // `license_key=<uuid>`, `client_secret=…`: the name says it, whatever the value looks
+            // like, except a plain word (`key=roompilot` names a project).
+            let names_password = ["password", "passwd", "pwd"].iter().any(|word| name.ends_with(word));
+            let names_secret = ["key", "secret", "token"].iter().any(|word| name.ends_with(word));
+            let plain_word = value.chars().all(|c| c.is_lowercase() || "-_:.".contains(c));
+            let reference = value.starts_with(['$', '<', '(', '[', '•'])
+                || ["env:", "op://", "secret:"].iter().any(|scheme| value.starts_with(scheme));
+            if (names_password || (names_secret && !plain_word)) && !reference && value.chars().count() >= 8 {
                 return true;
             }
             return looks_secret(value);
         }
+    }
+    if has_secret_prefix(core) {
+        return true;
+    }
+    // Code, query strings, globs, prices, measures, metrics, package versions and file names.
+    if core.contains(['(', ')', '[', ']', '{', '}', '<', '>', ',', '\'', '"', '`', '→'])
+        || (core.contains('?') && core.contains('='))
+        || core.starts_with("*.")
+        || is_apple_app_id(core)
+        || is_quantity(core)
+        || is_metric(core)
+        || is_package_spec(core)
+        || is_file_name(core)
+        || PUBLIC_ID_PREFIXES.iter().any(|prefix| core.starts_with(prefix))
+    {
+        return false;
     }
     let len = core.chars().count();
     let digits = core.chars().filter(|c| c.is_ascii_digit()).count();
@@ -510,31 +702,41 @@ pub(crate) fn looks_secret(token: &str) -> bool {
     let has_symbol = core.chars().any(|c| PASSWORD_SYMBOLS.contains(&c));
     let classes = [has_upper, has_lower, digits > 0, has_symbol].iter().filter(|b| **b).count();
     // Typical password ("Hx9!kLm2pQ", "0550…aA@!"): short but mixes a symbol, a digit
-    // and another class. Words joined by '+' or '/' (`BM25+vector`) are not one.
-    let password_like = len >= 8 && has_symbol && digits > 0 && classes >= 3 && !joined_words(core);
+    // and another class. Words joined by '+' or '/' (`BM25+vector`), paths, decimals
+    // (`targetQuality*0.15`) and long hyphenated names are not one.
+    let chars: Vec<char> = core.chars().collect();
+    let decimal = chars
+        .windows(3)
+        .any(|w| w[0].is_ascii_digit() && (w[1] == '.' || w[1] == ',') && w[2].is_ascii_digit());
+    let password_like = len >= 8
+        && has_symbol
+        && digits > 0
+        && letters >= 2
+        && classes >= 3
+        && !core.contains('/')
+        && !decimal
+        && core.matches('-').count() < 3
+        && !joined_words(core);
+    let separators = ['-', '_', '.', ':'];
+    let word_like = made_of_words(core.split(separators).filter(|part| !part.is_empty()));
     // Long random token. Lowercase words joined by separators
-    // (`multilingual-e5-small`, `x86_64-unknown-linux-musl`) are names, not keys.
-    let separated = core.contains(['-', '_', '.', ':']);
+    // (`multilingual-e5-small`, `x86_64-unknown-linux-musl`) and camelCase names are not keys.
+    let separated = core.contains(separators);
     let random_token = len >= 16
         && digits > 0
         && letters > 0
         && !core.contains('/')
+        && !decimal
+        && !word_like
         && (!separated || (has_upper && has_lower));
     // A long random part behind a prefix, even in lowercase (`sbp_<40 hex>`, `glpat-…`).
-    let random_part = !core.contains('/') && core.split(['-', '_', '.', ':']).any(|part| {
+    let random_part = !core.contains('/') && core.split(separators).any(|part| {
         part.chars().count() >= 20
             && part.chars().any(|c| c.is_ascii_digit())
             && part.chars().any(|c| c.is_alphabetic())
+            && !made_of_words([part])
     });
-    random_token
-        || random_part
-        || password_like
-        || core.starts_with("sk-")
-        || core.starts_with("sk_")
-        || core.starts_with("ghp_")
-        || core.starts_with("github_pat_")
-        || core.starts_with("xox")
-        || (core.starts_with("eyJ") && core.matches('.').count() >= 2)
+    random_token || random_part || password_like
 }
 
 /// True when the text holds a secret VALUE (key, token, password), not
@@ -549,15 +751,19 @@ pub(crate) fn find_secret_value(content: &str) -> Option<String> {
     for (index, token) in tokens.iter().enumerate() {
         if looks_secret(token) {
             let core = token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c));
+            if !has_secret_prefix(core) && !core.contains('=') && names_identifier(&tokens, index) {
+                continue;
+            }
             return Some(core.to_string());
         }
         let lower = token.to_lowercase();
         let word = lower.trim_matches(|c: char| !c.is_alphanumeric());
-        let announces_password = PASSWORD_KEYWORDS.contains(&word)
-            || (word == "passe" && index > 0 && tokens[index - 1].to_lowercase() == "de");
-        if !announces_password {
+        if !PASSWORD_KEYWORDS.contains(&word) {
             continue;
         }
+        // "pass"/"passe" alone are also verbs ("le ViewModel passe targetQuality").
+        let after_de = index > 0 && tokens[index - 1].to_lowercase() == "de";
+        let verb_form = matches!(word, "pass" | "passe") && !after_de;
         let mut assigned = token.ends_with(':') || token.ends_with('=');
         let mut value: Option<&str> = None;
         for next in tokens[index + 1..].iter().take(3) {
@@ -586,9 +792,12 @@ pub(crate) fn find_secret_value(content: &str) -> Option<String> {
             || value_lower.starts_with('•')
             || value_lower.starts_with('[');
         let core = value.trim_end_matches(['.', ',', ')']);
+        if core.contains(',') && !core.chars().any(char::is_alphabetic) {
+            continue; // screen coordinates ("mot de passe 402,519")
+        }
         let mixed = core.chars().any(|c| c.is_ascii_digit() || PASSWORD_SYMBOLS.contains(&c))
             || (core.chars().any(|c| c.is_uppercase()) && core.chars().skip(1).any(|c| c.is_uppercase()) && core.chars().any(|c| c.is_lowercase()));
-        if !is_reference && core.chars().count() >= 6 && (assigned || mixed) {
+        if !is_reference && core.chars().count() >= 6 && (assigned || (mixed && !verb_form)) {
             return Some(core.to_string());
         }
     }
@@ -604,8 +813,10 @@ pub(crate) fn masked_label(content: &str) -> String {
         let keyword = SECRET_KEYWORDS
             .iter()
             .any(|k| lower.trim_end_matches([':', '=']).ends_with(k));
-        if mask_next > 0 && !keyword {
-            if matches!(token, ":" | "=" | "/" | "-" | "→") {
+        // A value may end like a keyword (`sk_live_secret`): only the bare word stops the mask.
+        let bare_keyword = SECRET_KEYWORDS.contains(&lower.trim_matches(|c: char| !c.is_alphanumeric()));
+        if mask_next > 0 && !bare_keyword {
+            if matches!(lower.as_str(), ":" | "=" | "/" | "-" | "→" | "is" | "est" | "was" | "vaut") {
                 out.push(token.to_string());
                 continue;
             }
@@ -1327,6 +1538,61 @@ mod tests {
             "Appel avec max_tokens=4096, clé lue par op-sof.",
         ] {
             assert!(!contains_secret_value(prose), "false positive: {}", prose);
+        }
+    }
+
+    // Notes the detector sealed on write (2026-10-25): prices, public ids named
+    // by their label, metrics, code, package versions, file and topic names.
+    #[test]
+    fn secret_value_detection_ignores_ids_prices_and_code() {
+        let hex = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        let notes = [
+            "[Soflution_Pricing] Starter: 19€/mois".to_string(),
+            "Forfait Pro: 19,99€/mois, GPU €120/month, max £500/mois, Browserbase ~$20/mois".to_string(),
+            format!("Cloudflare account ID: {hex}"),
+            format!("Account ID CF: {hex} (zone sociomator.com (zoneId {hex}), KV FLIGHTS_KV id {hex})"),
+            format!("Twilio Account SID: AC{hex}"),
+            "PV (Doc ID 1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789) parent folder 1ZyXwVuTsRqPoNmLkJiHgFeDcBa98".to_string(),
+            "Stripe acct_1AbCdEfGhIjKlMnO, product prod_AbCdEfGhIjKl12, tarif price_1AbCdEfGhIjKlMnOpQ".to_string(),
+            format!("Vercel projectId=prj_AbCdEfGhIjKlMnOpQrSt12, CLOUDFLARE_ACCOUNT_ID={hex}"),
+            "Resend domaine roompilot.io (id=0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d) VERIFIED".to_string(),
+            "LongMemEval R@5=97.4%, FR R@5=62.4%->68.8%, latence ~50-60ms".to_string(),
+            "Deps: mcp-remote@0.15.1, @modelcontextprotocol/sdk@1.20.0, npx wrangler@4, actions/checkout@v4".to_string(),
+            "[OnlystParrains_Ui_Oct2026] Écran parrains : fetch membres actifs".to_string(),
+            "Helper buildStripeCheckoutUrl2024, modèle Qwen3Attention".to_string(),
+            "Ghostscript low=max(0.08, targetQuality*0.15)".to_string(),
+            "APNs AuthKey_AB12CD34EF.p8 posé en secret Cloudflare".to_string(),
+            "RoomPilot déployé via cf-orchestrator project key=roompilot".to_string(),
+            "et le ViewModel passe targetQuality au service".to_string(),
+            "L'ancienne STRIPE_API_KEY sk_live, format des clés Google « AIza »".to_string(),
+            "Estimation (ex 80%=12MB), étapes A1→A2→A3, lien header-anchor?param=1".to_string(),
+            "Stripe lookup_key=sociomator_pro, Défaut=0, Sauvegardes *.bak-20261025-client".to_string(),
+            format!("Profil Adobe CoatedFOGRA39.icc, webcredentials applinks:{}.com.soflution.app", "AB12CD345E"),
+            format!("Bindings: AUTH_KV (id {hex}), WAF (ruleset {hex})"),
+            "Coords : email [402,519] · mot de passe 402,519 · bouton [402,600]".to_string(),
+            "Header x-apikey='env:cegid_loop' ou x-apikey='key:cegid_loop' lu au runtime".to_string(),
+        ];
+        for note in &notes {
+            assert!(!contains_secret_value(note), "false positive: {}", note);
+        }
+    }
+
+    #[test]
+    fn secret_words_win_over_identifier_words() {
+        let hex = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        let stripe = format!("Stripe account {}_live_{}", "sk", "AbCdEf0123456789GhIjKl");
+        for secret in [
+            format!("Cloudflare account token: {hex}"),
+            format!("Supabase id 11112222-3333-4444-8555-666677778888, token {hex}"),
+            "workspace aaaabbbb-cccc-4ddd-8eee-ffff00001111 pwd Ab12Cd34!x".to_string(),
+            stripe,
+            format!("POWENS_CLIENT_ID=37447765. POWENS_CLIENT_{}=AbCdEf123456GhIjKl789", "SECRET"),
+            "Secret posé : CF_API_KEY=\"AbCdEf123456GhIjKl789\"".to_string(),
+            "Compte admin@example.com / Lavillart2026!".to_string(),
+        ] {
+            assert!(contains_secret_value(&secret), "missed: {}", secret);
+            let value = find_secret_value(&secret).expect("value");
+            assert!(!masked_label(&secret).contains(&value), "{} shown in the label of {}", value, secret);
         }
     }
 
