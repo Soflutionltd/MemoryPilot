@@ -511,7 +511,14 @@ pub(crate) fn looks_secret(token: &str) -> bool {
         && letters > 0
         && !core.contains('/')
         && (!separated || (has_upper && has_lower));
+    // A long random part behind a prefix, even in lowercase (`sbp_<40 hex>`, `glpat-…`).
+    let random_part = !core.contains('/') && core.split(['-', '_', '.', ':']).any(|part| {
+        part.chars().count() >= 20
+            && part.chars().any(|c| c.is_ascii_digit())
+            && part.chars().any(|c| c.is_alphabetic())
+    });
     random_token
+        || random_part
         || password_like
         || core.starts_with("sk-")
         || core.starts_with("sk_")
@@ -1299,6 +1306,7 @@ mod tests {
             "Rerank avec jina-reranker-v2 après BM25+vector, cartes avec hover:-translate-y-1.",
             "Cookie SameSite=Lax, header stale-while-revalidate=60, FCM pour iOS+Android.",
             "FAISS pour C++/Python, charger via load() plutôt que onMount/$effect.",
+            "D1 uuid bd40952d-15fc-434c-89af-f274846c5d25, migration 20260930120000_admin_guard.sql.",
         ] {
             assert!(!contains_secret_value(prose), "false positive: {}", prose);
         }
@@ -1306,6 +1314,8 @@ mod tests {
 
     #[test]
     fn secret_value_detection_finds_real_values() {
+        // Built at run time: a literal would trip secret scanners on the repository.
+        let supabase = format!("Supabase access token: sbp_{}01234567", "0123456789abcdef".repeat(2));
         for secret in [
             "password: villacalvi",
             "mot de passe : Calvi2026",
@@ -1319,6 +1329,8 @@ mod tests {
             "Clé QWERTYZXCV7ASDFGHJKL",
             "env token=4f9c2a8e1b7d6c5f3a2e",
             "API_KEY=sk-abc123def456ghi789",
+            supabase.as_str(),
+            "GitLab glpat-ab12cd34ef56gh78ij90",
         ] {
             assert!(contains_secret_value(secret), "missed: {}", secret);
         }
