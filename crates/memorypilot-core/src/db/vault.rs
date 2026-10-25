@@ -479,8 +479,12 @@ fn joined_words(core: &str) -> bool {
 
 pub(crate) fn looks_secret(token: &str) -> bool {
     let core = token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c));
-    if is_email(core) || core.contains("://") {
-        return false; // keep emails and URLs: they are what you search for
+    let is_path = core.starts_with("~/")
+        || core.starts_with("./")
+        || core.starts_with("../")
+        || (core.starts_with('/') && core[1..].contains('/'));
+    if is_email(core) || core.contains("://") || is_path {
+        return false; // keep emails, URLs and file paths: they are what you search for
     }
     // A setting (`SameSite=Lax`, `max-age=60`, `API_KEY=…`): only its value can be secret.
     if let Some((key, value)) = core.split_once('=') {
