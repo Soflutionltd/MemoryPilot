@@ -1324,6 +1324,7 @@ mod tests {
     fn secret_value_detection_finds_real_values() {
         // Built at run time: a literal would trip secret scanners on the repository.
         let supabase = format!("Supabase access token: sbp_{}01234567", "0123456789abcdef".repeat(2));
+        let gitlab = format!("GitLab {}-ab12cd34ef56gh78ij90", "glpat");
         for secret in [
             "password: villacalvi",
             "mot de passe : Calvi2026",
@@ -1338,7 +1339,7 @@ mod tests {
             "env token=4f9c2a8e1b7d6c5f3a2e",
             "API_KEY=sk-abc123def456ghi789",
             supabase.as_str(),
-            "GitLab glpat-ab12cd34ef56gh78ij90",
+            gitlab.as_str(),
         ] {
             assert!(contains_secret_value(secret), "missed: {}", secret);
             let value = find_secret_value(secret).expect("value");
