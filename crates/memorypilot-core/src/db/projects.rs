@@ -86,7 +86,7 @@ impl Database {
     }
 
     /// Names a root may go by, most specific first: Cargo package, npm
-    /// package, folder (`memory-pilot` in Cargo.toml, `MemoryPilot` on disk).
+    /// package, folder (`MemoryPilot` in Cargo.toml and on disk).
     pub(super) fn project_slug_candidates(project_root: &str) -> Vec<String> {
         let root = Path::new(project_root);
         let mut candidates: Vec<String> = Vec::new();

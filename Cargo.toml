@@ -6,7 +6,7 @@ default-members = [".", "crates/memorypilot-core", "crates/memorypilot-server"]
 version = "4.10.0"
 
 [package]
-name = "memory-pilot"
+name = "MemoryPilot"
 version.workspace = true
 edition = "2021"
 authors = ["SOFLUTION LTD"]
