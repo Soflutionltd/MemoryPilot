@@ -108,9 +108,9 @@ jobs:
           MCP_DNS_PRIVATE_KEY: ${{ secrets.MCP_DNS_PRIVATE_KEY }}
 
       - name: Retire the old io.github.Soflutionltd name
-        if: steps.check.outputs.skip != 'true'
         continue-on-error: true
         run: |
+          [ -x ./mcp-publisher ] || curl -fsSL https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz | tar xz mcp-publisher
           ./mcp-publisher logout || true
           ./mcp-publisher login github-oidc
-          ./mcp-publisher status --status deprecated --all-versions --message "Moved to com.soflution/memorypilot" io.github.Soflutionltd/memorypilot || true
+          yes | ./mcp-publisher status --status deprecated --all-versions --message "Moved to com.soflution/memorypilot" io.github.Soflutionltd/memorypilot || true
