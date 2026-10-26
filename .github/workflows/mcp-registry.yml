@@ -1,6 +1,6 @@
 # Wraps the release binaries into one .mcpb bundle (macOS, Linux and Windows when built),
 # attaches it to the GitHub release and publishes the server to the official MCP Registry
-# (registry.modelcontextprotocol.io) as io.github.Soflutionltd/memorypilot.
+# (registry.modelcontextprotocol.io) as com.soflution/memorypilot (domain soflution.com, verified by DNS).
 # Runs after each successful release workflow, or by hand for an existing tag.
 name: MCP Registry
 
@@ -41,7 +41,7 @@ jobs:
         run: |
           V="${VERSION_OVERRIDE:-${TAG#v}}"
           echo "V=$V" >> "$GITHUB_ENV"
-          code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.Soflutionltd%2Fmemorypilot/versions/$V" || true)
+          code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' "https://registry.modelcontextprotocol.io/v0.1/servers/com.soflution%2Fmemorypilot/versions/$V" || true)
           # Published versions are immutable: never rebuild their bundle (its SHA-256 would change).
           if [ "$code" = "200" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; echo "$V is already in the registry"; fi
 
@@ -102,5 +102,15 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           curl -fsSL https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz | tar xz mcp-publisher
-          ./mcp-publisher login github-oidc
+          ./mcp-publisher login dns --domain soflution.com --private-key "$MCP_DNS_PRIVATE_KEY"
           ./mcp-publisher publish
+        env:
+          MCP_DNS_PRIVATE_KEY: ${{ secrets.MCP_DNS_PRIVATE_KEY }}
+
+      - name: Retire the old io.github.Soflutionltd name
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          ./mcp-publisher logout || true
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher status --status deprecated --all-versions --message "Moved to com.soflution/memorypilot" io.github.Soflutionltd/memorypilot || true

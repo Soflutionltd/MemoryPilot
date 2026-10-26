@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.Soflutionltd/memorypilot",
+  "name": "com.soflution/memorypilot",
   "title": "MemoryPilot",
   "description": "Long-term memory for AI agents: fast recall, project brains and skills, local, in one binary.",
   "version": "0.0.0",
