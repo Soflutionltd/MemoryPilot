@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Soflutionltd/memorypilot",
+  "title": "MemoryPilot",
+  "description": "Long-term memory for AI agents: fast recall, project brains and skills, local, in one binary.",
+  "version": "0.0.0",
+  "websiteUrl": "https://github.com/Soflutionltd/MemoryPilot",
+  "repository": {
+    "url": "https://github.com/Soflutionltd/MemoryPilot",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/Soflutionltd/MemoryPilot/releases/download/TAG/memorypilot.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

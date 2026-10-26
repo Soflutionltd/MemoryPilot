@@ -1,0 +1,87 @@
+# Wraps the release binaries into one .mcpb bundle (macOS, Linux and Windows when built),
+# attaches it to the GitHub release and publishes the server to the official MCP Registry
+# (registry.modelcontextprotocol.io) as io.github.Soflutionltd/memorypilot.
+# Runs after each successful release workflow, or by hand for an existing tag.
+name: MCP Registry
+
+on:
+  workflow_run:
+    workflows: ['release']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to bundle and publish (for example v1.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: mcp-registry
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for every release binary
+        run: |
+          # The signed macOS build is uploaded separately, so give it up to 45 minutes.
+          for i in $(seq 1 90); do
+            have=$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)
+            missing=""
+            for a in MemoryPilot-aarch64-apple-darwin.tar.gz MemoryPilot-x86_64-unknown-linux-gnu.tar.gz MemoryPilot-aarch64-unknown-linux-gnu.tar.gz; do echo "$have" | grep -qx "$a" || missing="$missing $a"; done
+            [ -z "$missing" ] && exit 0
+            echo "waiting for:$missing"; sleep 30
+          done
+          echo "release $TAG is missing:$missing"; exit 1
+
+      - name: Bundle
+        run: |
+          set -eu
+          fetch() {
+            mkdir -p "bundle/server/$1" dl
+            gh release download "$TAG" -p "$2" -D dl --clobber
+            rm -rf x && mkdir x
+            case "$2" in *.zip) unzip -q "dl/$2" -d x ;; *) tar xzf "dl/$2" -C x ;; esac
+            find x -type f \( -name 'MemoryPilot' -o -name 'MemoryPilot.exe' \) -exec mv {} "bundle/server/$1/" \;
+            chmod +x bundle/server/$1/* || true
+          }
+          fetch darwin MemoryPilot-aarch64-apple-darwin.tar.gz
+          fetch linux-x64 MemoryPilot-x86_64-unknown-linux-gnu.tar.gz
+          fetch linux-arm64 MemoryPilot-aarch64-unknown-linux-gnu.tar.gz
+          install -m 755 .mcp/run.sh bundle/server/run.sh
+          cp README.md LICENSE bundle/ 2>/dev/null || true
+          jq --arg v "${TAG#v}" '.version=$v' .mcp/manifest.json > bundle/manifest.json
+          if [ -f .mcp/icon.png ]; then
+            cp .mcp/icon.png bundle/icon.png
+            jq '.icon="icon.png"' bundle/manifest.json > m.json && mv m.json bundle/manifest.json
+          fi
+          find bundle -type f | sort
+          npx -y @anthropic-ai/mcpb@2 validate bundle/manifest.json
+          npx -y @anthropic-ai/mcpb@2 pack bundle memorypilot.mcpb
+          echo "SHA=$(sha256sum memorypilot.mcpb | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Attach to the release
+        run: gh release upload "$TAG" memorypilot.mcpb --clobber
+
+      - name: Write server.json
+        run: |
+          jq --arg v "${TAG#v}" --arg u "https://github.com/${{ github.repository }}/releases/download/$TAG/memorypilot.mcpb" --arg s "$SHA" \
+            '.version=$v | .packages[0].identifier=$u | .packages[0].fileSha256=$s' .mcp/server.json > server.json
+          cat server.json
+
+      - name: Publish to the MCP Registry
+        run: |
+          curl -fsSL https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

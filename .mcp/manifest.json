@@ -1,0 +1,46 @@
+{
+  "manifest_version": "0.3",
+  "name": "memorypilot",
+  "display_name": "MemoryPilot",
+  "version": "0.0.0",
+  "description": "Long-term memory for AI agents: fast recall, project brains and skills, local, in one binary.",
+  "long_description": "MemoryPilot gives every AI agent a shared long-term memory that stays on your machine: facts, decisions and preferences with fast search, per-project brains, working and episodic memory, and reusable skills. One fast Rust binary, no cloud.",
+  "author": {
+    "name": "Soflution Ltd",
+    "email": "contact@soflution.com",
+    "url": "https://github.com/Soflutionltd"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Soflutionltd/MemoryPilot.git"
+  },
+  "homepage": "https://github.com/Soflutionltd/MemoryPilot",
+  "support": "https://github.com/Soflutionltd/MemoryPilot/issues",
+  "license": "LicenseRef-Soflution-Source-Available",
+  "keywords": [
+    "memory",
+    "long-term memory",
+    "knowledge",
+    "search",
+    "embeddings",
+    "skills",
+    "agents"
+  ],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/run.sh",
+    "mcp_config": {
+      "command": "/bin/sh",
+      "args": [
+        "${__dirname}/server/run.sh"
+      ],
+      "env": {}
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "linux"
+    ]
+  }
+}
