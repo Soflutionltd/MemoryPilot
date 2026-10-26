@@ -14,6 +14,10 @@ on:
         description: Release tag to bundle and publish (for example v1.2.0)
         required: true
         type: string
+      version:
+        description: Registry version, only to republish a tag under a new version (for example 1.2.0-1)
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -30,10 +34,21 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+      VERSION_OVERRIDE: ${{ inputs.version }}
     steps:
+      - name: Skip a version the registry already has
+        id: check
+        run: |
+          V="${VERSION_OVERRIDE:-${TAG#v}}"
+          echo "V=$V" >> "$GITHUB_ENV"
+          code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.Soflutionltd%2Fmemorypilot/versions/$V" || true)
+          # Published versions are immutable: never rebuild their bundle (its SHA-256 would change).
+          if [ "$code" = "200" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; echo "$V is already in the registry"; fi
+
       - uses: actions/checkout@v4
 
       - name: Wait for every release binary
+        if: steps.check.outputs.skip != 'true'
         run: |
           # The signed macOS build is uploaded separately, so give it up to 45 minutes.
           for i in $(seq 1 90); do
@@ -46,6 +61,7 @@ jobs:
           echo "release $TAG is missing:$missing"; exit 1
 
       - name: Bundle
+        if: steps.check.outputs.skip != 'true'
         run: |
           set -eu
           fetch() {
@@ -72,15 +88,18 @@ jobs:
           echo "SHA=$(sha256sum memorypilot.mcpb | cut -d' ' -f1)" >> "$GITHUB_ENV"
 
       - name: Attach to the release
+        if: steps.check.outputs.skip != 'true'
         run: gh release upload "$TAG" memorypilot.mcpb --clobber
 
       - name: Write server.json
+        if: steps.check.outputs.skip != 'true'
         run: |
-          jq --arg v "${TAG#v}" --arg u "https://github.com/${{ github.repository }}/releases/download/$TAG/memorypilot.mcpb" --arg s "$SHA" \
+          jq --arg v "$V" --arg u "https://github.com/${{ github.repository }}/releases/download/$TAG/memorypilot.mcpb" --arg s "$SHA" \
             '.version=$v | .packages[0].identifier=$u | .packages[0].fileSha256=$s' .mcp/server.json > server.json
           cat server.json
 
       - name: Publish to the MCP Registry
+        if: steps.check.outputs.skip != 'true'
         run: |
           curl -fsSL https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz | tar xz mcp-publisher
           ./mcp-publisher login github-oidc
