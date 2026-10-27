@@ -261,6 +261,32 @@ fn save_state(state: &HashMap<String, usize>) {
     }
 }
 
+/// Chunks ingested per hook run. A long backlog (first run on an old
+/// conversation, missed hooks) continues on the next run: nothing is
+/// skipped, the cursor only moves past what was ingested.
+const MAX_CHUNKS_PER_RUN: usize = 8;
+
+/// Splits `lines` into consecutive ranges of at most `max` bytes each
+/// (a single longer line is its own range).
+fn chunk_ranges(lines: &[&str], max: usize) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut size = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        let len = line.len() + 1;
+        if size > 0 && size + len > max {
+            ranges.push(start..index);
+            start = index;
+            size = 0;
+        }
+        size += len;
+    }
+    if start < lines.len() {
+        ranges.push(start..lines.len());
+    }
+    ranges
+}
+
 fn ingest_new_lines(transcript: &str, conversation: &str, root: &str) -> Result<String, String> {
     let raw = std::fs::read_to_string(transcript)
         .map_err(|e| format!("read '{}': {}", transcript, e))?;
@@ -271,14 +297,6 @@ fn ingest_new_lines(transcript: &str, conversation: &str, root: &str) -> Result<
     let already = state.get(&key).copied().unwrap_or(0).min(lines.len());
     if already == lines.len() {
         return Ok("nothing new".into());
-    }
-
-    let text = cursor_jsonl_to_transcript(&lines[already..].join("\n"));
-    let text = truncate_bytes(&text, MAX_INGEST_BYTES);
-    if text.trim().is_empty() {
-        state.insert(key, lines.len());
-        save_state(&state);
-        return Ok("no text in new lines".into());
     }
 
     let db = open_db()?;
@@ -298,26 +316,38 @@ fn ingest_new_lines(transcript: &str, conversation: &str, root: &str) -> Result<
         "cursor-hook".to_string(),
     ];
     let source = format!("cursor-hook:{}", conversation);
-    let report = db.ingest_session_transcript(
-        &text,
-        project.as_deref(),
-        &tags,
-        &source,
-        &scope,
-        false,
-    )?;
 
-    state.insert(key, lines.len());
-    save_state(&state);
+    let (mut candidates, mut added, mut merged, mut skipped) = (0, 0, 0, 0);
+    let mut cursor = already;
+    for range in chunk_ranges(&lines[already..], MAX_INGEST_BYTES).into_iter().take(MAX_CHUNKS_PER_RUN) {
+        let end = already + range.end;
+        let text = cursor_jsonl_to_transcript(&lines[already + range.start..end].join("\n"));
+        // Only a single line longer than the budget is cut, and it is said.
+        if text.len() > MAX_INGEST_BYTES {
+            eprintln!("[MemoryPilot] Transcript line over {} bytes: only its end is ingested.", MAX_INGEST_BYTES);
+        }
+        let text = truncate_bytes(&text, MAX_INGEST_BYTES);
+        if !text.trim().is_empty() {
+            let report = db.ingest_session_transcript(&text, project.as_deref(), &tags, &source, &scope, false)?;
+            candidates += report.distilled_candidates;
+            added += report.distilled_added;
+            merged += report.distilled_merged;
+            skipped += report.distilled_skipped;
+        }
+        cursor = end;
+        state.insert(key.clone(), cursor);
+        save_state(&state);
+    }
     Ok(format!(
-        "project={} lines={}..{} candidates={} added={} merged={} skipped={}",
+        "project={} lines={}..{}{} candidates={} added={} merged={} skipped={}",
         project.as_deref().unwrap_or("global"),
         already,
-        lines.len(),
-        report.distilled_candidates,
-        report.distilled_added,
-        report.distilled_merged,
-        report.distilled_skipped
+        cursor,
+        if cursor < lines.len() { format!(" (continues next run, {} lines left)", lines.len() - cursor) } else { String::new() },
+        candidates,
+        added,
+        merged,
+        skipped
     ))
 }
 
@@ -660,6 +690,25 @@ pub fn install_hooks() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_ranges_cover_every_line_in_order() {
+        let lines: Vec<String> = (0..1000).map(|i| format!("line {i} {}", "x".repeat(i % 50))).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let ranges = chunk_ranges(&refs, 4_000);
+        assert!(ranges.len() > 1);
+        let mut next = 0;
+        for range in &ranges {
+            assert_eq!(range.start, next, "gap or overlap");
+            assert!(range.end > range.start);
+            let bytes: usize = refs[range.clone()].iter().map(|l| l.len() + 1).sum();
+            assert!(bytes <= 4_000 || range.len() == 1);
+            next = range.end;
+        }
+        assert_eq!(next, refs.len());
+        let long = "y".repeat(10_000);
+        assert_eq!(chunk_ranges(&["a", &long, "b"], 4_000), vec![0..1, 1..2, 2..3]);
+    }
 
     #[test]
     fn converts_cursor_jsonl() {
