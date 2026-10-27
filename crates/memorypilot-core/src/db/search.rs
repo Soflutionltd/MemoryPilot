@@ -40,6 +40,10 @@ impl Database {
 /// approximate neighbours and the keyword hits, instead of every memory.
 pub const ANN_BYPASS_THRESHOLD: usize = 5_000;
 
+/// Largest result count a search returns. Larger requests are capped here,
+/// whatever the interface, so no caller can push the pool sizes out of range.
+pub const MAX_SEARCH_LIMIT: usize = 100;
+
 /// The search pipeline of [`Database::search_at`] on any store: the SQLite
 /// database or the server mode's Postgres store.
 #[allow(clippy::too_many_arguments)]
@@ -53,6 +57,10 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     tags: Option<&[String]>,
     watcher_keywords: Option<&[String]>,
 ) -> Result<(Vec<SearchResult>, SearchConfidence), String> {
+    if limit == 0 {
+        return Ok((Vec::new(), SearchConfidence::none()));
+    }
+    let limit = limit.min(MAX_SEARCH_LIMIT);
     let canonical_project = Database::canonical_project(project);
 
     let telemetry_enabled = crate::telemetry::is_enabled();
@@ -417,12 +425,12 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     // appended right before MMR, below every genuine finalist, so a
     // distinct candidate can still displace a near-duplicate.
     let session_candidate_limit = if crate::session_fusion::should_expand_candidates(query) {
-        (limit * 3).clamp(limit, 30)
+        (limit * 3).min(30).max(limit)
     } else {
         limit
     };
     let mmr_reserve_limit = if crate::diversity::is_enabled() {
-        (limit * crate::diversity::pool_multiplier()).clamp(limit, 24)
+        (limit * crate::diversity::pool_multiplier()).min(24).max(limit)
     } else {
         0
     };

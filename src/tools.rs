@@ -277,7 +277,7 @@ fn all_tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string" },
-                    "limit": { "type": "integer", "default": 10 },
+                    "limit": { "type": "integer", "default": 10, "minimum": 1, "maximum": 100, "description": "Results to return (1-100; larger values are capped)" },
                     "project": { "type": ["string","null"] },
                     "kind": { "type": ["string","null"] },
                     "tags": { "type": ["array","null"], "items": { "type": "string" } },

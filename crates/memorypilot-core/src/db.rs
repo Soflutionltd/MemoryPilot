@@ -534,3 +534,7 @@ fn parse_v1_memory(
 #[cfg(test)]
 #[path = "db/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "db/audit_tests.rs"]
+mod audit_tests;
