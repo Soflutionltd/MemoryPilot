@@ -41,6 +41,9 @@ impl Database {
         let _ = db.sync_embedding_model();
         db.backfill_missing_at_startup();
         let _ = db.migrate_fts_to_stemmed();
+        if let Err(error) = db.migrate_credential_masking() {
+            eprintln!("[MemoryPilot] Credential masking migration: {}", error);
+        }
         Self::spawn_ann_warmup(ann, path.to_path_buf(), ann_warm_complete);
         Ok(db)
     }

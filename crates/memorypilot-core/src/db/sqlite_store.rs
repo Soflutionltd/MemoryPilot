@@ -9,6 +9,10 @@ const MEMORY_COLUMNS: &str = "id,content,kind,project,tags,source,importance,exp
 
 impl MemoryStore for Database {
     fn insert_memory(&self, memory: &Memory, content_hash: &str) -> Result<(), String> {
+        let sealed = vault::seal_for_write(memory)?;
+        let sealed_hash = sealed.as_ref().map(|m| super::content_hash(&m.content));
+        let memory = sealed.as_ref().unwrap_or(memory);
+        let content_hash = sealed_hash.as_deref().unwrap_or(content_hash);
         let tags_json = serde_json::to_string(&memory.tags).unwrap_or_else(|_| "[]".into());
         let meta_json = memory
             .metadata
@@ -49,6 +53,10 @@ impl MemoryStore for Database {
     }
 
     fn write_memory(&self, memory: &Memory, content_hash: &str, content_changed: bool) -> Result<(), String> {
+        let sealed = vault::seal_for_write(memory)?;
+        let sealed_hash = sealed.as_ref().map(|m| super::content_hash(&m.content));
+        let memory = sealed.as_ref().unwrap_or(memory);
+        let content_hash = sealed_hash.as_deref().unwrap_or(content_hash);
         let tags_json = serde_json::to_string(&memory.tags).unwrap_or_else(|_| "[]".into());
         let metadata_json = memory
             .metadata

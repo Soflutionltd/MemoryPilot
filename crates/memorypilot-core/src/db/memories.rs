@@ -95,14 +95,22 @@ impl Database {
     /// as stored, sealing included.
     fn after_write(&self, outcome: &WriteOutcome) -> Result<Memory, String> {
         let memory = &outcome.memory;
+        // A credential is sealed by the store before it is written: embed what
+        // was stored (the masked label), never the secret.
+        let stored_content = if memory.kind == "credential" {
+            self.stored_content(&memory.id)?
+        } else {
+            memory.content.clone()
+        };
         if outcome.content_changed {
             queue_embedding_job(
                 &memory.id,
-                &memory.content,
-                &Self::embedding_input(&memory.kind, memory.project.as_deref(), &memory.created_at, &memory.content),
+                &stored_content,
+                &Self::embedding_input(&memory.kind, memory.project.as_deref(), &memory.created_at, &stored_content),
             );
         }
         if memory.kind == "credential" {
+            // Rows written by older versions, or with the vault off then on.
             self.seal_credentials()?;
             return self
                 .get_memory(&memory.id)?

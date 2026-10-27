@@ -40,3 +40,109 @@ fn search_accepts_large_limits_without_panicking() {
     }
     cleanup(&path);
 }
+
+const URI: &str = "postgres://alice:synthetic_password@db.example.com/app";
+
+fn file_bytes_contain(path: &PathBuf, needle: &str) -> bool {
+    let mut hit = false;
+    for file in [path.display().to_string(), format!("{}-wal", path.display())] {
+        if let Ok(bytes) = std::fs::read(&file) {
+            hit |= bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+        }
+    }
+    hit
+}
+
+/// A connection URI with a password: masked label, no clear text in the
+/// table, FTS, entities, project brain or database files.
+#[test]
+fn credential_uri_never_stored_or_returned_in_clear() {
+    let path = temp_db_path("cred-uri");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let (stored, _) = add(&db, &format!("Prod database: {URI}"), "credential", "proj");
+        assert!(!stored.content.contains("synthetic_password"), "label: {}", stored.content);
+        assert!(stored.content.contains("postgres://alice:••••@db.example.com/app"), "label: {}", stored.content);
+
+        // The same URI in a note is detected as a credential.
+        let (note, _) = add(&db, &format!("Staging uses DATABASE_URL={URI} for now"), "note", "proj");
+        assert_eq!(note.kind, "credential");
+        assert!(!note.content.contains("synthetic_password"));
+
+        let raw: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories WHERE content LIKE '%synthetic_password%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, 0);
+        let fts: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'synthetic_password'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, 0);
+        let entities: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_entities WHERE entity_value LIKE '%synthetic_password%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(entities, 0);
+        let brain = db.get_project_brain("proj", Some(1500), false).expect("brain");
+        assert!(!brain.to_string().contains("synthetic_password"), "brain leaked: {brain}");
+        let got = db.get_memory(&stored.id).unwrap().unwrap();
+        assert!(!got.content.contains("synthetic_password"));
+        // Still recoverable from the vault.
+        assert_eq!(db.credential_clear_text(&stored.id).unwrap().as_deref(), Some(format!("Prod database: {URI}").as_str()));
+    }
+    assert!(!file_bytes_contain(&path, "synthetic_password"), "secret found in the database files");
+    cleanup(&path);
+}
+
+/// Databases written by older versions: the startup migration re-masks
+/// leaked labels, reclassifies notes holding a URI password and rebuilds
+/// entities from the masked text.
+#[test]
+fn startup_migration_cleans_credentials_left_by_older_versions() {
+    let path = temp_db_path("cred-migration");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let now = chrono::Utc::now().to_rfc3339();
+        for (id, kind, content) in [
+            ("legacy-cred", "credential", format!("🔒 Prod database: {URI}")),
+            ("legacy-note", "note", format!("Staging DATABASE_URL={URI}")),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
+                     VALUES (?1,?2,?3,'proj','[]','test',3,NULL,NULL,NULL,'h',?4,?4,0)",
+                    rusqlite::params![id, content, kind, now],
+                )
+                .unwrap();
+            let rowid = db.conn.last_insert_rowid();
+            db.conn
+                .execute(
+                    "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,'[]',?3,'proj')",
+                    rusqlite::params![rowid, content, kind],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO memory_entities (memory_id, entity_kind, entity_value) VALUES (?1,'file',?2)",
+                    rusqlite::params![id, URI],
+                )
+                .unwrap();
+        }
+        db.conn.execute("DELETE FROM config WHERE key='credential_mask_version'", []).unwrap();
+    }
+    {
+        let db = Database::open_at(&path).expect("reopen");
+        for sql in [
+            "SELECT COUNT(*) FROM memories WHERE content LIKE '%synthetic_password%'",
+            "SELECT COUNT(*) FROM memory_entities WHERE entity_value LIKE '%synthetic_password%'",
+            "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'synthetic_password'",
+        ] {
+            let n: i64 = db.conn.query_row(sql, [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "{sql}");
+        }
+        let kind: String = db.conn.query_row("SELECT kind FROM memories WHERE id='legacy-note'", [], |r| r.get(0)).unwrap();
+        assert_eq!(kind, "credential");
+    }
+    cleanup(&path);
+}

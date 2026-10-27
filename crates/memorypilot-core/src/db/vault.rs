@@ -647,6 +647,25 @@ fn joined_words(core: &str) -> bool {
             .any(|part| part.len() >= 4 && part.chars().all(|c| c.is_ascii_lowercase()))
 }
 
+/// Byte range of the password in a URI with credentials
+/// (`postgres://user:password@host`, also behind `NAME=`), if any.
+pub(crate) fn uri_password_range(token: &str) -> Option<(usize, usize)> {
+    let scheme_end = token.find("://")? + 3;
+    let rest = &token[scheme_end..];
+    // The userinfo ends at the last '@' before the first '/', '?' or '#'.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let at = rest[..authority_end].rfind('@')?;
+    let colon = rest[..at].find(':')?;
+    let (start, end) = (scheme_end + colon + 1, scheme_end + at);
+    (end > start).then_some((start, end))
+}
+
+/// The token with the password of its URI replaced by the mask.
+fn mask_uri_password(token: &str) -> Option<String> {
+    let (start, end) = uri_password_range(token)?;
+    Some(format!("{}••••{}", &token[..start], &token[end..]))
+}
+
 pub(crate) fn looks_secret(token: &str) -> bool {
     let core = token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c));
     let is_path = core.starts_with("~/")
@@ -749,6 +768,12 @@ pub(crate) fn contains_secret_value(content: &str) -> bool {
 pub(crate) fn find_secret_value(content: &str) -> Option<String> {
     let tokens: Vec<&str> = content.split_whitespace().collect();
     for (index, token) in tokens.iter().enumerate() {
+        if let Some((start, end)) = uri_password_range(token) {
+            let password = &token[start..end];
+            if password != "••••" && !password.starts_with('$') && !password.starts_with('<') {
+                return Some(password.to_string());
+            }
+        }
         if looks_secret(token) {
             let core = token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c));
             // Identifiers never hold a password symbol: "account: x@y.com Hx9!kLm2" stays secret.
@@ -826,6 +851,11 @@ pub(crate) fn masked_label(content: &str) -> String {
             mask_next -= 1;
             continue;
         }
+        if let Some(masked) = mask_uri_password(token) {
+            out.push(masked);
+            mask_next = 0;
+            continue;
+        }
         if looks_secret(token) {
             out.push("••••".to_string());
             continue;
@@ -854,6 +884,39 @@ pub(crate) fn masked_label(content: &str) -> String {
     }
     let label: String = label.chars().take(220).collect();
     format!("{}{}", SEAL_PREFIX, label)
+}
+
+/// True when the vault was turned off on purpose (`MEMORYPILOT_VAULT=off`):
+/// credentials are then stored as given, which is the user's explicit choice.
+fn vault_disabled() -> bool {
+    std::env::var("MEMORYPILOT_VAULT").map(|v| v == "off").unwrap_or(false)
+}
+
+/// The credential as it must reach the database: masked label in `content`,
+/// ciphertext in `metadata.enc`. Sealing happens before the row is written,
+/// so the secret never lands in the table, the FTS index or the WAL.
+/// `None` when nothing has to change (not a credential, already sealed, or
+/// vault turned off on purpose). Fails closed when the key is unavailable.
+pub(crate) fn seal_for_write(memory: &Memory) -> Result<Option<Memory>, String> {
+    if memory.kind != "credential" || memory.content.starts_with(SEAL_PREFIX) || vault_disabled() {
+        return Ok(None);
+    }
+    let Some(enc) = encrypt(&memory.content) else {
+        return Err("Credential not stored: the vault key is unavailable (Keychain refused or key file unreadable). Set MEMORYPILOT_VAULT=off to store credentials in clear on purpose.".into());
+    };
+    if decrypt(&enc).as_deref() != Some(memory.content.as_str()) {
+        return Err("Credential not stored: the ciphertext could not be read back".into());
+    }
+    let mut meta = memory.metadata.clone().unwrap_or_else(|| serde_json::json!({}));
+    if !meta.is_object() {
+        meta = serde_json::json!({ "previous_metadata": meta });
+    }
+    meta["enc"] = serde_json::Value::String(enc);
+    meta["sealed"] = serde_json::Value::Bool(true);
+    let mut sealed = memory.clone();
+    sealed.content = masked_label(&memory.content);
+    sealed.metadata = Some(meta);
+    Ok(Some(sealed))
 }
 
 impl Database {
@@ -964,6 +1027,10 @@ impl Database {
             );
             sealed += 1;
         }
+        if sealed > 0 {
+            // The clear text was in WAL frames: copy them back and truncate the WAL.
+            let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
         Ok(sealed)
     }
 
@@ -1008,12 +1075,87 @@ impl Database {
                     self.replace_sealed_label(&id, &label, memory.project.as_deref(), &memory.created_at)?;
                 }
             }
+            if apply {
+                // Entities used to be extracted from the clear text: rebuild them from the label.
+                let mut labelled = memory.clone();
+                labelled.content = label;
+                if let Err(error) = super::knowledge::rebuild_memory_links(self, &labelled) {
+                    eprintln!("[MemoryPilot] Links of credential {} not rebuilt: {}", id, error);
+                }
+            }
         }
         if apply && (report.relabelled > 0 || !report.reclassified.is_empty()) {
             // Old labels may survive in free pages of the file.
-            self.conn.execute_batch("VACUUM;").map_err(|e| format!("vacuum: {}", e))?;
+            self.conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);").map_err(|e| format!("vacuum: {}", e))?;
         }
         Ok(report)
+    }
+
+    /// One-shot, keyless repair of what older versions left in clear: sealed
+    /// labels that kept the password of a connection URI, entities extracted
+    /// from a credential's clear text, and notes holding such a URI (turned
+    /// into credentials, sealed by the next pass once the key is loaded).
+    /// Guarded by `credential_mask_version` in `config`.
+    pub(super) fn migrate_credential_masking(&self) -> Result<usize, String> {
+        const VERSION: &str = "1";
+        let current: String = self
+            .conn
+            .query_row("SELECT value FROM config WHERE key='credential_mask_version'", [], |r| r.get(0))
+            .unwrap_or_default();
+        if current == VERSION {
+            return Ok(0);
+        }
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, kind, content FROM memories WHERE kind = 'credential' OR content LIKE '%://%@%'")
+                .map_err(|e| format!("mask migration prepare: {}", e))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| format!("mask migration query: {}", e))?;
+            rows.flatten().collect()
+        };
+        let mut changed = 0usize;
+        for (id, kind, content) in rows {
+            let Some(memory) = self.get_memory(&id)? else { continue };
+            if kind != "credential" {
+                // A note holding a connection URI with its password.
+                if !content.split_whitespace().any(|t| uri_password_range(t).is_some()) {
+                    continue;
+                }
+                self.conn
+                    .execute("UPDATE memories SET kind='credential' WHERE id=?1", params![id])
+                    .map_err(|e| format!("mask migration reclassify: {}", e))?;
+                changed += 1;
+            } else if content.starts_with(SEAL_PREFIX) {
+                let label = masked_label(content.trim_start_matches(SEAL_PREFIX));
+                if label != content {
+                    self.replace_sealed_label(&id, &label, memory.project.as_deref(), &memory.created_at)?;
+                    changed += 1;
+                }
+            }
+            // Entities from the masked label only.
+            let mut labelled = memory.clone();
+            labelled.kind = "credential".into();
+            labelled.content = masked_label(content.trim_start_matches(SEAL_PREFIX));
+            if let Err(error) = super::knowledge::rebuild_memory_links(self, &labelled) {
+                eprintln!("[MemoryPilot] Links of credential {} not rebuilt: {}", id, error);
+            }
+        }
+        if changed > 0 {
+            let _ = self.seal_pending_credentials();
+            // Old labels survive in free pages and WAL frames otherwise.
+            self.conn
+                .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(|e| format!("mask migration vacuum: {}", e))?;
+        }
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES ('credential_mask_version', ?1)",
+                params![VERSION],
+            )
+            .map_err(|e| format!("mask migration version: {}", e))?;
+        Ok(changed)
     }
 
     fn replace_sealed_label(&self, id: &str, label: &str, project: Option<&str>, created_at: &str) -> Result<(), String> {
@@ -1475,8 +1617,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mp-pending-seal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Database::open_at(&dir.join("memory.db")).unwrap();
+        // New writes are sealed before they reach the table: a credential in
+        // clear is a row left by an older version or written with the vault off.
         db.insert_memory(&credential("Admin demo : password: Hx9!kLm2pQ", None), "hash").unwrap();
         assert!(key().is_some());
+        assert_eq!(db.seal_pending_credentials().unwrap(), 0, "sealed on insert");
+        db.conn
+            .execute("UPDATE memories SET content='Admin demo : password: Hx9!kLm2pQ', metadata=NULL WHERE id='c1'", [])
+            .unwrap();
         assert_eq!(db.seal_pending_credentials().unwrap(), 1);
         assert_eq!(db.seal_pending_credentials().unwrap(), 0, "idempotent");
         let stored = db.stored_content("c1").unwrap();

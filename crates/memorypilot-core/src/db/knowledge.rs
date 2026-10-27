@@ -5,7 +5,15 @@ use super::*;
 /// Re-extracts a memory's entities (and the calendar dates it names), then
 /// links it, both ways, to the memories sharing a reliable entity with it.
 pub fn rebuild_memory_links<S: GraphStore + ?Sized>(store: &S, memory: &Memory) -> Result<(), String> {
-    let entities = crate::graph::extract_entities(&memory.content, memory.project.as_deref());
+    // A credential's entities come from its masked label, never from the secret.
+    let masked;
+    let text = if memory.kind == "credential" && !memory.content.starts_with(vault::SEAL_PREFIX) {
+        masked = vault::masked_label(&memory.content);
+        masked.as_str()
+    } else {
+        memory.content.as_str()
+    };
+    let entities = crate::graph::extract_entities(text, memory.project.as_deref());
     let mut entity_rows: Vec<(String, String)> = entities
         .iter()
         .map(|entity| (entity.kind.to_string(), entity.value.clone()))
@@ -14,7 +22,7 @@ pub fn rebuild_memory_links<S: GraphStore + ?Sized>(store: &S, memory: &Memory) 
     // own day. Not a link entity (two memories sharing a date are not
     // related); read by the temporal window in `search`.
     let own_day = crate::temporal::day_of_timestamp(&memory.created_at);
-    for date in crate::temporal::extract_dates(&memory.content, own_day) {
+    for date in crate::temporal::extract_dates(text, own_day) {
         entity_rows.push(("date".into(), date.format("%Y-%m-%d").to_string()));
     }
     store.replace_entities(&memory.id, &entity_rows)?;
