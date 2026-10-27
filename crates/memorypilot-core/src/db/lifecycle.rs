@@ -87,6 +87,8 @@ impl Database {
                 [],
             )
             .map_err(|error| format!("Embedding model swap invalidate: {}", error))?;
+        // Episode vectors come from the same encoder: rebuild them with the new one.
+        let _ = self.conn.execute("DELETE FROM episodes", []);
         if with_vectors > 0 {
             invalidated += with_vectors;
             if let Some(ann) = self.ann.as_ref() {

@@ -103,37 +103,49 @@ impl Database {
         // ── Level 1: raw memories → hourly interval episodes ──────────
         let raw_rows = self.load_rollup_rows()?;
         report.memories_scanned = raw_rows.len();
+        // Buckets are per project and hour; an episode's hash covers its
+        // sources' ids and contents, so an edited, deleted or newly added
+        // memory gives a new episode, and the stale one is pruned below.
         let interval_buckets = bucket_rows(&raw_rows, INTERVAL_KEY_LEN);
+        let mut wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (_, rows) in interval_buckets {
             if rows.len() < MIN_MEMORIES_PER_INTERVAL {
                 continue;
             }
+            wanted.insert(interval_hash(&rows));
             if self.insert_interval_episode(&rows)? {
                 report.interval_created += 1;
             }
         }
+        self.prune_episodes("interval", &wanted)?;
 
         // ── Level 2: interval episodes → daily episodes ───────────────
         let intervals = self.load_episodes_by_level("interval")?;
+        let mut wanted = std::collections::HashSet::new();
         for (_, group) in group_episodes(&intervals, DAILY_KEY_LEN) {
             if group.len() < MIN_INTERVALS_PER_DAY {
                 continue;
             }
+            wanted.insert(parent_hash(&group, "daily"));
             if self.insert_parent_episode(&group, "daily")? {
                 report.daily_created += 1;
             }
         }
+        self.prune_episodes("daily", &wanted)?;
 
         // ── Level 3: daily episodes → monthly long-term episodes ──────
         let dailies = self.load_episodes_by_level("daily")?;
+        let mut wanted = std::collections::HashSet::new();
         for (_, group) in group_episodes(&dailies, MONTHLY_KEY_LEN) {
             if group.len() < MIN_DAILIES_PER_MONTH {
                 continue;
             }
+            wanted.insert(parent_hash(&group, "longterm"));
             if self.insert_parent_episode(&group, "longterm")? {
                 report.longterm_created += 1;
             }
         }
+        self.prune_episodes("longterm", &wanted)?;
 
         Ok(report)
     }
@@ -336,7 +348,7 @@ impl Database {
         // themselves summaries (capsules) to avoid summarising summaries.
         let sql = "SELECT id, content, kind, project, importance, created_at \
                    FROM memories \
-                   WHERE kind NOT IN ('capsule', 'session_capsule') \
+                   WHERE kind NOT IN ('capsule', 'session_capsule', 'credential') \
                    ORDER BY created_at ASC";
         let mut stmt = self
             .conn
@@ -373,10 +385,30 @@ impl Database {
 
     /// Materialise one interval episode from raw memories. Returns true if
     /// a new row was inserted (false if it already existed by hash).
+    /// Deletes the episodes of a level that no longer match their sources.
+    fn prune_episodes(&self, level: &str, wanted: &std::collections::HashSet<String>) -> Result<usize, String> {
+        let stale: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, COALESCE(content_hash, '') FROM episodes WHERE level = ?1")
+                .map_err(|e| format!("prune prepare: {}", e))?;
+            let rows = stmt
+                .query_map(params![level], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| format!("prune query: {}", e))?;
+            rows.flatten().filter(|(_, hash)| !wanted.contains(hash)).map(|(id, _)| id).collect()
+        };
+        for id in &stale {
+            self.conn
+                .execute("DELETE FROM episodes WHERE id = ?1", params![id])
+                .map_err(|e| format!("prune delete: {}", e))?;
+        }
+        Ok(stale.len())
+    }
+
     fn insert_interval_episode(&self, rows: &[&RawRow]) -> Result<bool, String> {
         let mut source_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
         source_ids.sort();
-        let hash = content_hash(&source_ids.join("|"));
+        let hash = interval_hash(rows);
         // Idempotency check *before* summarising and embedding: a full
         // pass over an already-rolled-up corpus must cost a few index
         // lookups, not one ONNX call per hour of history.
@@ -419,7 +451,7 @@ impl Database {
     fn insert_parent_episode(&self, children: &[&Episode], level: &str) -> Result<bool, String> {
         let mut child_ids: Vec<String> = children.iter().map(|c| c.id.clone()).collect();
         child_ids.sort();
-        let hash = content_hash(&format!("{}:{}", level, child_ids.join("|")));
+        let hash = parent_hash(children, level);
         if self.episode_exists(&hash)? {
             return Ok(false);
         }
@@ -545,6 +577,11 @@ impl Database {
     }
 
     /// Recursively resolve an episode down to leaf raw-memory ids.
+    #[cfg(test)]
+    pub(crate) fn resolve_episode_sources(&self, id: &str) -> Vec<String> {
+        self.resolve_leaf_source_ids(id, 0).unwrap_or_default()
+    }
+
     fn resolve_leaf_source_ids(&self, id: &str, depth: usize) -> Result<Vec<String>, String> {
         if depth > 4 {
             return Ok(Vec::new());
@@ -635,11 +672,26 @@ fn raw_to_memory(r: &RawRow) -> Memory {
 /// Bucket raw rows by a timestamp-prefix key of the given length, keeping
 /// chronological order inside each bucket. Buckets are returned sorted by
 /// key for deterministic rollup.
+/// Episode identity: version, sorted source ids and the hash of each source's content.
+fn interval_hash(rows: &[&RawRow]) -> String {
+    let mut parts: Vec<String> = rows.iter().map(|r| format!("{}:{}", r.id, content_hash(&r.content))).collect();
+    parts.sort();
+    content_hash(&format!("v2|{}", parts.join("|")))
+}
+
+/// Parent identity: level and sorted child ids (children change id when their sources change).
+fn parent_hash(children: &[&Episode], level: &str) -> String {
+    let mut child_ids: Vec<&str> = children.iter().map(|c| c.id.as_str()).collect();
+    child_ids.sort();
+    content_hash(&format!("v2|{}:{}", level, child_ids.join("|")))
+}
+
+/// Never mixes projects: the key is the project, then the time prefix.
 fn bucket_rows<'a>(rows: &'a [RawRow], key_len: usize) -> Vec<(String, Vec<&'a RawRow>)> {
     use std::collections::BTreeMap;
     let mut map: BTreeMap<String, Vec<&RawRow>> = BTreeMap::new();
     for r in rows {
-        let key = time_key(&r.created_at, key_len);
+        let key = format!("{}\u{1f}{}", r.project.as_deref().unwrap_or(""), time_key(&r.created_at, key_len));
         map.entry(key).or_default().push(r);
     }
     map.into_iter().collect()
@@ -649,7 +701,7 @@ fn group_episodes<'a>(eps: &'a [Episode], key_len: usize) -> Vec<(String, Vec<&'
     use std::collections::BTreeMap;
     let mut map: BTreeMap<String, Vec<&Episode>> = BTreeMap::new();
     for e in eps {
-        let key = time_key(&e.start_at, key_len);
+        let key = format!("{}\u{1f}{}", e.project.as_deref().unwrap_or(""), time_key(&e.start_at, key_len));
         map.entry(key).or_default().push(e);
     }
     map.into_iter().collect()

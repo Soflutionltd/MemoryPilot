@@ -107,6 +107,14 @@ impl MemoryStore for Database {
         if let Some(ann) = self.ann.as_ref() {
             let _ = ann.remove(id);
         }
+        if affected > 0 {
+            // A deleted memory must not live on in an episode summary; the
+            // next rollup rebuilds the episode from what is left.
+            let _ = self.conn.execute(
+                "DELETE FROM episodes WHERE source_ids LIKE ?1",
+                params![format!("%\"{}\"%", id)],
+            );
+        }
         Ok(affected > 0)
     }
 

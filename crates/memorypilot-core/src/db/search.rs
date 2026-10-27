@@ -187,8 +187,12 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     // of ANN top-K and BM25 hits — avoids loading every embedding blob just to
     // score it. Below the threshold the full scan is kept (provably no recall
     // regression).
+    // Only for unfiltered searches: the ANN top-K is global, so a project,
+    // kind or tag filter applied after it could drop the best matches of a
+    // small project. A filtered search scans its own subset instead.
+    let unfiltered = canonical_project.is_none() && kind.is_none() && tags.map(|t| t.is_empty()).unwrap_or(true);
     let ann_active_for_bypass =
-        store.approximate_index_len() >= ANN_BYPASS_THRESHOLD && !ann_hits.is_empty();
+        unfiltered && store.approximate_index_len() >= ANN_BYPASS_THRESHOLD && !ann_hits.is_empty();
     let restricted_ids: Option<Vec<String>> = if ann_active_for_bypass {
         let mut ids: std::collections::HashSet<String> = bm25_results.keys().cloned().collect();
         for (id, _) in &ann_hits {

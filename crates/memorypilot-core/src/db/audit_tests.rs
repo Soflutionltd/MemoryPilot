@@ -260,3 +260,47 @@ fn stale_embedding_is_not_written_for_edited_content() {
     }
     cleanup(&path);
 }
+
+/// Episodes used to group every project of an hour together, and were never
+/// refreshed when a source memory changed or was deleted.
+#[test]
+fn episodes_stay_within_one_project_and_follow_their_sources() {
+    let path = temp_db_path("episodes");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let hour = "2026-09-01T10:15:00+00:00";
+        for (id, project, content) in [
+            ("a1", "alpha", "Alpha billing export moved to the nightly job"),
+            ("a2", "alpha", "Alpha invoices now carry the VAT number"),
+            ("b1", "beta", "Beta mobile app switched to the new login screen"),
+            ("b2", "beta", "Beta push notifications use the EU endpoint"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
+                     VALUES (?1,?2,'fact',?3,'[]','test',3,NULL,NULL,NULL,'h',?4,?4,0)",
+                    rusqlite::params![id, content, project, hour],
+                )
+                .unwrap();
+        }
+        db.roll_up_episodes().expect("rollup");
+        let episodes = db.list_episodes(None, Some("interval"), 50).unwrap();
+        assert_eq!(episodes.len(), 2, "one episode per project");
+        for e in &episodes {
+            let ids = db.resolve_episode_sources(&e.id);
+            let prefix = if e.project.as_deref() == Some("alpha") { 'a' } else { 'b' };
+            assert!(ids.iter().all(|id| id.starts_with(prefix)), "mixed projects: {ids:?}");
+        }
+        // Source edited: the episode is rebuilt from the new text.
+        db.conn.execute("UPDATE memories SET content='Alpha billing export moved to the hourly job' WHERE id='a1'", []).unwrap();
+        db.roll_up_episodes().expect("rollup 2");
+        let alpha = db.list_episodes(Some("alpha"), Some("interval"), 50).unwrap();
+        assert_eq!(alpha.len(), 1, "stale episode kept");
+        assert!(alpha[0].summary.contains("hourly") || alpha[0].title.contains("hourly") || !alpha[0].summary.contains("nightly"), "summary not refreshed: {}", alpha[0].summary);
+        // Source deleted: below the minimum, the episode goes.
+        db.delete_memory("b2").unwrap();
+        db.roll_up_episodes().expect("rollup 3");
+        assert!(db.list_episodes(Some("beta"), Some("interval"), 50).unwrap().is_empty());
+    }
+    cleanup(&path);
+}
