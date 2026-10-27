@@ -304,3 +304,29 @@ fn episodes_stay_within_one_project_and_follow_their_sources() {
     }
     cleanup(&path);
 }
+
+/// Exports stopped at 10,000 memories without saying so.
+#[test]
+fn export_includes_every_memory_past_ten_thousand() {
+    let path = temp_db_path("export-all");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let now = chrono::Utc::now().to_rfc3339();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        for i in 0..10_050 {
+            tx.execute(
+                "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
+                 VALUES (?1,?2,'note','proj','[]','test',3,NULL,NULL,NULL,'h',?3,?3,0)",
+                rusqlite::params![format!("m{i:05}"), format!("note {i}"), now],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let json = db.export_memories(Some("proj"), "json").expect("export");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(rows.len(), 10_050);
+        let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 10_050, "duplicates across pages");
+    }
+    cleanup(&path);
+}

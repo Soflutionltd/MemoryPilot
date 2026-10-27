@@ -1,12 +1,29 @@
 use super::{Database, Memory};
 
+/// Every memory of the project (or of all projects), page by page: an
+/// export is complete whatever the store's size.
+fn all_memories(db: &Database, project: Option<&str>) -> Result<Vec<Memory>, String> {
+    const PAGE: usize = 5_000;
+    let mut all = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let (page, _) = db.list_memories(project, None, None, PAGE, offset)?;
+        let got = page.len();
+        all.extend(page);
+        if got < PAGE {
+            return Ok(all);
+        }
+        offset += got;
+    }
+}
+
 pub(super) fn export_memories(
     db: &Database,
     project: Option<&str>,
     format: &str,
 ) -> Result<String, String> {
     let canonical_project = Database::canonical_project(project);
-    let (memories, _) = db.list_memories(canonical_project.as_deref(), None, None, 10000, 0)?;
+    let memories = all_memories(db, canonical_project.as_deref())?;
     match format {
         "json" => {
             serde_json::to_string_pretty(&memories).map_err(|error| format!("JSON: {}", error))
@@ -31,7 +48,7 @@ pub(super) fn export_session_markdown(
     }
 
     let canonical_project = Database::canonical_project(project);
-    let (mut memories, _) = db.list_memories(canonical_project.as_deref(), None, None, 10000, 0)?;
+    let mut memories = all_memories(db, canonical_project.as_deref())?;
     memories.retain(|memory| {
         crate::session_export::scope_matches(memory, session_id, thread_id, window_id)
     });

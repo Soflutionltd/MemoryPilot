@@ -157,7 +157,7 @@ impl MemoryStore for Database {
             .map_err(|e| format!("Count: {}", e))?;
 
         let data_sql = format!(
-            "SELECT {} FROM memories{} ORDER BY updated_at DESC LIMIT ?{} OFFSET ?{}",
+            "SELECT {} FROM memories{} ORDER BY updated_at DESC, id LIMIT ?{} OFFSET ?{}",
             MEMORY_COLUMNS,
             where_clause,
             param_values.len() + 1,
