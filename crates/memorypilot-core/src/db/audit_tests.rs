@@ -176,3 +176,63 @@ fn dedup_keeps_the_correction_and_the_previous_version() {
     }
     cleanup(&path);
 }
+
+fn seed_old(db: &Database, id: &str, content: &str, kind: &str, importance: i32, tags: &str) {
+    let stale = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+    db.conn
+        .execute(
+            "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
+             VALUES (?1,?2,?3,'proj',?4,'test',?5,NULL,NULL,NULL,?6,?7,?7,0)",
+            rusqlite::params![id, content, kind, tags, importance, super::content_hash(content), stale],
+        )
+        .unwrap();
+    let rowid = db.conn.last_insert_rowid();
+    db.conn
+        .execute(
+            "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,'proj')",
+            rusqlite::params![rowid, content, tags, kind],
+        )
+        .unwrap();
+}
+
+/// Capsules used to delete their originals (pinned ones included) with no
+/// way back. Pinned memories are now skipped and every original is archived.
+#[test]
+fn compaction_skips_pinned_and_archives_every_original() {
+    let path = temp_db_path("capsule-archive");
+    {
+        let db = Database::open_at(&path).expect("db");
+        for i in 0..6 {
+            seed_old(&db, &format!("n{i}"), &format!("Point {i}. Root cause detail {i}: the cache key ignored the tenant id {i}."), "note", 2, "[]");
+        }
+        seed_old(&db, "pinned-decision", "We decided to keep Postgres 16. Reason: logical replication.", "decision", 2, "[\"pinned\"]");
+        let (capsules, compressed) = db.compact_to_capsules(14, 3).expect("compact");
+        assert!(capsules >= 1 && compressed == 6, "capsules {capsules}, compressed {compressed}");
+        assert!(db.get_memory("pinned-decision").unwrap().is_some(), "pinned memory compacted");
+        let archived = db.list_archived(None, 50).unwrap();
+        assert_eq!(archived.len(), 6);
+        assert!(archived.iter().all(|a| a["replaced_by"].is_string()));
+        // Full text recoverable.
+        let restored = db.restore_archived("n3").unwrap().expect("restored");
+        assert!(restored.content.contains("Root cause detail 3"));
+        assert_eq!(db.list_archived(None, 50).unwrap().len(), 5);
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn gc_merge_archives_its_sources() {
+    let path = temp_db_path("gc-archive");
+    {
+        let db = Database::open_at(&path).expect("db");
+        for i in 0..10 {
+            seed_old(&db, &format!("t{i}"), &format!("Todo {i}: fix the export. Detail {i} explains why the cursor skips lines."), "todo", 1, "[]");
+        }
+        db.run_gc(&crate::gc::GcConfig::default(), false).expect("gc");
+        let remaining: i64 = db.conn.query_row("SELECT COUNT(*) FROM memories WHERE id LIKE 't%'", [], |r| r.get(0)).unwrap();
+        let archived = db.list_archived(None, 50).unwrap().len() as i64;
+        assert!(archived > 0, "gc merged nothing");
+        assert_eq!(remaining + archived, 10, "an original vanished: {remaining} left, {archived} archived");
+    }
+    cleanup(&path);
+}

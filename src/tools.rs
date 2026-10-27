@@ -313,6 +313,22 @@ fn all_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
         },
         {
+            "name": "list_archived",
+            "description": "List originals that compaction (run_gc, compact_memories, consolidation) folded into a summary. Nothing compaction removes is lost: restore any of them with restore_memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "replaced_by": { "type": ["string","null"], "description": "Only the originals folded into this summary memory" },
+                    "limit": { "type": "integer", "default": 50 }
+                }
+            }
+        },
+        {
+            "name": "restore_memory",
+            "description": "Put an archived original back among the memories, as it was before compaction.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
+        },
+        {
             "name": "list_memories",
             "description": "List memories with optional filters and pagination.",
             "inputSchema": {
@@ -427,7 +443,7 @@ fn all_tool_definitions() -> Value {
         { "name": "cleanup_expired", "description": "Manually remove all expired memories.", "inputSchema": { "type": "object", "properties": {} } },
         {
             "name": "compact_memories",
-            "description": "Compress old low-importance memories into dense capsules (~100-200 tokens each). Preserves Knowledge Graph links. Credentials and architecture decisions are never compressed.",
+            "description": "Compress old low-importance memories into dense capsules (~100-200 tokens each). Credentials, architecture decisions and pinned memories are never compressed; every original is kept in the archive (list_archived, restore_memory).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -816,6 +832,8 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "get_memory" => handle_get(db, args),
         "update_memory" => handle_update(db, args),
         "delete_memory" => handle_delete(db, args),
+        "list_archived" => handle_list_archived(db, args),
+        "restore_memory" => handle_restore(db, args),
         "list_memories" => handle_list(db, args),
         "get_project_context" => handle_project_context(db, args),
         "get_project_brain" => handle_get_project_brain(db, args),
@@ -1520,6 +1538,27 @@ fn handle_delete(db: &Database, args: &Value) -> Value {
     match db.delete_memory(id) {
         Ok(true) => tool_result(&format!("Deleted: {}", id)),
         Ok(false) => tool_error(&format!("Not found: {}", id)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_list_archived(db: &Database, args: &Value) -> Value {
+    let replaced_by = args.get("replaced_by").and_then(|v| v.as_str());
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).clamp(1, 500) as usize;
+    match db.list_archived(replaced_by, limit) {
+        Ok(rows) => tool_result(&serde_json::to_string_pretty(&rows).unwrap_or_default()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_restore(db: &Database, args: &Value) -> Value {
+    let id = match args.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        _ => return tool_error("id required"),
+    };
+    match db.restore_archived(id) {
+        Ok(Some(memory)) => tool_result(&format!("Restored: {} ({})", memory.id, memory.kind)),
+        Ok(None) => tool_error(&format!("Not in the archive: {}", id)),
         Err(e) => tool_error(&e),
     }
 }

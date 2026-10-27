@@ -191,22 +191,22 @@ impl Database {
                             });
 
                             if !dry_run {
-                                if self
-                                    .add_memory(
-                                        &merged_content,
-                                        kind,
-                                        proj.as_deref(),
-                                        &["merged".to_string()],
-                                        "gc_compressor",
-                                        3,
-                                        None,
-                                        None,
-                                        &MemoryScope::default(),
-                                    )
-                                    .is_ok()
-                                {
+                                if let Ok((merged, _)) = self.add_memory(
+                                    &merged_content,
+                                    kind,
+                                    proj.as_deref(),
+                                    &["merged".to_string()],
+                                    "gc_compressor",
+                                    3,
+                                    None,
+                                    None,
+                                    &MemoryScope::default(),
+                                ) {
                                     for id in ids_to_delete {
-                                        let _ = self.delete_memory(&id);
+                                        if id == merged.id {
+                                            continue;
+                                        }
+                                        let _ = self.archive_and_delete(&id, "gc_merge", Some(&merged.id));
                                         memories_compressed += 1;
                                     }
                                     groups_merged += 1;
@@ -257,14 +257,15 @@ impl Database {
 
     /// Compress old low-importance memories into dense capsules.
     /// Groups by project + age, merges into ~100-200 token summaries.
-    /// Preserves Knowledge Graph links. Returns (capsules_created, memories_compressed).
+    /// Pinned memories are never compacted; every original is kept in
+    /// `memories_archive` (see `restore_archived`). Returns (capsules_created, memories_compressed).
     pub fn compact_to_capsules(
         &self,
         age_days: i64,
         importance_max: i32,
     ) -> Result<(usize, usize), String> {
         let now = chrono::Utc::now();
-        let sql = "SELECT id, content, kind, project, importance, updated_at FROM memories WHERE kind NOT IN ('credential', 'architecture', 'transcript_chunk') AND importance <= ?1";
+        let sql = "SELECT id, content, kind, project, importance, updated_at FROM memories WHERE kind NOT IN ('credential', 'architecture', 'transcript_chunk') AND importance <= ?1 AND tags NOT LIKE '%pinned%'";
         let mut stmt = self
             .conn
             .prepare(sql)
@@ -323,22 +324,22 @@ impl Database {
                 let kinds: Vec<String> = chunk.iter().map(|(_, _, k)| k.clone()).collect();
                 let capsule = crate::gc::capsule_summary(&contents, &kinds, project.as_deref());
 
-                if self
-                    .add_memory(
-                        &capsule,
-                        "note",
-                        project.as_deref(),
-                        &["capsule".to_string(), "compressed".to_string()],
-                        "auto_capsule",
-                        3,
-                        None,
-                        None,
-                        &MemoryScope::default(),
-                    )
-                    .is_ok()
-                {
+                if let Ok((capsule_memory, _)) = self.add_memory(
+                    &capsule,
+                    "note",
+                    project.as_deref(),
+                    &["capsule".to_string(), "compressed".to_string()],
+                    "auto_capsule",
+                    3,
+                    None,
+                    None,
+                    &MemoryScope::default(),
+                ) {
                     for (id, _, _) in chunk {
-                        let _ = self.delete_memory(id);
+                        if *id == capsule_memory.id {
+                            continue;
+                        }
+                        let _ = self.archive_and_delete(id, "capsule", Some(&capsule_memory.id));
                         memories_compressed += 1;
                     }
                     capsules_created += 1;

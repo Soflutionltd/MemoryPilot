@@ -265,7 +265,7 @@ impl Database {
                  SELECT ?1, entity_kind, entity_value, valid_from, valid_to FROM memory_entities WHERE memory_id=?2",
                 params![canonical.id, duplicate.id],
             );
-            self.delete_memory(&duplicate.id)?;
+            self.archive_and_delete(&duplicate.id, "consolidate", Some(&canonical.id))?;
         }
         Ok(())
     }

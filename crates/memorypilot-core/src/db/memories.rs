@@ -146,6 +146,99 @@ impl Database {
         self.remove_memory(id)
     }
 
+    /// Removes a memory that compaction folded into a summary, after copying
+    /// the full row (sealed content and ciphertext included) into
+    /// `memories_archive`: compaction never loses an original. Restore it
+    /// with [`Self::restore_archived`].
+    pub fn archive_and_delete(&self, id: &str, reason: &str, replaced_by: Option<&str>) -> Result<bool, String> {
+        let copied = self
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO memories_archive
+                 (id,content,kind,project,tags,source,importance,metadata,created_at,updated_at,archived_at,reason,replaced_by)
+                 SELECT id,content,kind,project,tags,source,importance,metadata,created_at,updated_at,?2,?3,?4
+                 FROM memories WHERE id=?1",
+                params![id, Utc::now().to_rfc3339(), reason, replaced_by],
+            )
+            .map_err(|e| format!("Archive: {}", e))?;
+        if copied == 0 {
+            return Ok(false);
+        }
+        self.remove_memory(id)
+    }
+
+    /// Archived originals, newest first (optionally those folded into `replaced_by`).
+    pub fn list_archived(&self, replaced_by: Option<&str>, limit: usize) -> Result<Vec<serde_json::Value>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, content, kind, project, archived_at, reason, replaced_by FROM memories_archive
+                 WHERE (?1 IS NULL OR replaced_by = ?1) ORDER BY archived_at DESC LIMIT ?2",
+            )
+            .map_err(|e| format!("Archive list: {}", e))?;
+        let rows = stmt
+            .query_map(params![replaced_by, limit as i64], |r| {
+                let kind: String = r.get(2)?;
+                let content: String = r.get(1)?;
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "content": vault::read_content(&kind, content, None),
+                    "kind": kind,
+                    "project": r.get::<_, Option<String>>(3)?,
+                    "archived_at": r.get::<_, String>(4)?,
+                    "reason": r.get::<_, String>(5)?,
+                    "replaced_by": r.get::<_, Option<String>>(6)?,
+                }))
+            })
+            .map_err(|e| format!("Archive list: {}", e))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Puts an archived original back among the memories, as it was.
+    pub fn restore_archived(&self, id: &str) -> Result<Option<Memory>, String> {
+        let row = self.conn.query_row(
+            "SELECT content,kind,project,tags,source,importance,metadata,created_at FROM memories_archive WHERE id=?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i32>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            },
+        );
+        let Ok((content, kind, project, tags, source, importance, metadata, created_at)) = row else {
+            return Ok(None);
+        };
+        let memory = Memory {
+            id: id.to_string(),
+            content: content.clone(),
+            kind,
+            project,
+            tags: serde_json::from_str(&tags).unwrap_or_default(),
+            source,
+            importance,
+            expires_at: None,
+            created_at,
+            updated_at: Utc::now().to_rfc3339(),
+            metadata: metadata.and_then(|m| serde_json::from_str(&m).ok()),
+            last_accessed_at: None,
+            access_count: 0,
+        };
+        self.insert_memory(&memory, &content_hash(&content))?;
+        report_link_failure(rebuild_memory_links(self, &memory), &memory.id);
+        self.conn
+            .execute("DELETE FROM memories_archive WHERE id=?1", params![id])
+            .map_err(|e| format!("Archive restore: {}", e))?;
+        let outcome = WriteOutcome { memory, merged: false, content_changed: true };
+        self.after_write(&outcome).map(Some)
+    }
+
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>, String> {
         self.fetch_memory(id)
     }

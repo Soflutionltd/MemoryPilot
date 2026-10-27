@@ -108,6 +108,22 @@ impl Database {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS memories_archive (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                project TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                source TEXT NOT NULL DEFAULT '',
+                importance INTEGER NOT NULL DEFAULT 3,
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                replaced_by TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_archive_replaced_by ON memories_archive(replaced_by);
         ").map_err(|e| format!("Schema: {}", e))
     }
 
