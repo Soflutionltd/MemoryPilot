@@ -43,7 +43,7 @@ fn search_accepts_large_limits_without_panicking() {
 
 const URI: &str = "postgres://alice:synthetic_password@db.example.com/app";
 
-fn file_bytes_contain(path: &PathBuf, needle: &str) -> bool {
+fn file_bytes_contain(path: &std::path::Path, needle: &str) -> bool {
     let mut hit = false;
     for file in [path.display().to_string(), format!("{}-wal", path.display())] {
         if let Ok(bytes) = std::fs::read(&file) {
