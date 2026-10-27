@@ -236,3 +236,27 @@ fn gc_merge_archives_its_sources() {
     }
     cleanup(&path);
 }
+
+/// A vector computed for an old text must not be written once the memory
+/// was edited while its batch was embedding.
+#[test]
+fn stale_embedding_is_not_written_for_edited_content() {
+    let path = temp_db_path("stale-embedding");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let (mem, _) = add(&db, "The ingestion worker runs every five minutes on the cron host", "fact", "proj");
+        db.conn.execute("UPDATE memories SET embedding=NULL WHERE id=?1", rusqlite::params![mem.id]).unwrap();
+        // Job taken from the queue with the old text, then the memory is edited.
+        let old_text = mem.content.clone();
+        db.update_memory_full(&mem.id, Some("The ingestion worker now runs every hour on the queue host"), None, None, None, None, None)
+            .unwrap();
+        db.conn.execute("UPDATE memories SET embedding=NULL WHERE id=?1", rusqlite::params![mem.id]).unwrap();
+        let blob = crate::embedding::vec_to_blob(&[0.5f32; 8]);
+        let written = super::embed_worker::store_embedding(&db.conn, &mem.id, &old_text, &blob, &super::content_hash(&old_text));
+        assert_eq!(written, 0, "stale vector written");
+        let current = db.get_memory(&mem.id).unwrap().unwrap().content;
+        let written = super::embed_worker::store_embedding(&db.conn, &mem.id, &current, &blob, &super::content_hash(&current));
+        assert_eq!(written, 1);
+    }
+    cleanup(&path);
+}

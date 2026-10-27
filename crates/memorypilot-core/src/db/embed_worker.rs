@@ -293,6 +293,16 @@ fn ensure_embed_worker() {
 /// queries interleave instead of waiting behind the whole corpus.
 const EMBED_SLICE: usize = 32;
 
+/// Writes a computed vector only if the row still holds the text it was
+/// computed from and has no vector yet. Returns the rows written (0 or 1).
+pub(super) fn store_embedding(conn: &Connection, id: &str, content: &str, blob: &[u8], hash: &str) -> usize {
+    conn.execute(
+        "UPDATE memories SET embedding = ?1, content_hash = ?2 WHERE id = ?3 AND embedding IS NULL AND content = ?4",
+        params![blob, hash, id, content],
+    )
+    .unwrap_or(0)
+}
+
 fn embed_worker_loop() {
     let mut backlog = false;
     loop {
@@ -353,10 +363,12 @@ fn embed_worker_loop() {
         for (job, embedding) in jobs.iter().zip(embeddings.iter()) {
             let blob = crate::embedding::vec_to_blob(embedding);
             let hash = content_hash(&job.content);
-            let _ = conn.execute(
-                "UPDATE memories SET embedding = ?1, content_hash = ?2 WHERE id = ?3 AND embedding IS NULL",
-                params![blob, &hash, &job.id],
-            );
+            // Only for the text this vector was computed from: a memory
+            // edited while its batch was embedding keeps NULL until the job
+            // queued by that edit writes the right vector.
+            if store_embedding(&conn, &job.id, &job.content, &blob, &hash) == 0 {
+                continue;
+            }
             if let Some(index) = ann.as_ref() {
                 if index.add(&job.id, embedding).is_ok() {
                     ann_pushed += 1;
