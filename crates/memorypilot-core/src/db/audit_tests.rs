@@ -146,3 +146,33 @@ fn startup_migration_cleans_credentials_left_by_older_versions() {
     }
     cleanup(&path);
 }
+
+/// A same-length correction of a near-duplicate used to be dropped, the old
+/// figure kept and its date refreshed.
+#[test]
+fn dedup_keeps_the_correction_and_the_previous_version() {
+    let path = temp_db_path("dedup-correction");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let old = "Le délai de règlement contractuel applicable à tous les clients de notre entreprise est fixé à 30 jours.";
+        let new = "Le délai de règlement contractuel applicable à tous les clients de notre entreprise est fixé à 60 jours.";
+        let (first, _) = add(&db, old, "fact", "proj");
+        let (second, merged) = add(&db, new, "fact", "proj");
+        assert!(merged, "still one memory");
+        assert_eq!(second.id, first.id);
+        let stored = db.get_memory(&first.id).unwrap().unwrap();
+        assert!(stored.content.contains("60 jours"), "{}", stored.content);
+        let versions = stored.metadata.as_ref().and_then(|m| m.get("previous_versions")).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0]["content"].as_str().unwrap().contains("30 jours"));
+
+        // A repeat that adds nothing keeps the stored text.
+        let (_, merged) = add(&db, "Le délai de règlement contractuel applicable à tous les clients de notre entreprise est fixé à 60 jours", "fact", "proj");
+        assert!(merged);
+        let stored = db.get_memory(&first.id).unwrap().unwrap();
+        assert!(stored.content.ends_with("60 jours."));
+        let versions = stored.metadata.as_ref().and_then(|m| m.get("previous_versions")).and_then(|v| v.as_array()).map(|v| v.len()).unwrap_or(0);
+        assert_eq!(versions, 1, "no version added for a repeat");
+    }
+    cleanup(&path);
+}

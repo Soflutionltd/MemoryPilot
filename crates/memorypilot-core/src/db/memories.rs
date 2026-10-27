@@ -338,6 +338,28 @@ fn find_duplicate<S: MemoryStore + ?Sized>(
     Ok(None)
 }
 
+/// How many replaced texts a memory keeps in `metadata.previous_versions`.
+const MAX_PREVIOUS_VERSIONS: usize = 5;
+
+/// `metadata` with the existing text appended to `previous_versions` (newest last).
+fn with_previous_version(metadata: Option<serde_json::Value>, existing: &Memory) -> serde_json::Value {
+    let mut meta = match metadata {
+        Some(value @ serde_json::Value::Object(_)) => value,
+        Some(other) => serde_json::json!({ "previous_metadata": other }),
+        None => serde_json::json!({}),
+    };
+    let mut versions = meta
+        .get("previous_versions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    versions.push(serde_json::json!({ "content": existing.content, "until": Utc::now().to_rfc3339() }));
+    let excess = versions.len().saturating_sub(MAX_PREVIOUS_VERSIONS);
+    versions.drain(..excess);
+    meta["previous_versions"] = serde_json::Value::Array(versions);
+    meta
+}
+
 /// Links are derived data: a failure leaves the memory stored, unlinked
 /// until its next write, and is printed.
 fn report_link_failure(rebuilt: Result<(), String>, memory_id: &str) {
@@ -347,8 +369,8 @@ fn report_link_failure(rebuilt: Result<(), String>, memory_id: &str) {
 }
 
 /// Adds a memory to any store: a secret value forces the credential kind,
-/// a near-duplicate is merged into instead (longest content, highest
-/// importance, union of tags), a new memory gets its project, entities and
+/// a near-duplicate is merged into instead (latest content unless it adds
+/// nothing, highest importance, union of tags), a new memory gets its project, entities and
 /// links. Embedding and sealing are left to the caller ([`WriteOutcome`]).
 #[allow(clippy::too_many_arguments)]
 pub fn add_memory_to<S: MemoryStore + GraphStore + ?Sized>(
@@ -370,9 +392,20 @@ pub fn add_memory_to<S: MemoryStore + GraphStore + ?Sized>(
     let canonical_project = Database::canonical_project(project);
     let scoped_metadata = Database::apply_scope_to_metadata(metadata, scope);
     if let Some(existing) = find_duplicate(store, content, canonical_project.as_deref())? {
-        // Merge: update content if newer is longer, bump updated_at
+        // Merge. The new text replaces the old one unless it adds nothing to
+        // it (all its words already there): a near-duplicate that changes a
+        // figure, a date or a name ("30 jours" -> "60 jours") is a correction,
+        // and the latest statement wins. The replaced text is kept in
+        // `metadata.previous_versions`, so nothing is lost.
         // A credential is read masked: keeping it means not rewriting it.
-        let new_content = if content.len() > existing.content.len() {
+        let new_norm = Database::normalize(content);
+        let old_norm = Database::normalize(&existing.content);
+        let adds_nothing = {
+            let old_words: std::collections::HashSet<&str> = old_norm.split_whitespace().collect();
+            new_norm.split_whitespace().all(|w| old_words.contains(w))
+        };
+        let replaces = existing.kind != "credential" && content != existing.content && !adds_nothing;
+        let new_content = if replaces {
             Some(content)
         } else if existing.kind == "credential" {
             None
@@ -386,7 +419,10 @@ pub fn add_memory_to<S: MemoryStore + GraphStore + ?Sized>(
                 merged_tags.push(t.clone());
             }
         }
-        let merged_metadata = Database::merge_metadata(existing.metadata.as_ref(), scoped_metadata.as_ref());
+        let mut merged_metadata = Database::merge_metadata(existing.metadata.as_ref(), scoped_metadata.as_ref());
+        if replaces {
+            merged_metadata = Some(with_previous_version(merged_metadata, &existing));
+        }
         let updated = update_memory_in(
             store,
             &existing.id,
