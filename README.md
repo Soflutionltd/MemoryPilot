@@ -56,34 +56,41 @@ AI coding assistants forget everything between sessions. MemoryPilot gives them 
   <img src="https://raw.githubusercontent.com/Soflutionltd/MemoryPilot/main/static/benchmark_chart.png" alt="MemoryPilot vs Mem0, Zep, MemPalace, mcp-memory-service on LongMemEval-S" width="820"/>
 </p>
 
-Evaluated on 470 questions from the [LongMemEval](https://arxiv.org/abs/2410.10813) benchmark (ICLR 2025), the standard academic dataset for long-term memory retrieval. Turn-level granularity, ~50 sessions per haystack.
+Evaluated on the 470 answerable questions of [LongMemEval-S](https://arxiv.org/abs/2410.10813) (ICLR 2025; the 30 abstention questions are left out, as the official retrieval protocol does). Turn-level index, ~50 sessions per haystack.
 
-#### vs the entire market (LongMemEval-S, public numbers)
+**What the score measures.** `R@5` here is session-level `recall_any@5`: a question counts as a hit when at least one of the top 5 retrieved turns belongs to one of its gold sessions. It is a retrieval metric, not answer accuracy, and a question that needs several sessions counts as a hit as soon as one of them is found (300 of the 470 questions have more than one gold session). For scale: a plain BM25 over turns, with no embeddings, scores about 93% on the same metric and 74% on `recall_all@5`. These figures were measured with v4.2 (multilingual-e5-small); the current default model has only been measured on a 100-question slice (see v4.6 below).
 
-| System | R@5 / Accuracy | Latency | Privacy | Stack | Source |
-|--------|---------------:|---------|---------|-------|--------|
-| **MemoryPilot v4.2 (adaptive)** | **99.1%** | ~900 ms | 100% local | Rust · 35 MB binary · zero API | This repo, `--benchmark-longmemeval` @470 |
-| **MemoryPilot v4.2 (default fast)** | **98.7%** | **~28 ms** | 100% local | Rust · 35 MB binary · zero API | This repo, `--benchmark-longmemeval` @470 |
-| MemPalace v3.3.3 (hybrid) | 98.4% | not published | 100% local | Python + ChromaDB · ~500 MB | MemPalace v3.3.3 release notes |
-| agentmemory v0.9 (11k+ stars) | 95.2% | not published | 100% local | Node + iii-engine + SQLite | [github.com/rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) — `benchmark/LONGMEMEVAL.md` |
-| Mem0 (cloud, OpenAI backend) | 94.4% | ~6 787 tokens/query | Cloud (OpenAI) | SaaS + OpenAI embeddings | [mem0.ai blog](https://mem0.ai/blog/benchmarked-openai-memory-vs-langmem-vs-memgpt-vs-mem0-for-long-term-memory-here-s-how-they-stacked-up) |
-| mcp-memory-service v10.34.0 | 80.4% | not published | 100% local | Python + SQLite-Vec + MiniLM | [v10.34.0 release notes](https://github.com/doobidoo/mcp-memory-service/releases/tag/v10.34.0) |
-| Zep / Graphiti | 63.8% | "90% lower vs baseline" | Cloud or self-host | Python + Neo4j + LLM extraction | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956) |
-| Letta / MemGPT | not measured on LongMemEval | — | Self-host | Python framework | [Letta tracking issue #3115](https://github.com/letta-ai/letta/issues/3115) |
+#### Retrieval scores (same metric family, setups differ)
 
-> MemoryPilot is the **only system in this comparison that is both 100% local *and* tops the leaderboard**. The default fast mode (~28 ms) already beats every published competitor — including agentmemory (95.2%), the current darling of the AI-agent-memory category with 11k+ GitHub stars. The adaptive cross-encoder mode adds +0.4 pp R@5 for the cost of one ONNX rerank pass per query, and a +6.7 pp MRR lead vs agentmemory (94.9% vs 88.2%).
+| System | R@5 (recall_any, session level) | Notes | Source |
+|--------|--------------------------------:|-------|--------|
+| **MemoryPilot v4.2 (adaptive rerank)** | **99.1%** | 470 questions, ~900 ms/query on an M-series Mac | This repo, `--benchmark-longmemeval` |
+| **MemoryPilot v4.2 (rerank off)** | **98.7%** | 470 questions, ~28 ms/query with `MEMORYPILOT_CROSS_RERANK=off` | This repo, `--benchmark-longmemeval` |
+| MemPalace v3.3.3 (hybrid) | 98.4% | 450 held-out questions after tuning on 50; 96.6% raw on 500 | MemPalace v3.3.3 release notes |
+| agentmemory v0.9 | 95.2% | 500 questions (abstention included), all-MiniLM | [github.com/rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) `benchmark/LONGMEMEVAL.md` |
+| mcp-memory-service v10.34.0 | 80.4% | labelled R@5; hit definition not stated | [v10.34.0 release notes](https://github.com/doobidoo/mcp-memory-service/releases/tag/v10.34.0) |
+
+#### Answer accuracy (a different metric: an LLM reads the retrieved context and a judge grades the answer)
+
+| System | QA accuracy | Setup | Source |
+|--------|------------:|-------|--------|
+| Mem0 (cloud) | 94.4% | Mem0's own suite, top-200 retrieval | [mem0.ai blog](https://mem0.ai/blog/benchmarked-openai-memory-vs-langmem-vs-memgpt-vs-mem0-for-long-term-memory-here-s-how-they-stacked-up) |
+| Zep / Graphiti | 63.8% / 71.2% | gpt-4o-mini / gpt-4o as reader, GPT-4o judge | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956), Table 2 |
+| MemoryPilot | not measured | an end-to-end QA run is planned | |
+
+> All figures are published by their own authors, none was reproduced independently, and the two tables cannot be compared with each other. On session-level recall MemoryPilot posts the highest published local score, by a margin smaller than the gap between this metric and a plain BM25 baseline. The protocol to settle a comparison: same 470 questions, same hardware, every system run by the same script, reporting `recall_any@5`, `recall_all@5`, turn-level evidence recall and end-to-end QA accuracy with a fixed reader and judge.
 
 #### Detailed view — MemoryPilot vs MemPalace (closest local competitor)
 
-| Metric | MemoryPilot v4.2 (default fast) | MemoryPilot v4.2 (adaptive rerank) | MemPalace v3.3.3 | Delta vs MemPalace |
+| Metric | MemoryPilot v4.2 (rerank off) | MemoryPilot v4.2 (adaptive rerank) | MemPalace v3.3.3 | Delta vs MemPalace |
 |--------|---------------------------------|------------------------------------|------------------|--------------------|
 | **R@5** | **98.7%** | **99.1%** | 96.6% raw / 98.4% hybrid | +2.5% vs raw / +0.7% vs hybrid |
 | **R@10** | **99.6%** | **99.4%** | ~97%¹ | +2.6% vs raw |
 | **NDCG@10** | **95.1%** | **96.0%** | Not published | MemoryPilot publishes |
 | **MRR** | **93.6%** | **94.9%** | Not published | MemoryPilot publishes |
-| **Avg search latency** | ~28 ms | ~900 ms | N/A | Default mode is 30× faster |
+| **Avg search latency** | ~28 ms (`MEMORYPILOT_CROSS_RERANK=off`) | ~900 ms (the default) | N/A | search call only, models warm |
 
-> ¹ Validated with the full 470-question evaluation set (after dropping the 30 abstention questions) in two modes: default fast local hybrid retrieval (BM25 + cosine RRF, ~28 ms/query, suitable for live MCP traffic) and adaptive cross-encoder rerank (`MEMORYPILOT_CROSS_RERANK=adaptive`, jina-v2-multilingual, fusion weight 0.45, ~900 ms/query, suitable for benchmarks and high-stakes recall). The default mode already beats MemPalace's hybrid held-out result; the adaptive mode trades latency for a further +0.4 pp R@5 and +1.3 pp MRR.
+> ¹ Validated with the full 470-question evaluation set (after dropping the 30 abstention questions) in two modes: hybrid retrieval with the rerank off (BM25 + cosine RRF, `MEMORYPILOT_CROSS_RERANK=off`, ~28 ms/query) and the default adaptive cross-encoder rerank (`MEMORYPILOT_CROSS_RERANK=adaptive`, jina-v2-multilingual, fusion weight 0.45, ~900 ms/query, suitable for benchmarks and high-stakes recall). Latencies cover the search call only, with models loaded; MemPalace's figures come from a different question split.
 
 #### By Category (470 questions, adaptive rerank)
 
@@ -143,9 +150,9 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | **Cluster Coherence** | **96.7%** | N/A | N/A |
 | **Multilingual** | **100+ languages** (validated FR R@5 99.1%) | English only | English only |
 | **AAAK Compression** | **5-10x** (no recall loss) | 30x (recall drops to 84.2%) | N/A |
-| **Avg Search Latency** | **~28 ms** default / ~410 ms adaptive | N/A | ~80 ms |
-| **Binary Size** | **35 MB** | ~500 MB (Python+ChromaDB) | 1.5 GB |
-| **Dependencies** | 0 (single binary, ONNX bundled) | Python + ChromaDB + SQLite | Python + ONNX |
+| **Avg Search Latency** | **~28 ms** rerank off / ~410 ms adaptive (default) | N/A | ~80 ms |
+| **Install size** | 35 MB binary + ~530 MB of models downloaded on first run | ~500 MB (Python+ChromaDB) | 1.5 GB |
+| **Dependencies** | none at runtime (single binary, ONNX bundled; models fetched from Hugging Face once) | Python + ChromaDB + SQLite | Python + ONNX |
 
 ---
 
@@ -153,7 +160,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 
 | Feature | MemoryPilot v4.7 | MemPalace v3.3.3 | agentmemory v0.9 | Mem0 | Zep / Graphiti |
 |---------|-----------------|----------------|------------------|------|----------------|
-| LongMemEval R@5 | **99.1%** | 98.4% | 95.2% | 94.4% | 63.8% |
+| LongMemEval | **99.1%** R@5 (v4.2, recall_any) | 98.4% R@5 (held-out split) | 95.2% R@5 | 94.4% QA accuracy (not comparable) | 63.8% QA accuracy (not comparable) |
 | LongMemEval MRR | **94.9%** | not published | 88.2% | not published | not published |
 | Search | Hybrid BM25 + jina-embeddings-v5-nano RRF (768-dim, int8) + adaptive mmarco cross-encoder | ChromaDB cosine (all-MiniLM-L6-v2) | BM25 + vector + graph (RRF) | Vector search (cloud API) | Temporal KG traversal + vector |
 | Embeddings | jina-embeddings-v5-text-nano-retrieval (100+ languages, 8k context, local ONNX) | all-MiniLM-L6-v2 (English only) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) | OpenAI / cloud LLM extraction |
@@ -631,7 +638,7 @@ config             — key/value store
 | Binary size | 35 MB |
 | Startup (`open_at`) | 1-2 ms (ANN warm-up runs in background) |
 | Startup (`open_at_warm`) | 50-200 ms on 10 k memories (ANN hydrated synchronously, deterministic search from query #1) |
-| Search default fast (BM25 + RRF) | ~28 ms avg on LongMemEval-S |
+| Search with rerank off (BM25 + RRF) | ~28 ms avg on LongMemEval-S (v4.2, search call only) |
 | Search adaptive cross-encoder | ~210 ms avg on `--benchmark-fr` (R@5 99.1%, MRR 97.4%; v4.4 was 230 ms / R@5 70.6% / MRR 65%, v4.3 415 ms / R@5 60% / MRR 57%) |
 | Concurrency p95 (4 clients × 20 queries, 500 memories, adaptive) | 229 ms |
 | `add_memory` latency | <1 ms (lazy embed) |
@@ -715,7 +722,7 @@ MEMORYPILOT_CROSS_RERANK_WEIGHT=0.70 MemoryPilot --benchmark-longmemeval benchma
 MEMORYPILOT_RERANKER_MODEL=bge-v2-m3 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json  # swap the model
 ```
 
-Supported model shortcuts: `jina-v2-multilingual` (default), `bge-v2-m3`, `bge-base`, and `jina-v1`. Validated full-run results on the 470 evaluable LongMemEval-S questions: default fast mode reaches **98.7% R@5**, **95.1% NDCG@10**, **93.6% MRR**, ~28 ms average search latency; adaptive mode reaches **99.1% R@5**, **96.0% NDCG@10**, **94.9% MRR**, ~900 ms average search latency. The deterministic French benchmark (`--benchmark-fr`) is the canonical regression test for any multilingual change — variance is bounded to ±1 pp R@5 across runs.
+Supported model shortcuts: `jina-v2-multilingual` (default), `bge-v2-m3`, `bge-base`, and `jina-v1`. Validated full-run results on the 470 evaluable LongMemEval-S questions (v4.2, session-level recall_any): with the rerank off, **98.7% R@5**, **95.1% NDCG@10**, **93.6% MRR**, ~28 ms average search latency; adaptive mode reaches **99.1% R@5**, **96.0% NDCG@10**, **94.9% MRR**, ~900 ms average search latency. The deterministic French benchmark (`--benchmark-fr`) is the canonical regression test for any multilingual change — variance is bounded to ±1 pp R@5 across runs.
 
 ## Storage
 
