@@ -192,7 +192,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Confidence scoring | Embedding similarity | LLM-based merge |
 | HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
-| MCP tools | 41 tools | 29 tools | **51 tools** | N/A | Limited MCP server |
+| MCP tools | 41 tools | 29 tools | **65 tools** | N/A | Limited MCP server |
 | Hooks / event capture | SessionStart auto-recall + Stop auto-ingest for **Cursor, Claude Code and Codex** (incremental, distilled, agent narration filtered, secrets redacted) + file watcher | No | **12 named hooks** (Claude Code, Cursor, Codex, Copilot CLI…) | No | No |
 | Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |
 | Language | Rust (single binary, zero deps) | Python (pip install) | TypeScript / Node (npm install) | SaaS | Python + Neo4j |
@@ -287,7 +287,7 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
-## Unreleased
+## What's new in v4.13
 
 - **Conversation finder** (`find_conversation`, `read_conversation`): "the Gina comparison for MemoryPilot sorting" finds the conversation where it happened, whichever tool it was in. The index lives in its own database (`~/.MemoryPilot/conversations.db`, never mixed with memories), is read-only on the sources, and syncs incrementally (a few seconds at most, before a search). It keeps each request and the final answer of each turn, not the agent's progress notes: 703 conversations, 26,000 messages and 110 MB (vectors included) for 120 GB of Cursor history. On 22 real questions asked from memory, the right conversation comes first for 77% of them and in the top 3 for all of them (MRR 0.87, 150 ms median); words alone reach 91% in the top 3 in 26 ms. `--index-conversations`, `--find-conversation "<query>"`, `--benchmark-conversations <file>`.
 
@@ -383,7 +383,7 @@ Not updated automatically: Homebrew installs (`brew upgrade memorypilot`), binar
 ```bash
 # Via Cargo, pinned to a release tag — works anywhere Rust runs
 # (unsigned on macOS: Keychain prompt after each update if you store credentials):
-cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.12.0 --bin MemoryPilot
+cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.13.0 --bin MemoryPilot
 
 # Local clone + auto-config (same installer, run from inside the repo):
 git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && ./install.sh

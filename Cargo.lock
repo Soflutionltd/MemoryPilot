@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "MemoryPilot"
-version = "4.12.0"
+version = "4.13.0"
 dependencies = [
  "chacha20poly1305",
  "chrono",
@@ -1653,7 +1653,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memorypilot-core"
-version = "4.12.0"
+version = "4.13.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "memorypilot-server"
-version = "4.12.0"
+version = "4.13.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
