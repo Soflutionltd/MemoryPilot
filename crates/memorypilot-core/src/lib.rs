@@ -6,6 +6,7 @@ pub mod ann;
 pub mod chunker;
 pub mod code_chunker;
 pub mod connectors;
+pub mod conversations;
 pub mod db;
 pub mod diversity;
 pub mod embedding;
