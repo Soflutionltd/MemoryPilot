@@ -405,7 +405,7 @@ fn all_tool_definitions() -> Value {
                     "conversation_id": { "type": "string" },
                     "message_id": { "type": ["integer","null"] },
                     "offset": { "type": "integer", "default": 0, "minimum": 0 },
-                    "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 }
+                    "limit": { "type": "integer", "default": 6, "minimum": 1, "maximum": 50 }
                 },
                 "required": ["conversation_id"]
             }

@@ -211,7 +211,24 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
         "next_offset": has_more.then_some(offset + limit),
         "related_memories": related_memories,
     });
-    tool_result(&serde_json::to_string_pretty(&body).unwrap_or_default())
+    tool_result(&compact_json(body))
+}
+
+/// Results go straight into the agent's context: no indentation, no
+/// empty fields.
+fn compact_json(mut value: Value) -> String {
+    fn prune(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.retain(|k, v| k == "next_offset" || !(v.is_null() || v.as_array().is_some_and(Vec::is_empty)));
+                map.values_mut().for_each(prune);
+            }
+            Value::Array(items) => items.iter_mut().for_each(prune),
+            _ => {}
+        }
+    }
+    prune(&mut value);
+    serde_json::to_string(&value).unwrap_or_default()
 }
 
 pub fn handle_read_conversation(args: &Value) -> Value {
@@ -220,16 +237,17 @@ pub fn handle_read_conversation(args: &Value) -> Value {
     };
     let message_id = args.get("message_id").and_then(Value::as_i64);
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20).clamp(1, 100) as usize;
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(6).clamp(1, 50) as usize;
     let store = match ConversationStore::open_default() {
         Ok(store) => store,
         Err(error) => return tool_error(&error),
     };
     match store.read(conversation_id, message_id, offset, limit) {
-        Ok((messages, next_offset)) => tool_result(
-            &serde_json::to_string_pretty(&json!({ "messages": messages, "next_offset": next_offset }))
-                .unwrap_or_default(),
-        ),
+        Ok((messages, _)) if messages.is_empty() && offset == 0 => tool_error(&format!(
+            "No conversation {}: pass the full conversation_id returned by find_conversation",
+            conversation_id
+        )),
+        Ok((messages, next_offset)) => tool_result(&compact_json(json!({ "messages": messages, "next_offset": next_offset }))),
         Err(error) => tool_error(&error),
     }
 }
