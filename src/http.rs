@@ -125,6 +125,23 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
         actual_port
     );
 
+    // Requests being served: an installed update restarts the server in
+    // place only when none is in progress.
+    static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    struct InFlight;
+    impl InFlight {
+        fn enter() -> Self {
+            IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    crate::update::spawn_idle_restarter(|| IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) == 0);
+
     let num_workers = 4;
     let mut handles = Vec::new();
     for i in 0..num_workers {
@@ -136,6 +153,7 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
                 Err(e) => { eprintln!("[HTTP worker {}] DB open failed: {}", i, e); return; }
             };
             for mut request in srv.incoming_requests() {
+                let _in_flight = InFlight::enter();
                 let url = request.url().to_string();
                 let origin = request.headers().iter()
                     .find(|h| h.field.equiv("Origin"))
@@ -165,6 +183,7 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
                 };
                 let response = add_cors_headers(response, origin.as_deref());
                 let _ = request.respond(response);
+                crate::update::mark_healthy();
             }
         }));
     }

@@ -1,0 +1,14 @@
+{
+  "assets": {
+    "MemoryPilot-aarch64-apple-darwin.tar.gz": "26ce1a1580f693873b6268fef54c5f0d0607f2896cad02ce2894c0c899a11575",
+    "MemoryPilot-aarch64-unknown-linux-gnu.tar.gz": "3515a2650f41bd9d92452612f93c911e6b6302bc895e6a0acbe23a751898d3ae",
+    "MemoryPilot-x86_64-unknown-linux-gnu.tar.gz": "300d051341afc8275b156035dc0452a085941feaaa476b400a30f3d227f60728"
+  },
+  "paused": false,
+  "published_at": 1790000000,
+  "rollout": {
+    "full_at": 1790086400,
+    "percent": 10
+  },
+  "version": "9.0.0"
+}
