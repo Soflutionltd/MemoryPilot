@@ -360,14 +360,14 @@ If no pre-built binary is available for your platform, it falls back to `cargo b
 
 ### Automatic updates
 
-A running server (stdio or `--http`) looks for a new release 2 minutes after it starts, then every 6 hours. Apart from the first model download, this is the only network call MemoryPilot makes on its own: one HTTPS request to `github.com` for the release manifest, carrying no identifier, then the archive when there is a new version. When there is one:
+A running server (stdio or `--http`) looks for a new release 2 minutes after it starts, then every 6 hours. Apart from the first model download, this is the only network call MemoryPilot makes on its own: two small HTTPS requests to `github.com` for the release manifest and its signature, carrying no identifier, then the archive when there is a new version. When there is one:
 
 1. The manifest must carry a valid minisign signature from the key compiled into the binary, and the archive must match the SHA-256 the manifest lists. On macOS the new binary must also be signed by Developer ID team `TB8CC687M3`, and on every platform it must answer `--version` with the expected version.
 2. The database is copied (`VACUUM INTO`) to `~/.MemoryPilot/backups/memory-before-v<version>.db` (mode 600, the two latest copies kept), and the new binary opens a second copy with its schema upgrades (`--self-test`). Any failure stops the update and nothing is replaced.
-3. The binary is replaced atomically; the previous one stays next to it as `MemoryPilot.old`. Each running server switches to the new version in place the next time it has been idle for a second: the IDE keeps its connection, there is nothing to restart.
+3. The binary is replaced atomically; the previous one stays next to it as `MemoryPilot.old`. Each running server switches to the new version in place as soon as it is idle (a second without a request over stdio, a few seconds over HTTP): the IDE keeps its connection, there is nothing to restart.
 4. If the new version fails to start three times, the previous binary is put back and that version is skipped. The database is not rolled back automatically, because other servers may have it open: the copy from step 2 is there to restore by hand.
 
-Releases roll out progressively: first to a share of installations (chosen from a random id kept in `~/.MemoryPilot/update/install-id`, never sent), then to everyone after a delay, and a rollout can be paused. `MemoryPilot update` installs the latest release now; `MemoryPilot update --check` only reports it.
+Releases roll out progressively: first to a share of installations (chosen from a random id kept in `~/.MemoryPilot/update/install-id`, never sent), then to everyone after a delay, and a rollout can be paused. `MemoryPilot update` installs the latest release now, rollout and skipped versions aside; `MemoryPilot update --check` only reports it.
 
 Not updated automatically: Homebrew installs (`brew upgrade memorypilot`), binaries inside a cargo `target/` directory, debug builds, platforms without a release binary (Intel Macs, Windows), and any server started with `MEMORYPILOT_AUTO_UPDATE=0`. A binary installed with `cargo install` moves to the signed release binary at its first update. Installations of v4.11.0 or older do not have the updater yet: update them once by hand (`install.sh` again, or `brew upgrade`).
 
