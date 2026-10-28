@@ -48,6 +48,23 @@ impl Database {
         Ok(db)
     }
 
+    /// Opens the database at `path`, applies this version's schema
+    /// upgrades and counts the memories, without loading a model or the
+    /// ANN index. The updater runs it with the new binary on a copy of the
+    /// user's database before switching binaries (`--self-test`).
+    pub fn check_schema_at(path: &Path) -> Result<usize, String> {
+        let db = Self::open_maintenance(path)?;
+        db.init_schema()?;
+        db.upgrade_schema()?;
+        db.normalize_project_identities()?;
+        db.migrate_fts_to_stemmed()?;
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .map_err(|error| format!("count memories: {}", error))?;
+        usize::try_from(count).map_err(|_| format!("invalid memory count {}", count))
+    }
+
     /// A second handle on the same database for background maintenance
     /// (episodic rollup). One writer connection, one reader, no ANN
     /// index, none of the startup work `open_at` does — cheap enough to

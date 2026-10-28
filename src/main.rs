@@ -7,6 +7,7 @@ mod hooks;
 mod http;
 mod protocol;
 mod tools;
+mod update;
 mod watcher;
 
 use memorypilot_core::{
@@ -31,6 +32,24 @@ fn main() {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("update") {
+        let check_only = args.iter().any(|a| a == "--check");
+        std::process::exit(update::run_cli(check_only));
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--self-test") {
+        let Some(path) = args.get(pos + 1) else {
+            eprintln!("✗ --self-test needs a database path");
+            std::process::exit(2);
+        };
+        match db::Database::check_schema_at(std::path::Path::new(path)) {
+            Ok(count) => println!("MemoryPilot self-test ok ({} memories)", count),
+            Err(e) => {
+                eprintln!("✗ self-test: {}", e);
+                std::process::exit(1);
+            }
+        }
         return;
     }
     if let Some(pos) = args.iter().position(|a| a == "--hook") {
@@ -248,10 +267,14 @@ fn main() {
                 .get(pos + 1)
                 .and_then(|v| v.parse::<u16>().ok())
                 .unwrap_or(7437);
+            update::startup_guard();
+            update::spawn_background();
             run_http_server(port);
             return;
         }
     }
+    update::startup_guard();
+    update::spawn_background();
     run_mcp_server();
 }
 
@@ -281,34 +304,95 @@ fn run_mcp_server() {
             eprintln!("[MemoryPilot] FTS index repaired ({} orphan rows removed, {} missing added).", removed, added);
         }
     }
-    let db_arc = std::sync::Arc::new(db);
+    serve_stdio(&db);
+    update::mark_clean_exit();
+}
 
+/// One JSON-RPC message per line on stdin, one response per line on stdout.
+/// Once stdin has been quiet for a second with nothing buffered, a freshly
+/// installed binary takes over in place: the server answers requests
+/// without session state, so the client does not notice.
+#[cfg(unix)]
+fn serve_stdio(db: &db::Database) {
+    use std::os::fd::AsFd;
+    let input = match io::stdin().as_fd().try_clone_to_owned() {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(e) => {
+            eprintln!("[MemoryPilot] stdin: {}", e);
+            return;
+        }
+    };
+    let mut input = io::BufReader::new(input);
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut line = String::new();
+    loop {
+        if input.buffer().is_empty() && !input_ready(input.get_ref()) {
+            if update::restart_pending() {
+                let _ = out.flush();
+                update::restart();
+            }
+            continue;
+        }
+        line.clear();
+        match input.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => answer_line(db, &line, &mut out),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn serve_stdio(db: &db::Database) {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) if !l.trim().is_empty() => l,
-            Ok(_) => continue,
+        match line {
+            Ok(line) => answer_line(db, &line, &mut out),
             Err(_) => break,
-        };
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = JsonRpcResponse::error(None, -32700, format!("Parse: {}", e));
-                let _ = writeln!(out, "{}", serde_json::to_string(&resp).unwrap());
-                let _ = out.flush();
-                continue;
-            }
-        };
-        if request.id.is_none() {
-            // JSON-RPC notification — no response expected
-            let _ = handle_request(&db_arc, &request);
-            continue;
         }
-        let response = handle_request(&db_arc, &request);
-        let _ = writeln!(out, "{}", serde_json::to_string(&response).unwrap());
-        let _ = out.flush();
+    }
+}
+
+/// Waits up to a second for input on stdin. An error counts as ready: the
+/// following read reports it.
+#[cfg(unix)]
+fn input_ready(input: &std::fs::File) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    let mut fds = [PollFd::new(input, PollFlags::IN)];
+    let timeout = Timespec { tv_sec: 1, tv_nsec: 0 };
+    !matches!(poll(&mut fds, Some(&timeout)), Ok(0))
+}
+
+fn answer_line(db: &db::Database, line: &str, out: &mut impl Write) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let request: JsonRpcRequest = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(e) => {
+            write_message(out, &JsonRpcResponse::error(None, -32700, format!("Parse: {}", e)));
+            return;
+        }
+    };
+    if request.id.is_none() {
+        // JSON-RPC notification: no response expected
+        let _ = handle_request(db, &request);
+        return;
+    }
+    let response = handle_request(db, &request);
+    write_message(out, &response);
+    update::mark_healthy();
+}
+
+fn write_message(out: &mut impl Write, response: &JsonRpcResponse) {
+    match serde_json::to_string(response) {
+        Ok(text) => {
+            let _ = writeln!(out, "{}", text);
+            let _ = out.flush();
+        }
+        Err(e) => eprintln!("[MemoryPilot] response serialization failed: {}", e),
     }
 }
 
@@ -1074,6 +1158,8 @@ fn print_help() {
     println!("  MemoryPilot --benchmark-concurrency [--clients N] [--queries-per-client N] [--seed-memories N]  Multi-client concurrent search throughput");
     println!("  MemoryPilot --benchmark-latency [--queries N] [--seed-memories N] [--db PATH]  Cold/warm search latency");
     println!("  MemoryPilot --version        Show version");
+    println!("  MemoryPilot update [--check] Install the latest release now (--check: only report it). Servers check by themselves every 6 h; MEMORYPILOT_AUTO_UPDATE=0 turns that off");
+    println!("  MemoryPilot --self-test DB   Open DB with this version's schema upgrades (run by the updater on a copy)");
     println!("  MemoryPilot --help           Show this help");
     println!();
     println!("MCP TOOLS (41):");
