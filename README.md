@@ -287,6 +287,10 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## Unreleased
+
+- **Automatic updates**: a running server installs new releases by itself and switches to them in place when idle, without restarting the IDE. Signed manifest, checksum, Developer ID check on macOS, database backup and a self-test of the new binary before anything is replaced; a version that fails to start three times is rolled back. Progressive rollout, `MemoryPilot update [--check]`, `MEMORYPILOT_AUTO_UPDATE=0` to turn it off. See [Automatic updates](#automatic-updates).
+
 ## What's new in v4.11
 
 - **Jina models only, non-commercial use**: jina-embeddings-v5-text-nano-retrieval and jina-reranker-v2-base-multilingual are the only models (the e5, bge, gte and mmarco options are gone). Both are CC-BY-NC-4.0: see [Models: non-commercial use only](#models-non-commercial-use-only).
@@ -353,6 +357,19 @@ What this does:
 5. Auto-configures every supported IDE / agent it finds — Cursor, Claude Desktop, Claude Code, Codex CLI, Gemini CLI, Windsurf, VS Code, OpenCode, Cline, Roo Code — in a single pass.
 
 If no pre-built binary is available for your platform, it falls back to `cargo build --release --features http` automatically (requires Rust).
+
+### Automatic updates
+
+A running server (stdio or `--http`) looks for a new release 2 minutes after it starts, then every 6 hours. Apart from the first model download, this is the only network call MemoryPilot makes on its own: one HTTPS request to `github.com` for the release manifest, carrying no identifier, then the archive when there is a new version. When there is one:
+
+1. The manifest must carry a valid minisign signature from the key compiled into the binary, and the archive must match the SHA-256 the manifest lists. On macOS the new binary must also be signed by Developer ID team `TB8CC687M3`, and on every platform it must answer `--version` with the expected version.
+2. The database is copied (`VACUUM INTO`) to `~/.MemoryPilot/backups/memory-before-v<version>.db` (mode 600, the two latest copies kept), and the new binary opens a second copy with its schema upgrades (`--self-test`). Any failure stops the update and nothing is replaced.
+3. The binary is replaced atomically; the previous one stays next to it as `MemoryPilot.old`. Each running server switches to the new version in place the next time it has been idle for a second: the IDE keeps its connection, there is nothing to restart.
+4. If the new version fails to start three times, the previous binary is put back and that version is skipped. The database is not rolled back automatically, because other servers may have it open: the copy from step 2 is there to restore by hand.
+
+Releases roll out progressively: first to a share of installations (chosen from a random id kept in `~/.MemoryPilot/update/install-id`, never sent), then to everyone after a delay, and a rollout can be paused. `MemoryPilot update` installs the latest release now; `MemoryPilot update --check` only reports it.
+
+Not updated automatically: Homebrew installs (`brew upgrade memorypilot`), binaries inside a cargo `target/` directory, debug builds, platforms without a release binary (Intel Macs, Windows), and any server started with `MEMORYPILOT_AUTO_UPDATE=0`. A binary installed with `cargo install` moves to the signed release binary at its first update. Installations of v4.11.0 or older do not have the updater yet: update them once by hand (`install.sh` again, or `brew upgrade`).
 
 ### Alternative paths
 
@@ -557,6 +574,8 @@ MemoryPilot --benchmark-concurrency  # Multi-client concurrency bench (--clients
 MemoryPilot --benchmark-latency      # open_at startup + search latency
 MemoryPilot --http 7437              # Start HTTP REST server (requires --features http)
 MemoryPilot --migrate                # Import v1 JSON data
+MemoryPilot update [--check]         # Install the latest release now (--check: only report it)
+MemoryPilot --self-test DB           # Open DB with this version's schema upgrades (used by the updater on a copy)
 MemoryPilot --version                # Show version
 MemoryPilot --help                   # Show help
 ```
@@ -578,6 +597,7 @@ MemoryPilot --help                   # Show help
 | `MEMORYPILOT_TEMPORAL` | `on` | Query-time date window boost/demotion. `0` disables (date entities are still extracted at ingest). |
 | `MEMORYPILOT_ABSTAIN_COSINE` / `MEMORYPILOT_TRUST_CROSS` | `0.35` / `1.0` | Below the cosine floor a search reports `confidence.abstain = true` unless the cross-encoder logit on the top hit reaches the trust value. |
 | `MEMORYPILOT_READER_NULL_MARGIN` | `0` | Extractive reader: the span logit must beat the model's no-answer logit by this much. Negative values answer more often (`−3` → 92/100 answered, 3/7 abstentions still caught on LongMemEval-S@100). |
+| `MEMORYPILOT_AUTO_UPDATE` | `on` | `0`/`off` stops the server from checking for and installing new releases (see [Automatic updates](#automatic-updates)). `MemoryPilot update` still works by hand. |
 | `MEMORYPILOT_EMBED_MODEL` | `jina` | `jina-embeddings-v5-text-nano-retrieval` int8 (768-dim), the only embedder since v4.11. `jina-q4` = its 4-bit variant (140 MB download, faster queries, about 1 pp lower R@5 and 3 pp lower MRR on FR). The database records which model produced its vectors; a database built with another model is re-embedded once in the background at next start (BM25 keeps answering meanwhile). |
 
 ## HTTP API
