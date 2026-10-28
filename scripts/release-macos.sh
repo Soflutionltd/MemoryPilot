@@ -88,3 +88,12 @@ else
 fi
 
 echo "✓ ${TAG}: signed, notarized, uploaded; Homebrew installs the signed binary"
+
+echo "▸ automatic update manifest"
+PUBLISHED="$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name')"
+if echo "$PUBLISHED" | grep -qx "MemoryPilot-x86_64-unknown-linux-gnu.tar.gz" &&
+	echo "$PUBLISHED" | grep -qx "MemoryPilot-aarch64-unknown-linux-gnu.tar.gz"; then
+	sh scripts/publish-update-manifest.sh "$TAG"
+else
+	echo "  Linux archives not on ${TAG} yet: once CI is done, run scripts/publish-update-manifest.sh ${TAG}"
+fi
