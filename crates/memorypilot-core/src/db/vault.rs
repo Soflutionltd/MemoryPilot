@@ -1621,7 +1621,10 @@ mod tests {
         // clear is a row left by an older version or written with the vault off.
         db.insert_memory(&credential("Admin demo : password: Hx9!kLm2pQ", None), "hash").unwrap();
         assert!(key().is_some());
-        assert_eq!(db.seal_pending_credentials().unwrap(), 0, "sealed on insert");
+        // MEMORYPILOT_VAULT=off (how the test suite runs on a developer Mac)
+        // stores the credential as given; otherwise it is sealed on insert.
+        let left_in_clear = usize::from(vault_disabled());
+        assert_eq!(db.seal_pending_credentials().unwrap(), left_in_clear, "sealed on insert unless the vault is off");
         db.conn
             .execute("UPDATE memories SET content='Admin demo : password: Hx9!kLm2pQ', metadata=NULL WHERE id='c1'", [])
             .unwrap();
