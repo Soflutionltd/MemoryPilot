@@ -6,11 +6,11 @@
 
 <p align="center">
   <strong>The most advanced MCP memory server. Period.</strong><br><br>
-  <sub>Hybrid search (BM25 + jina-embeddings-v5 RRF + cross-encoder rerank) · 100+ languages · Temporal Knowledge Graph · Query-aware ranking · Corpus origin detection · Agent/persona disambiguation · Topic tunnels · AAAK compression (5-10x token savings) · GraphRAG · Chunked RAG · Auto-Compaction · Auto-Classification · Memory Capsules · HTTP API · Single binary · Zero API calls</sub>
+  <sub>Hybrid search (BM25 + jina-embeddings-v5 RRF + cross-encoder rerank) · 100+ languages · Temporal Knowledge Graph · Query-aware ranking · Corpus origin detection · Agent/persona disambiguation · Topic tunnels · AAAK compression (5-10x token savings) · GraphRAG · Chunked RAG · Auto-Compaction · Auto-Classification · Memory Capsules · HTTP API · Signed automatic updates · Single binary · Zero API calls</sub>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/v4.11-latest-green" alt="v4.11"/>
+  <img src="https://img.shields.io/badge/v4.12-latest-green" alt="v4.12"/>
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF_+_cross--encoder-blueviolet" alt="Hybrid RRF + cross-encoder"/>
   <img src="https://img.shields.io/badge/embeddings-jina--embeddings--v5--nano_(768--dim,_int8)-blue" alt="jina-embeddings-v5-text-nano-retrieval"/>
@@ -287,11 +287,12 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
-## Unreleased
+## What's new in v4.12
 
 - **Automatic updates**: a running server installs new releases by itself and switches to them in place when idle, without restarting the IDE. Signed manifest, checksum, Developer ID check on macOS, database backup and a self-test of the new binary before anything is replaced; a version that fails to start three times is rolled back. Progressive rollout, `MemoryPilot update [--check]`, `MEMORYPILOT_AUTO_UPDATE=0` to turn it off. See [Automatic updates](#automatic-updates).
 - **Rerank fusion weight 0.6** (was 0.45): best R@1 and MRR on a 119-question LongMemEval-S sample (R@1 93.3% to 94.1%, MRR 95.6% to 96.1%), French benchmark R@1 96.3% to 97.2%, average search latency within run-to-run noise (703 ms and 724 ms). A non-numeric or non-finite `MEMORYPILOT_CROSS_RERANK_WEIGHT` now falls back to the default instead of producing NaN scores.
 - **`--benchmark-longmemeval` reports R@1 and recall_all@5** (every gold session in the top 5).
+- **Security updates**: h2 (unbounded empty DATA frames), bundled root certificates (distrusted emSign intermediates), crossbeam-epoch, tokio, cxx, rustls, rustls-webpki and openssl moved to their patched releases.
 
 ## What's new in v4.11
 
@@ -378,7 +379,7 @@ Not updated automatically: Homebrew installs (`brew upgrade memorypilot`), binar
 ```bash
 # Via Cargo, pinned to a release tag — works anywhere Rust runs
 # (unsigned on macOS: Keychain prompt after each update if you store credentials):
-cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.11.0 --bin MemoryPilot
+cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.12.0 --bin MemoryPilot
 
 # Local clone + auto-config (same installer, run from inside the repo):
 git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && ./install.sh
@@ -588,7 +589,7 @@ MemoryPilot --help                   # Show help
 |----------|---------|--------|
 | `MEMORYPILOT_CROSS_RERANK` | `adaptive` | `1`/`always` to force rerank on every query, `0`/`off` to disable. Adaptive rerank fires on hard / non-English queries. |
 | `MEMORYPILOT_CROSS_RERANK_TOP_K` | `12` | Number of candidates the cross-encoder rescores. |
-| `MEMORYPILOT_CROSS_RERANK_WEIGHT` | `0.6` | Fusion weight given to the cross-encoder score against the RRF score, bounded to 0-1. Sweep 0.45 / 0.6 / 0.75 / 0.9 / 1.0 (v4.11.1, jina-reranker-v2, 119-question LongMemEval-S sample, Apple M2 Max): 0.6 has the best LongMemEval R@1 (94.1%, 93.3% at 0.45) and MRR (96.1%, 95.6% at 0.45), and raises `--benchmark-fr` R@1 from 96.3% to 97.2%. Higher weights help the French benchmark further but lose LongMemEval questions. |
+| `MEMORYPILOT_CROSS_RERANK_WEIGHT` | `0.6` | Fusion weight given to the cross-encoder score against the RRF score, bounded to 0-1. Sweep 0.45 / 0.6 / 0.75 / 0.9 / 1.0 (v4.12, jina-reranker-v2, 119-question LongMemEval-S sample, Apple M2 Max): 0.6 has the best LongMemEval R@1 (94.1%, 93.3% at 0.45) and MRR (96.1%, 95.6% at 0.45), and raises `--benchmark-fr` R@1 from 96.3% to 97.2%. Higher weights help the French benchmark further but lose LongMemEval questions. |
 | `MEMORYPILOT_RERANK_POOL_SIZE` | `1` | Number of cross-encoder ONNX sessions kept hot. `2` helps only under heavy concurrent load; each extra session costs ~140 MB. |
 | `MEMORYPILOT_EMBED_POOL_SIZE` | `1` | Number of embedding ONNX sessions in the pool. A second jina session adds ~250 MB and only pays off under heavy concurrent writes. |
 | `MEMORYPILOT_EMBED_THREADS` | `min(4, cores)` | ONNX intra-op threads for the embedder. `MEMORYPILOT_RERANK_THREADS` (default `min(2, cores)`) does the same for the cross-encoder. |

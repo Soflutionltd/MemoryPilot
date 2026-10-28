@@ -205,7 +205,7 @@ pub fn rerank_cross_encoder_if_enabled(
 
 /// Fusion ratio between the original RRF score and the cross encoder's
 /// relevance signal, both min-max normalised over the reranked window.
-/// Sweep of 0.45 / 0.6 / 0.75 / 0.9 / 1.0 with jina-reranker-v2 (v4.11.1,
+/// Sweep of 0.45 / 0.6 / 0.75 / 0.9 / 1.0 with jina-reranker-v2 (v4.12,
 /// 119-question LongMemEval-S sample and `--benchmark-fr`): 0.6 gave the
 /// best LongMemEval R@1 (94.1% vs 93.3% at 0.45) and MRR (96.1% vs 95.6%)
 /// and lifted the French R@1 from 96.3% to 97.2%. Higher weights keep
