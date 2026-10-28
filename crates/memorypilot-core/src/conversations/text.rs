@@ -192,7 +192,7 @@ pub struct Reference {
 pub fn extract_references(text: &str) -> Vec<Reference> {
     let mut refs = BTreeSet::new();
     for (index, token) in token_spans(text) {
-        let bare = token.trim_matches(|c: char| "`(),.:;".contains(c));
+        let bare = trim_parentheses(token.trim_matches(|c: char| "`,.:;".contains(c)));
         if is_sha(bare) {
             let preceding: Vec<char> = text[..index].chars().rev().take(24).collect();
             let before: String = preceding.into_iter().rev().collect::<String>().to_lowercase();
@@ -205,6 +205,26 @@ pub fn extract_references(text: &str) -> Vec<Reference> {
         }
     }
     refs.into_iter().collect()
+}
+
+/// Drops the parentheses around a token, keeping the ones that belong to
+/// it, as in a SvelteKit route group `(app)/+layout.svelte`.
+fn trim_parentheses(token: &str) -> &str {
+    let mut token = token;
+    loop {
+        let opens = token.matches('(').count();
+        let closes = token.matches(')').count();
+        let trimmed = if token.starts_with('(') && opens > closes {
+            &token[1..]
+        } else if token.ends_with(')') && closes > opens {
+            &token[..token.len() - 1]
+        } else if token.starts_with('(') && token.ends_with(')') && token.len() >= 2 {
+            &token[1..token.len() - 1]
+        } else {
+            return token.trim_matches(|c: char| "`,.:;".contains(c));
+        };
+        token = trimmed.trim_matches(|c: char| "`,.:;".contains(c));
+    }
 }
 
 fn token_spans(text: &str) -> impl Iterator<Item = (usize, &str)> {
@@ -291,5 +311,13 @@ mod tests {
             value: "apps/web/src/routes/api/reconciliation/invoice/+server.ts".into()
         }));
         assert!(!refs.iter().any(|r| r.value.starts_with("4aa7ce72")));
+    }
+
+    #[test]
+    fn keeps_route_group_parentheses_in_paths() {
+        let refs = extract_references("Voir src/routes/(app)/+layout.svelte (et lib/db.ts).");
+        let files: Vec<&str> = refs.iter().map(|r| r.value.as_str()).collect();
+        assert!(files.contains(&"src/routes/(app)/+layout.svelte"));
+        assert!(files.contains(&"lib/db.ts"));
     }
 }
