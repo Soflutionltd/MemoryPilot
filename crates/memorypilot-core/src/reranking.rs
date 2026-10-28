@@ -176,18 +176,9 @@ pub fn rerank_cross_encoder_if_enabled(
         .fold(f64::NEG_INFINITY, f64::max);
     let original_span = (max_original - min_original).max(0.0001);
 
-    // Fusion ratio between the original RRF score and the cross
-    // encoder's relevance signal. Tunable via env var so callers can
-    // sweep without recompiling. Default 0.55 / 0.45 was the best
-    // operating point in the in-house sweep on memorypilot-fr-v2 and
-    // LongMemEval-S — the previous 0.70 / 0.30 was too conservative
-    // and left several preference / temporal cases on the table where
-    // the cross encoder was clearly more confident than RRF.
-    let cross_weight = std::env::var("MEMORYPILOT_CROSS_RERANK_WEIGHT")
-        .ok()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or(0.45)
-        .clamp(0.0, 1.0);
+    let cross_weight = cross_weight_from(
+        std::env::var("MEMORYPILOT_CROSS_RERANK_WEIGHT").ok().as_deref(),
+    );
     let original_weight = 1.0 - cross_weight;
 
     let mut fused = results.drain(..top_k).collect::<Vec<_>>();
@@ -210,6 +201,23 @@ pub fn rerank_cross_encoder_if_enabled(
     fused.extend(results.drain(..));
     *results = fused;
     Some(best_raw)
+}
+
+/// Fusion ratio between the original RRF score and the cross encoder's
+/// relevance signal, both min-max normalised over the reranked window.
+/// 0.55 / 0.45 was the best operating point in the in-house sweep on
+/// memorypilot-fr-v2 and LongMemEval-S; the previous 0.70 / 0.30 left
+/// preference and temporal cases on the table.
+const DEFAULT_CROSS_WEIGHT: f64 = 0.45;
+
+/// `MEMORYPILOT_CROSS_RERANK_WEIGHT`, bounded to [0, 1]. A value that does
+/// not parse, or is not finite, falls back to the default: a NaN weight
+/// would make every fused score NaN.
+fn cross_weight_from(raw: Option<&str>) -> f64 {
+    raw.and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(DEFAULT_CROSS_WEIGHT)
+        .clamp(0.0, 1.0)
 }
 
 struct CrossScore {
@@ -962,6 +970,20 @@ mod tests {
     fn romance_marker_detection() {
         assert!(looks_non_english("hola que tal"));
         assert!(looks_non_english("danke schön"));
+    }
+
+    #[test]
+    fn cross_weight_default_and_bounds() {
+        assert_eq!(cross_weight_from(None), DEFAULT_CROSS_WEIGHT);
+        assert_eq!(cross_weight_from(Some("")), DEFAULT_CROSS_WEIGHT);
+        assert_eq!(cross_weight_from(Some("abc")), DEFAULT_CROSS_WEIGHT);
+        assert_eq!(cross_weight_from(Some("NaN")), DEFAULT_CROSS_WEIGHT);
+        assert_eq!(cross_weight_from(Some("inf")), DEFAULT_CROSS_WEIGHT);
+        assert_eq!(cross_weight_from(Some(" 0.6 ")), 0.6);
+        assert_eq!(cross_weight_from(Some("0")), 0.0);
+        assert_eq!(cross_weight_from(Some("1")), 1.0);
+        assert_eq!(cross_weight_from(Some("-0.3")), 0.0);
+        assert_eq!(cross_weight_from(Some("1.7")), 1.0);
     }
 
     fn result(id: &str, content: &str, score: f64) -> SearchResult {
