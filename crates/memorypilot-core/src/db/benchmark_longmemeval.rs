@@ -22,6 +22,8 @@ pub struct LongMemEvalOptions {
 struct Outcome {
     question_type: String,
     in_top5: bool,
+    /// Every gold session is in the top-5 (same as `in_top5` with one gold).
+    all_in_top5: bool,
     in_top10: bool,
     best_rank: Option<usize>,
     /// Multi-session only: gold sessions present in the top-10 / total.
@@ -363,6 +365,9 @@ impl Database {
                 |id: &&str| -> bool { answer_session_ids.iter().any(|gold| id.starts_with(gold)) };
 
             let in_top5 = result_ids.iter().take(5).any(matches_gold);
+            let all_in_top5 = answer_session_ids
+                .iter()
+                .all(|gold| result_ids.iter().take(5).any(|id| id.starts_with(gold.as_str())));
             let in_top10 = result_ids.iter().take(10).any(matches_gold);
             let best_rank = result_ids.iter().take(10).position(matches_gold);
             let coverage = if answer_session_ids.len() > 1 {
@@ -414,6 +419,7 @@ impl Database {
             outcomes.push(Outcome {
                 question_type: question_type.to_string(),
                 in_top5,
+                all_in_top5,
                 in_top10,
                 best_rank,
                 coverage,
@@ -441,7 +447,9 @@ impl Database {
 
         let actual_count = outcomes.len().max(1) as f64;
         let pct = |value: f64| (value * 1000.0).round() / 10.0;
+        let hits_r1 = outcomes.iter().filter(|o| o.best_rank == Some(0)).count();
         let hits_r5 = outcomes.iter().filter(|o| o.in_top5).count();
+        let hits_all_r5 = outcomes.iter().filter(|o| o.all_in_top5).count();
         let hits_r10 = outcomes.iter().filter(|o| o.in_top10).count();
         let ndcg_sum: f64 = outcomes
             .iter()
@@ -548,7 +556,9 @@ impl Database {
             "supersede_pass": supersede_pass,
             "mmr_lambda": crate::diversity::lambda(),
             "metrics": {
+                "recall_at_1": format!("{}%", pct(hits_r1 as f64 / actual_count)),
                 "recall_at_5": format!("{}%", pct(hits_r5 as f64 / actual_count)),
+                "recall_all_at_5": format!("{}%", pct(hits_all_r5 as f64 / actual_count)),
                 "recall_at_10": format!("{}%", pct(hits_r10 as f64 / actual_count)),
                 "ndcg_at_10": format!("{}%", pct(ndcg_sum / actual_count)),
                 "mrr": format!("{}%", pct(mrr_sum / actual_count)),

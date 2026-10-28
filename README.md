@@ -287,6 +287,10 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## Unreleased
+
+- **`--benchmark-longmemeval` reports R@1 and recall_all@5** (every gold session in the top 5).
+
 ## What's new in v4.11
 
 - **Jina models only, non-commercial use**: jina-embeddings-v5-text-nano-retrieval and jina-reranker-v2-base-multilingual are the only models (the e5, bge, gte and mmarco options are gone). Both are CC-BY-NC-4.0: see [Models: non-commercial use only](#models-non-commercial-use-only).
