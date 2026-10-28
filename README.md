@@ -287,6 +287,10 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## Unreleased
+
+- **Conversation finder** (`find_conversation`, `read_conversation`): "the Gina comparison for MemoryPilot sorting" finds the conversation where it happened, whichever tool it was in. The index lives in its own database (`~/.MemoryPilot/conversations.db`, never mixed with memories), is read-only on the sources, and syncs incrementally (a few seconds at most, before a search). It keeps each request and the final answer of each turn, not the agent's progress notes: 703 conversations, 26,000 messages and 110 MB (vectors included) for 120 GB of Cursor history. On 22 real questions asked from memory, the right conversation comes first for 77% of them and in the top 3 for all of them (MRR 0.87, 150 ms median); words alone reach 91% in the top 3 in 26 ms. `--index-conversations`, `--find-conversation "<query>"`, `--benchmark-conversations <file>`.
+
 ## What's new in v4.12
 
 - **Automatic updates**: a running server installs new releases by itself and switches to them in place when idle, without restarting the IDE. Signed manifest, checksum, Developer ID check on macOS, database backup and a self-test of the new binary before anything is replaced; a version that fails to start three times is rolled back. Progressive rollout, `MemoryPilot update [--check]`, `MEMORYPILOT_AUTO_UPDATE=0` to turn it off. See [Automatic updates](#automatic-updates).
@@ -483,6 +487,8 @@ MemoryPilot --backfill-force
 | **`get_project_brain`** | Instant project summary (<1500 tokens): tech stack, architecture, bugs, recent changes, components, team members. Supports `compact = true`. |
 | **`search_memory`** | Hybrid BM25 + jina RRF search, boosted by importance, graph links, and file watcher context. Batched triple scoring. |
 | **`get_file_context`** | Memories related to recently modified files in working directory. |
+| **`find_conversation`** | Finds a past conversation from a vague description, across Cursor (every window, sub-agents folded into their conversation), Claude Code and Claude desktop agent sessions. Exact words and stems, misheard words (one or two letters off, split names glued back), and meaning, fused per conversation. Also finds conversations by a commit or a file they mention. Returns the matching message, commits, files and related memories. |
+| **`read_conversation`** | Reads a found conversation, paginated, optionally centred on the matching message. |
 
 ### Memory CRUD
 

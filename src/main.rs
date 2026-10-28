@@ -2,6 +2,7 @@
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
 /// (c) SOFLUTION LTD — Apache 2.0 License
+mod conversations_cli;
 mod hooks;
 #[cfg(feature = "http")]
 mod http;
@@ -65,6 +66,18 @@ fn main() {
         .any(|a| a == "--install-hooks" || a == "--install-cursor-hooks")
     {
         hooks::install_hooks();
+        return;
+    }
+    if args.iter().any(|a| a == "--index-conversations") {
+        conversations_cli::run_index(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--find-conversation") {
+        conversations_cli::run_find(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--benchmark-conversations") {
+        conversations_cli::run_benchmark(&args);
         return;
     }
     if args.iter().any(|a| a == "--migrate") {
