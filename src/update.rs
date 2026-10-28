@@ -46,7 +46,7 @@ const PROBATION: Duration = Duration::from_secs(120);
 const MAX_CRASHED_BOOTS: usize = 3;
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BACKUPS_KEPT: usize = 2;
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 3600);
 
 static EXECUTABLE: OnceLock<Option<Executable>> = OnceLock::new();
 static RESTART_FAILED: AtomicBool = AtomicBool::new(false);
@@ -890,22 +890,32 @@ struct UpdateLock {
 }
 
 impl UpdateLock {
+    /// The lock holds the pid of its owner: it is taken over once that
+    /// process is gone, however long the update took. The age limit only
+    /// covers a lock whose pid is unreadable or was reused.
     fn acquire(dir: &Path) -> Result<Self, String> {
         let path = dir.join("update.lock");
-        let stale = fs::metadata(&path)
+        let too_old = fs::metadata(&path)
             .and_then(|meta| meta.modified())
             .ok()
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > LOCK_STALE_AFTER);
-        if stale {
+        let owner_gone = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .is_some_and(|pid| !process_alive(pid));
+        if too_old || owner_gone {
             let _ = fs::remove_file(&path);
         }
-        fs::OpenOptions::new()
+        let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
-            .map(|_| Self { path })
-            .map_err(|_| "another update is already running".to_string())
+            .map_err(|_| "another update is already running".to_string())?;
+        let lock = Self { path };
+        std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes())
+            .map_err(|error| format!("cannot write {}: {}", lock.path.display(), error))?;
+        Ok(lock)
     }
 }
 
@@ -1034,6 +1044,22 @@ mod tests {
         // A newer version than the one on probation supersedes it.
         assert_eq!(on_boot(&mut other, "4.13.0", 0), BootAction::Continue);
         assert_eq!(other.pending, None);
+    }
+
+    #[test]
+    fn update_lock_is_taken_over_only_from_a_dead_owner() {
+        let dir = PrivateDir::create().unwrap();
+        let lock_path = dir.path.join("update.lock");
+        let held = UpdateLock::acquire(&dir.path).unwrap();
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), std::process::id().to_string());
+        assert!(UpdateLock::acquire(&dir.path).is_err());
+        drop(held);
+        assert!(!lock_path.exists());
+
+        fs::write(&lock_path, "2147483632").unwrap();
+        assert!(UpdateLock::acquire(&dir.path).is_ok());
+        fs::write(&lock_path, "").unwrap();
+        assert!(UpdateLock::acquire(&dir.path).is_err());
     }
 
     #[test]
