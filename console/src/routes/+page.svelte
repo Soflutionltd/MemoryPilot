@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { Api, ApiError, type MemoryRow } from "$lib/api";
-  import { clearSession, loadSession, saveSession, type Session } from "$lib/session.svelte";
+  import { Api, ApiError, type MemoryRow } from "#lib/api.js";
+  import { clearSession, loadSession, saveSession, type Session } from "#lib/session.svelte.js";
 
   let session = $state<Session>(loadSession());
   let signedIn = $state(false);
