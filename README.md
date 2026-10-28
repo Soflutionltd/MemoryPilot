@@ -289,6 +289,7 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 
 ## Unreleased
 
+- **Rerank fusion weight 0.6** (was 0.45): best R@1 and MRR on a 119-question LongMemEval-S sample (R@1 93.3% to 94.1%, MRR 95.6% to 96.1%), French benchmark R@1 96.3% to 97.2%, same latency. A non-numeric or non-finite `MEMORYPILOT_CROSS_RERANK_WEIGHT` now falls back to the default instead of producing NaN scores.
 - **`--benchmark-longmemeval` reports R@1 and recall_all@5** (every gold session in the top 5).
 
 ## What's new in v4.11
@@ -571,7 +572,7 @@ MemoryPilot --help                   # Show help
 |----------|---------|--------|
 | `MEMORYPILOT_CROSS_RERANK` | `adaptive` | `1`/`always` to force rerank on every query, `0`/`off` to disable. Adaptive rerank fires on hard / non-English queries. |
 | `MEMORYPILOT_CROSS_RERANK_TOP_K` | `12` | Number of candidates the cross-encoder rescores. |
-| `MEMORYPILOT_CROSS_RERANK_WEIGHT` | `0.45` | Fusion weight given to the cross-encoder score against the RRF score. Sweep tested 0.20-0.85; 0.45 is the best operating point on `--benchmark-fr` and stays within 0.2 pp R@5 of the optimum on LongMemEval. |
+| `MEMORYPILOT_CROSS_RERANK_WEIGHT` | `0.6` | Fusion weight given to the cross-encoder score against the RRF score, bounded to 0-1. Sweep 0.45 / 0.6 / 0.75 / 0.9 / 1.0 (v4.11.1, jina-reranker-v2, 119-question LongMemEval-S sample, Apple M2 Max): 0.6 has the best LongMemEval R@1 (94.1%, 93.3% at 0.45) and MRR (96.1%, 95.6% at 0.45), and raises `--benchmark-fr` R@1 from 96.3% to 97.2%. Higher weights help the French benchmark further but lose LongMemEval questions. |
 | `MEMORYPILOT_RERANK_POOL_SIZE` | `1` | Number of cross-encoder ONNX sessions kept hot. `2` helps only under heavy concurrent load; each extra session costs ~140 MB. |
 | `MEMORYPILOT_EMBED_POOL_SIZE` | `1` | Number of embedding ONNX sessions in the pool. A second jina session adds ~250 MB and only pays off under heavy concurrent writes. |
 | `MEMORYPILOT_EMBED_THREADS` | `min(4, cores)` | ONNX intra-op threads for the embedder. `MEMORYPILOT_RERANK_THREADS` (default `min(2, cores)`) does the same for the cross-encoder. |

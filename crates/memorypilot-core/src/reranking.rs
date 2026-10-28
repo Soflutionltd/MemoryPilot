@@ -205,10 +205,13 @@ pub fn rerank_cross_encoder_if_enabled(
 
 /// Fusion ratio between the original RRF score and the cross encoder's
 /// relevance signal, both min-max normalised over the reranked window.
-/// 0.55 / 0.45 was the best operating point in the in-house sweep on
-/// memorypilot-fr-v2 and LongMemEval-S; the previous 0.70 / 0.30 left
-/// preference and temporal cases on the table.
-const DEFAULT_CROSS_WEIGHT: f64 = 0.45;
+/// Sweep of 0.45 / 0.6 / 0.75 / 0.9 / 1.0 with jina-reranker-v2 (v4.11.1,
+/// 119-question LongMemEval-S sample and `--benchmark-fr`): 0.6 gave the
+/// best LongMemEval R@1 (94.1% vs 93.3% at 0.45) and MRR (96.1% vs 95.6%)
+/// and lifted the French R@1 from 96.3% to 97.2%. Higher weights keep
+/// improving the French benchmark but lose LongMemEval questions, because
+/// MMR and session fusion run after this step.
+const DEFAULT_CROSS_WEIGHT: f64 = 0.6;
 
 /// `MEMORYPILOT_CROSS_RERANK_WEIGHT`, bounded to [0, 1]. A value that does
 /// not parse, or is not finite, falls back to the default: a NaN weight
@@ -974,6 +977,7 @@ mod tests {
 
     #[test]
     fn cross_weight_default_and_bounds() {
+        assert_eq!(cross_weight_from(None), 0.6);
         assert_eq!(cross_weight_from(None), DEFAULT_CROSS_WEIGHT);
         assert_eq!(cross_weight_from(Some("")), DEFAULT_CROSS_WEIGHT);
         assert_eq!(cross_weight_from(Some("abc")), DEFAULT_CROSS_WEIGHT);
