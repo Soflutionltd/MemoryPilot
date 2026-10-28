@@ -365,9 +365,10 @@ impl Database {
                 |id: &&str| -> bool { answer_session_ids.iter().any(|gold| id.starts_with(gold)) };
 
             let in_top5 = result_ids.iter().take(5).any(matches_gold);
-            let all_in_top5 = answer_session_ids
-                .iter()
-                .all(|gold| result_ids.iter().take(5).any(|id| id.starts_with(gold.as_str())));
+            let all_in_top5 = in_top5
+                && answer_session_ids
+                    .iter()
+                    .all(|gold| result_ids.iter().take(5).any(|id| id.starts_with(gold.as_str())));
             let in_top10 = result_ids.iter().take(10).any(matches_gold);
             let best_rank = result_ids.iter().take(10).position(matches_gold);
             let coverage = if answer_session_ids.len() > 1 {

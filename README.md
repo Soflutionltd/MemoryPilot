@@ -289,7 +289,7 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 
 ## Unreleased
 
-- **Rerank fusion weight 0.6** (was 0.45): best R@1 and MRR on a 119-question LongMemEval-S sample (R@1 93.3% to 94.1%, MRR 95.6% to 96.1%), French benchmark R@1 96.3% to 97.2%, same latency. A non-numeric or non-finite `MEMORYPILOT_CROSS_RERANK_WEIGHT` now falls back to the default instead of producing NaN scores.
+- **Rerank fusion weight 0.6** (was 0.45): best R@1 and MRR on a 119-question LongMemEval-S sample (R@1 93.3% to 94.1%, MRR 95.6% to 96.1%), French benchmark R@1 96.3% to 97.2%, average search latency within run-to-run noise (703 ms and 724 ms). A non-numeric or non-finite `MEMORYPILOT_CROSS_RERANK_WEIGHT` now falls back to the default instead of producing NaN scores.
 - **`--benchmark-longmemeval` reports R@1 and recall_all@5** (every gold session in the top 5).
 
 ## What's new in v4.11
