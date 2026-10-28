@@ -6,9 +6,9 @@
 /// output). It is the strongest sub-300M multilingual retrieval encoder
 /// available today and beats multilingual-e5-small by a wide margin on
 /// MMTEB — especially on French queries, which is where MemoryPilot's
-/// users live. Licence: CC-BY-NC-4.0; the model is downloaded straight
-/// from Jina's Hugging Face repository at first run, MemoryPilot does not
-/// redistribute it.
+/// users live. Licence: CC-BY-NC-4.0 (non-commercial use only); the model
+/// is downloaded straight from Jina's Hugging Face repository at first
+/// run, MemoryPilot does not redistribute it.
 ///
 /// The jina model is driven by `ort` directly (not through fastembed):
 /// fastembed only knows CLS/mean pooling and loads "bring your own"
@@ -17,10 +17,10 @@
 /// from file (external-data friendly), pick the pre-pooled output and
 /// cap the intra-op threads so the server stays a good citizen.
 ///
-/// The legacy fastembed models remain selectable via
-/// `MEMORYPILOT_EMBED_MODEL` (`e5-small`, `e5-base`, `e5-large`,
-/// `bge-m3`) for users who need an Apache-2.0 encoder; `jina-q4`
-/// selects the 4-bit jina variant (~140 MB) for constrained machines.
+/// Only the jina models are supported. `MEMORYPILOT_EMBED_MODEL=jina-q4`
+/// selects the 4-bit variant (~140 MB) for constrained machines; any
+/// other value falls back to the int8 default (a database built with an
+/// older model is re-embedded once, see `Database::sync_embedding_model`).
 ///
 /// Stored embeddings are int8-quantized (4-byte scale + N i8 bytes,
 /// 4× smaller than f32). The on-disk blob length is `4 + dim`. The
@@ -59,37 +59,11 @@ const JINA_TOKEN_BUDGET: usize = 512;
 enum SelectedModel {
     JinaV5Nano,
     JinaV5NanoQ4,
-    E5Large,
-    E5Base,
-    E5Small,
-    BGEM3,
 }
 
 impl SelectedModel {
     fn dim(self) -> usize {
-        match self {
-            SelectedModel::E5Large | SelectedModel::BGEM3 => 1024,
-            SelectedModel::JinaV5Nano | SelectedModel::JinaV5NanoQ4 | SelectedModel::E5Base => {
-                768
-            }
-            SelectedModel::E5Small => 384,
-        }
-    }
-
-    fn is_jina(self) -> bool {
-        matches!(self, SelectedModel::JinaV5Nano | SelectedModel::JinaV5NanoQ4)
-    }
-
-    fn fastembed(self) -> fastembed::EmbeddingModel {
-        match self {
-            SelectedModel::E5Large => fastembed::EmbeddingModel::MultilingualE5Large,
-            SelectedModel::E5Base => fastembed::EmbeddingModel::MultilingualE5Base,
-            SelectedModel::E5Small => fastembed::EmbeddingModel::MultilingualE5Small,
-            SelectedModel::BGEM3 => fastembed::EmbeddingModel::BGEM3,
-            SelectedModel::JinaV5Nano | SelectedModel::JinaV5NanoQ4 => {
-                unreachable!("jina models are served by the ort engine")
-            }
-        }
+        768
     }
 
     /// ONNX graph file inside the jina repository. Both variants ship
@@ -99,7 +73,6 @@ impl SelectedModel {
         match self {
             SelectedModel::JinaV5Nano => "onnx/model_quantized.onnx",
             SelectedModel::JinaV5NanoQ4 => "onnx/model_q4.onnx",
-            _ => unreachable!("not a jina model"),
         }
     }
 
@@ -111,10 +84,6 @@ impl SelectedModel {
         match self {
             SelectedModel::JinaV5Nano => "jina-embeddings-v5-text-nano-retrieval int8, 768-dim",
             SelectedModel::JinaV5NanoQ4 => "jina-embeddings-v5-text-nano-retrieval q4, 768-dim",
-            SelectedModel::E5Large => "multilingual-e5-large, 1024-dim",
-            SelectedModel::E5Base => "multilingual-e5-base, 768-dim",
-            SelectedModel::E5Small => "multilingual-e5-small, 384-dim",
-            SelectedModel::BGEM3 => "BGE-M3, 1024-dim",
         }
     }
 }
@@ -122,31 +91,22 @@ impl SelectedModel {
 fn selected_model() -> SelectedModel {
     static CACHED: OnceLock<SelectedModel> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        match std::env::var("MEMORYPILOT_EMBED_MODEL")
+        let requested = std::env::var("MEMORYPILOT_EMBED_MODEL")
             .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("e5-large") | Some("multilingual-e5-large") | Some("large") => {
-                SelectedModel::E5Large
-            }
-            Some("e5-base") | Some("multilingual-e5-base") | Some("base") => SelectedModel::E5Base,
-            Some("e5-small") | Some("multilingual-e5-small") | Some("small") => {
-                SelectedModel::E5Small
-            }
-            Some("bge-m3") | Some("bgem3") | Some("baai/bge-m3") => SelectedModel::BGEM3,
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        match requested.as_deref() {
             Some("jina-q4") | Some("jina-nano-q4") | Some("light") | Some("lite") => {
                 SelectedModel::JinaV5NanoQ4
             }
-            // Default: jina-embeddings-v5-text-nano-retrieval, int8.
-            // Best-in-class multilingual recall for its size, ~250 MB
-            // download, one ONNX session ≈ 400 MB resident. `quality`
-            // and `max` used to select BGE-M3 (2 GB download, 1.4 GB
-            // resident); jina-nano now outranks it on MMTEB retrieval at
-            // a fraction of the footprint, so they map here too.
-            _ => SelectedModel::JinaV5Nano,
+            None | Some("jina") | Some("jina-nano") | Some("jina-v5") | Some("default") => SelectedModel::JinaV5Nano,
+            Some(other) => {
+                eprintln!(
+                    "[MemoryPilot] MEMORYPILOT_EMBED_MODEL={} is no longer supported: only the jina models are. Using jina-embeddings-v5-text-nano-retrieval int8.",
+                    other
+                );
+                SelectedModel::JinaV5Nano
+            }
         }
     })
 }
@@ -356,16 +316,12 @@ impl OrtEmbedder {
 // ─── Engine pool ────────────────────────────────────
 
 enum Engine {
-    Fastembed(fastembed::TextEmbedding),
     Ort(OrtEmbedder),
 }
 
 impl Engine {
     fn embed(&mut self, texts: Vec<String>) -> Vec<Vec<f32>> {
         match self {
-            Engine::Fastembed(model) => model
-                .embed(texts, None)
-                .expect("fastembed embed failed"),
             Engine::Ort(model) => model
                 .embed(&texts)
                 .unwrap_or_else(|error| panic!("[MemoryPilot] jina embed failed: {}", error)),
@@ -384,44 +340,23 @@ impl Engine {
 /// Default pool size is **1**: one jina session is ~250 MB resident and
 /// embedding is a short burst, so a second session buys throughput only
 /// under heavy concurrent writes — users who want that opt in (capped
-/// at 8 to keep memory predictable). The legacy fastembed models keep
-/// their historical defaults (4, or 2 for the 1024-dim models).
+/// at 8 to keep memory predictable). 
 static EMBED_POOL: OnceLock<crate::pool::IdlePool<Engine>> = OnceLock::new();
 
 fn build_engine() -> Engine {
     let model = selected_model();
-    if model.is_jina() {
-        return Engine::Ort(OrtEmbedder::load(model).unwrap_or_else(|error| {
-            panic!(
-                "[MemoryPilot] jina embedding init failed ({}): {} — cannot start without embedding engine",
-                model.label(),
-                error
-            )
-        }));
-    }
-    let opts = fastembed::TextInitOptions::new(model.fastembed())
-        .with_show_download_progress(true)
-        .with_cache_dir(fastembed_cache_dir())
-        .with_intra_threads(intra_threads());
-    Engine::Fastembed(fastembed::TextEmbedding::try_new(opts).unwrap_or_else(|error| {
+    Engine::Ort(OrtEmbedder::load(model).unwrap_or_else(|error| {
         panic!(
-            "[MemoryPilot] fastembed init failed for model {:?}: {} — \
-             cannot start without embedding engine",
-            model, error
+            "[MemoryPilot] jina embedding init failed ({}): {} — cannot start without embedding engine",
+            model.label(),
+            error
         )
     }))
 }
 
 fn embed_pool() -> &'static crate::pool::IdlePool<Engine> {
     let pool = EMBED_POOL.get_or_init(|| {
-        let model = selected_model();
-        let default_pool = if model.is_jina() {
-            1
-        } else if vector_dim() >= 1024 {
-            2
-        } else {
-            4
-        };
+        let default_pool = 1;
         let pool_size = std::env::var("MEMORYPILOT_EMBED_POOL_SIZE")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
@@ -456,18 +391,12 @@ pub fn release_freed_memory() {
 
 /// Text actually fed to the encoder. The jina retrieval model is
 /// asymmetric: queries and documents carry different prefixes, and
-/// skipping them costs several points of recall. The fastembed models
-/// are used exactly as before (no prefix) so their stored vectors stay
-/// valid.
+/// skipping them costs several points of recall.
 fn with_prefix(text: &str, prefix: &str) -> String {
-    if selected_model().is_jina() {
-        let mut prefixed = String::with_capacity(prefix.len() + text.len());
-        prefixed.push_str(prefix);
-        prefixed.push_str(text);
-        prefixed
-    } else {
-        text.to_string()
-    }
+    let mut prefixed = String::with_capacity(prefix.len() + text.len());
+    prefixed.push_str(prefix);
+    prefixed.push_str(text);
+    prefixed
 }
 
 fn embed_prefixed(texts: Vec<String>) -> Vec<Vec<f32>> {
@@ -496,15 +425,10 @@ pub fn embed_text(text: &str) -> Vec<f32> {
 /// Downloads the active model's files into the cache (Docker image, first
 /// boot). Does not run inference.
 pub fn prefetch() -> Result<(), String> {
-    let model = selected_model();
-    if model.is_jina() {
-        let onnx = model.jina_onnx_file();
-        hf_file(JINA_REPO, onnx, true)?;
-        hf_file(JINA_REPO, &format!("{}_data", onnx), true)?;
-        hf_file(JINA_REPO, "tokenizer.json", true)?;
-        return Ok(());
-    }
-    let _ = embed_batch(&["prefetch"]);
+    let onnx = selected_model().jina_onnx_file();
+    hf_file(JINA_REPO, onnx, true)?;
+    hf_file(JINA_REPO, &format!("{}_data", onnx), true)?;
+    hf_file(JINA_REPO, "tokenizer.json", true)?;
     Ok(())
 }
 

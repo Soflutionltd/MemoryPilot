@@ -222,12 +222,10 @@ enum CrossRerankerState {
     Unavailable(String),
 }
 
-/// A loaded cross-encoder. The default mmarco model is driven through
-/// `ort` directly; the legacy fastembed rerankers stay available behind
-/// `MEMORYPILOT_RERANKER_MODEL`.
+/// A loaded cross-encoder: jina-reranker-v2-base-multilingual, driven
+/// through `ort` directly.
 enum Reranker {
     Ort(OrtReranker),
-    Fastembed(fastembed::TextRerank),
 }
 
 impl Reranker {
@@ -241,18 +239,6 @@ impl Reranker {
                     None
                 }
             },
-            Reranker::Fastembed(model) => {
-                let results = model
-                    .rerank(query.to_string(), documents, false, Some(16))
-                    .ok()?;
-                let mut scores = vec![0.0f32; documents.len()];
-                for result in results {
-                    if let Some(slot) = scores.get_mut(result.index) {
-                        *slot = result.score;
-                    }
-                }
-                Some(scores)
-            }
         }
     }
 }
@@ -562,8 +548,7 @@ fn looks_non_english(query: &str) -> bool {
 }
 
 /// Pool of cross-encoder model instances. Each instance owns its own
-/// ONNX session (~120 MB resident for the default int8
-/// mmarco-mMiniLMv2, ~1.1 GB for the legacy jina-v2-multilingual-base),
+/// ONNX session (the int8 jina-reranker-v2 is memory-mapped, 280 MB on disk),
 /// so the default pool size is intentionally small (1). Throughput-bound
 /// workloads can opt in to 2 via `MEMORYPILOT_RERANK_POOL_SIZE=2`.
 /// Sessions are built on first use and released after
@@ -623,46 +608,20 @@ pub fn warmup_cross_reranker() {
     drop(warmed);
 }
 
-/// Default cross-encoder: `mmarco-mMiniLMv2-L12-H384-v1` (Apache-2.0,
-/// 14 languages incl. French, trained on mMARCO), dynamically quantized
-/// to int8 — 118 MB on disk, ~250 MB resident. It replaces
-/// jina-reranker-v2-base-multilingual (1.1 GB) as the default, for a
-/// rerank of 12 candidates in ~100 ms instead of ~200 ms. Its quality on
-/// short memory snippets is on par: the cross-encoder only refines the
-/// top of an already good hybrid list.
-///
-/// Why this export and not the official `cross-encoder/…/onnx/*qint8*`
-/// files: those are QDQ-format graphs whose 250k-row embedding table
-/// ONNX Runtime materialises in fp32 at load — measured +306 MB after
-/// load and +552 MB after a few runs, versus +118 MB / +249 MB for the
-/// dynamic-quantization export below, which keeps the table int8.
-const MMARCO: OrtRerankerSpec = OrtRerankerSpec {
-    repo: "SugoLabs/mmarco-mMiniLMv2-L12-H384-v1",
-    onnx_file: "onnx/model_quantized.onnx",
-    label: "mmarco-mMiniLMv2-L12-H384-v1 int8",
-};
-
-/// `jina-reranker-v2-base-multilingual` (278M params, CC-BY-NC-4.0) as
-/// the int8 export shipped in the official repository: 280 MB on disk,
-/// memory-mapped. Opt in with `MEMORYPILOT_RERANKER_MODEL=jina-v2`.
+/// The cross-encoder: `jina-reranker-v2-base-multilingual` (278M params,
+/// 100+ languages, CC-BY-NC-4.0: non-commercial use only) as the int8
+/// export shipped in the official repository: 280 MB on disk,
+/// memory-mapped. It is the model the published LongMemEval figures were
+/// measured with. Downloaded from Jina's Hugging Face repository at first
+/// use, never redistributed.
 const JINA_V2_INT8: OrtRerankerSpec = OrtRerankerSpec {
     repo: "jinaai/jina-reranker-v2-base-multilingual",
     onnx_file: "onnx/model_int8.onnx",
     label: "jina-reranker-v2-base-multilingual int8",
 };
 
-/// `gte-multilingual-reranker-base` (306M params, Apache-2.0), int8
-/// export from onnx-community: 341 MB on disk, memory-mapped. Opt in
-/// with `MEMORYPILOT_RERANKER_MODEL=gte-multilingual`.
-const GTE_MULTILINGUAL_INT8: OrtRerankerSpec = OrtRerankerSpec {
-    repo: "onnx-community/gte-multilingual-reranker-base",
-    onnx_file: "onnx/model_int8.onnx",
-    label: "gte-multilingual-reranker-base int8",
-};
-
 enum RerankerChoice {
     Ort(OrtRerankerSpec),
-    Fastembed(fastembed::RerankerModel),
 }
 
 fn init_cross_reranker() -> CrossRerankerState {
@@ -670,20 +629,6 @@ fn init_cross_reranker() -> CrossRerankerState {
         RerankerChoice::Ort(spec) => OrtReranker::load(spec)
             .map(Reranker::Ort)
             .map_err(|error| format!("{} init: {}", spec.label, error)),
-        RerankerChoice::Fastembed(model) => {
-            let cache_dir = dirs::home_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".fastembed_cache")
-                .join("rerank");
-            let _ = std::fs::create_dir_all(&cache_dir);
-            let options = fastembed::RerankInitOptions::new(model)
-                .with_show_download_progress(false)
-                .with_cache_dir(cache_dir)
-                .with_intra_threads(rerank_intra_threads());
-            fastembed::TextRerank::try_new(options)
-                .map(Reranker::Fastembed)
-                .map_err(|error| error.to_string())
-        }
     };
     match result {
         Ok(model) => CrossRerankerState::Ready(model),
@@ -705,32 +650,18 @@ fn rerank_intra_threads() -> usize {
 }
 
 fn cross_reranker_model() -> RerankerChoice {
-    match std::env::var("MEMORYPILOT_RERANKER_MODEL")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "bge-base" | "bge-reranker-base" | "baai/bge-reranker-base" => {
-            RerankerChoice::Fastembed(fastembed::RerankerModel::BGERerankerBase)
-        }
-        "bge-v2-m3" | "rozgo/bge-reranker-v2-m3" => {
-            RerankerChoice::Fastembed(fastembed::RerankerModel::BGERerankerV2M3)
-        }
-        "jina-v1" | "jinaai/jina-reranker-v1-turbo-en" => {
-            RerankerChoice::Fastembed(fastembed::RerankerModel::JINARerankerV1TurboEn)
-        }
-        "jina-v2-multilingual-fp32" => {
-            RerankerChoice::Fastembed(fastembed::RerankerModel::JINARerankerV2BaseMultiligual)
-        }
-        "jina-v2" | "jina-v2-multilingual" | "jinaai/jina-reranker-v2-base-multilingual" => {
-            RerankerChoice::Ort(JINA_V2_INT8)
-        }
-        "gte" | "gte-multilingual" | "alibaba-nlp/gte-multilingual-reranker-base" => {
-            RerankerChoice::Ort(GTE_MULTILINGUAL_INT8)
-        }
-        _ => RerankerChoice::Ort(MMARCO),
+    let requested = std::env::var("MEMORYPILOT_RERANKER_MODEL").unwrap_or_default();
+    let requested = requested.trim().to_ascii_lowercase();
+    if !matches!(
+        requested.as_str(),
+        "" | "jina" | "jina-v2" | "jina-v2-multilingual" | "jinaai/jina-reranker-v2-base-multilingual"
+    ) {
+        eprintln!(
+            "[MemoryPilot] MEMORYPILOT_RERANKER_MODEL={} is no longer supported: only jina-reranker-v2-base-multilingual is.",
+            requested
+        );
     }
+    RerankerChoice::Ort(JINA_V2_INT8)
 }
 
 fn truncate_document(content: &str) -> String {
@@ -917,9 +848,9 @@ mod tests {
     /// the relevant snippet first. Run with `--nocapture` to read the
     /// numbers.
     #[test]
-    fn mmarco_ort_reranker_scores_and_footprint() {
+    fn jina_ort_reranker_scores_and_footprint() {
         let before = rss_mb();
-        let mut model = OrtReranker::load(MMARCO).expect("mmarco load");
+        let mut model = OrtReranker::load(JINA_V2_INT8).expect("jina reranker load");
         let loaded = rss_mb();
         let query = "comment publier un post Instagram depuis Sociomator";
         let mut docs: Vec<String> = (0..11)
@@ -943,7 +874,7 @@ mod tests {
         let long_ms = started.elapsed().as_millis() / 3;
         let after_long = rss_mb();
         eprintln!(
-            "[mmarco probe] load +{:.0} MB, after 5 short reranks +{:.0} MB, after 3 long reranks +{:.0} MB ({} ms each, total {:.0} MB)",
+            "[jina reranker probe] load +{:.0} MB, after 5 short reranks +{:.0} MB, after 3 long reranks +{:.0} MB ({} ms each, total {:.0} MB)",
             loaded - before,
             after - before,
             after_long - before,

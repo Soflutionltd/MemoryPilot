@@ -492,9 +492,9 @@ mod tests {
         .expect("jina tokenizer.json")
     }
 
-    fn mmarco_tokenizer_json() -> std::path::PathBuf {
-        crate::embedding::hf_file("SugoLabs/mmarco-mMiniLMv2-L12-H384-v1", "tokenizer.json", false)
-            .expect("mmarco tokenizer.json")
+    fn xlmr_tokenizer_json() -> std::path::PathBuf {
+        crate::embedding::hf_file("jinaai/jina-reranker-v2-base-multilingual", "tokenizer.json", false)
+            .expect("jina reranker tokenizer.json")
     }
 
     #[test]
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn unigram_matches_tokenizers_crate_on_pairs() {
-        let path = mmarco_tokenizer_json();
+        let path = xlmr_tokenizer_json();
         let ours = Unigram::from_file(&path).expect("load");
         let mut reference = tokenizers::Tokenizer::from_file(&path).expect("reference");
         reference

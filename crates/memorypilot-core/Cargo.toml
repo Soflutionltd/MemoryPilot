@@ -14,14 +14,12 @@ rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
-fastembed = { version = "7.0.1", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
-# Pinned to the exact `ort` release fastembed 7.0.1 links against: two
-# `ort-sys` versions in one binary would fail to link (duplicate symbols).
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "api-24"] }
+# ONNX Runtime, driven directly for the jina embedder and reranker.
+# Pinned: a newer release candidate is an API change.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "api-24", "download-binaries", "tls-native"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
 # Lean tokenizers (src/tokenizer.rs): tiktoken's rank BPE for jina, a
-# hand-rolled Unigram for XLM-R. The `tokenizers` crate (pulled in by
-# fastembed for the legacy models) costs 205 MB + 330 MB resident for
+# hand-rolled Unigram for XLM-R. The `tokenizers` crate costs 205 MB + 330 MB resident for
 # these two vocabularies; this pair costs ~65 MB for identical output.
 tiktoken-rs = { version = "0.12", default-features = false }
 rustc-hash = "2"
