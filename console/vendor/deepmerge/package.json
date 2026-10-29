@@ -1,0 +1,12 @@
+{
+  "name": "deepmerge",
+  "version": "4.3.1-soflution.1",
+  "description": "deepmerge 4.3.1 with the fix for GHSA-gcqx-w48m-w2h4 (upstream unmaintained, no patched release)",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "license.txt"],
+  "scripts": {
+    "test": "node --test test.cjs"
+  }
+}
