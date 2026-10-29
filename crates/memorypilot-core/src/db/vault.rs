@@ -541,6 +541,17 @@ fn is_package_spec(core: &str) -> bool {
         && version.chars().all(|c| c.is_ascii_alphanumeric() || ".-+".contains(c))
 }
 
+/// A GitHub security advisory id (`GHSA-gcqx-w48m-w2h4`): three groups of four
+/// characters from GitHub's fixed alphabet.
+fn is_advisory_id(core: &str) -> bool {
+    let Some(groups) = core.strip_prefix("GHSA-") else { return false };
+    let groups: Vec<&str> = groups.split('-').collect();
+    groups.len() == 3
+        && groups
+            .iter()
+            .all(|group| group.len() == 4 && group.chars().all(|c| "23456789cfghjmpqrvwx".contains(c)))
+}
+
 fn is_file_name(core: &str) -> bool {
     core.rsplit_once('.')
         .is_some_and(|(stem, extension)| !stem.is_empty() && FILE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
@@ -708,6 +719,7 @@ pub(crate) fn looks_secret(token: &str) -> bool {
         || is_quantity(core)
         || is_metric(core)
         || is_package_spec(core)
+        || is_advisory_id(core)
         || is_file_name(core)
         || PUBLIC_ID_PREFIXES.iter().any(|prefix| core.starts_with(prefix))
     {
@@ -1724,6 +1736,7 @@ mod tests {
             format!("Bindings: AUTH_KV (id {hex}), WAF (ruleset {hex})"),
             "Coords : email [402,519] · mot de passe 402,519 · bouton [402,600]".to_string(),
             "Header x-apikey='env:cegid_loop' ou x-apikey='key:cegid_loop' lu au runtime".to_string(),
+            "deepmerge (GHSA-gcqx-w48m-w2h4, low) et @hono/node-server (GHSA-rmxm-3fg6-px4f) corrigés".to_string(),
         ];
         for note in &notes {
             assert!(!contains_secret_value(note), "false positive: {}", note);
