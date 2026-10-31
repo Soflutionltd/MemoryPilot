@@ -19,6 +19,7 @@ pub mod onnx_external;
 pub mod pool;
 pub mod reader;
 pub mod reranking;
+pub mod secrets;
 pub mod session_capsule;
 pub mod session_export;
 pub mod session_fusion;

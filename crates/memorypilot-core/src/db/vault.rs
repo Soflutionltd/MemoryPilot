@@ -28,6 +28,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::params;
 
 use super::{queue_embedding_job, Database, Memory};
+use crate::secrets::made_of_words;
 
 pub const SEAL_PREFIX: &str = "🔒 ";
 const KEYCHAIN_SERVICE: &str = "MemoryPilot";
@@ -555,51 +556,6 @@ fn is_advisory_id(core: &str) -> bool {
 fn is_file_name(core: &str) -> bool {
     core.rsplit_once('.')
         .is_some_and(|(stem, extension)| !stem.is_empty() && FILE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
-}
-
-/// Splits capitalised words, each optionally followed by digits (`OnlystParrains`,
-/// `Qwen3Attention`, `buildStripeCheckoutUrl2024`), into (words, letters); a number
-/// gives (0, 0). None when the part does not follow this pattern, as random keys
-/// do within a few characters.
-fn camel_words(part: &str) -> Option<(usize, usize)> {
-    let chars: Vec<char> = part.chars().collect();
-    if chars.is_empty() {
-        return None;
-    }
-    if chars.iter().all(|c| c.is_ascii_digit()) {
-        return Some((0, 0));
-    }
-    let (mut words, mut letters, mut index) = (0, 0, 0);
-    while index < chars.len() {
-        if chars[index].is_ascii_uppercase() {
-            index += 1;
-        } else if index > 0 {
-            return None;
-        }
-        let start = index;
-        while index < chars.len() && chars[index].is_ascii_lowercase() {
-            index += 1;
-        }
-        if index == start {
-            return None;
-        }
-        words += 1;
-        letters += index - start + usize::from(start > 0 && chars[start - 1].is_ascii_uppercase());
-        while index < chars.len() && chars[index].is_ascii_digit() {
-            index += 1;
-        }
-    }
-    Some((words, letters))
-}
-
-/// Real words average three letters or more; `AbCdEf12GhIj` does not.
-fn made_of_words<'a>(parts: impl IntoIterator<Item = &'a str>) -> bool {
-    let mut total = (0, 0);
-    for part in parts {
-        let Some((words, letters)) = camel_words(part) else { return false };
-        total = (total.0 + words, total.1 + letters);
-    }
-    total.1 >= 3 * total.0
 }
 
 /// Lowercase words of a label, split on punctuation and camelCase (`(zoneId` -> zone, id).

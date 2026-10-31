@@ -39,6 +39,30 @@ pub fn run_index(args: &[String]) {
     }
 }
 
+/// `--redact-conversations [--apply]`: masks the secrets already in the
+/// index. Without `--apply` only counts; no value is ever printed.
+pub fn run_redact(args: &[String]) {
+    let apply = args.iter().any(|a| a == "--apply");
+    let mut store = open_store();
+    match store.redact_stored_secrets(apply) {
+        Ok(report) => {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            println!(
+                "{} : {} segment(s) et {} titre(s) dans {} conversation(s){}.",
+                if apply { "Appliqué" } else { "À blanc (--apply pour écrire)" },
+                report.segments,
+                report.titles,
+                report.conversations,
+                if apply && report.segments > 0 { ", segments remis en file pour les embeddings" } else { "" }
+            );
+        }
+        Err(error) => {
+            eprintln!("✗ {}", error);
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `--find-conversation "<query>" [--limit N]`
 pub fn run_find(args: &[String]) {
     let Some(query) = value_after(args, "--find-conversation") else {

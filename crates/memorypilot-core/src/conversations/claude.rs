@@ -231,4 +231,28 @@ mod tests {
         assert_eq!(session.messages[1].text, "Elle est payée sur Revolut.");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn glued_token_is_masked_when_indexed() {
+        let dir = std::env::temp_dir().join(format!("mp-claude-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("def.jsonl");
+        let token = format!("ghp_{}", crate::secrets::tests::fake(36, 70));
+        let line = serde_json::json!({
+            "type": "user", "uuid": "u1", "sessionId": "s2", "cwd": "/Users/x/Cursor/App/Konta",
+            "timestamp": "2026-10-28T10:00:00Z",
+            "message": { "content": format!("Lance le push avec GITHUB_TOKEN=ghp_{}", &token[4..]) }
+        });
+        std::fs::write(&path, format!("{}\n", line)).unwrap();
+        let session = read_session(&SessionFile { path, version: "1".into() }, &HashMap::new()).unwrap();
+        let mut store = super::super::ConversationStore::open(&dir.join("conversations.db")).unwrap();
+        store.apply(&session.conversation, true, &session.messages, &[]).unwrap();
+        let text: String = store
+            .conn
+            .query_row("SELECT text FROM segments WHERE role = 'user'", [], |row| row.get(0))
+            .unwrap();
+        assert!(!text.contains(&token));
+        assert!(text.ends_with(&format!("GITHUB_TOKEN={}", crate::secrets::mask("github_token", &token))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

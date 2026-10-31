@@ -230,6 +230,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn fts_hits(store: &ConversationStore, phrase: &str) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM segments_fts WHERE segments_fts MATCH ?1",
+                [format!("\"{}\"", phrase)],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn secrets_are_masked_before_storage_and_search() {
+        let (mut store, dir) = temp_store("secrets");
+        let classic = format!("ghp_{}", crate::secrets::tests::fake(36, 60));
+        let fine_grained = format!("github_pat_{}", crate::secrets::tests::fake(59, 61));
+        let mut conversation = payload(vec![
+            message("m1", "user", 1, &format!("Configure le CI avec token={} stp", classic)),
+            message(
+                "m2",
+                "assistant",
+                2,
+                &format!("C'est fait, le secret GH_TOKEN vaut maintenant {} dans le dépôt.", fine_grained),
+            ),
+        ]);
+        conversation["title"] = json!(format!("Token {}", classic));
+        ingest(&mut store, &parse(&conversation).unwrap()).unwrap();
+
+        let texts: Vec<String> = {
+            let mut statement = store.conn.prepare("SELECT text FROM segments").unwrap();
+            statement.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        let title: String = store.conn.query_row("SELECT title FROM conversations", [], |row| row.get(0)).unwrap();
+        for value in [&classic, &fine_grained] {
+            assert!(texts.iter().chain([&title]).all(|text| !text.contains(value.as_str())));
+            assert_eq!(fts_hits(&store, value), 0);
+        }
+        let all = texts.join("\n");
+        assert!(all.contains(&crate::secrets::mask("github_token", &classic)));
+        assert!(all.contains(&crate::secrets::mask("github_pat", &fine_grained)));
+        assert!(title.contains(&crate::secrets::mask("github_token", &classic)));
+        assert!(fts_hits(&store, "Configure le CI") > 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn rejects_invalid_input_before_writing() {
         let mut bad_tool = payload(vec![]);

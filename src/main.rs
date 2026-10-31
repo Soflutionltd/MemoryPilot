@@ -72,6 +72,10 @@ fn main() {
         conversations_cli::run_index(&args);
         return;
     }
+    if args.iter().any(|a| a == "--redact-conversations") {
+        conversations_cli::run_redact(&args);
+        return;
+    }
     if args.iter().any(|a| a == "--find-conversation") {
         conversations_cli::run_find(&args);
         return;
@@ -1161,6 +1165,7 @@ fn print_help() {
     println!("  MemoryPilot --reseal-recovered [--apply]  Re-encrypt with the current key credentials recovered in clear (JSON id → text on stdin), each checked against its label");
     println!("  MemoryPilot --sync-1password [--apply]  Point every credential to 1Password (Soflution vault), creating missing items; back up the vault key");
     println!("  MemoryPilot --repair-credentials [--apply]  Re-mask leaking labels, reclassify credentials holding no secret");
+    println!("  MemoryPilot --redact-conversations [--apply]  Mask secrets already in the conversation index (counts only without --apply)");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop auto-ingest");
     println!("  MemoryPilot --hook session-start|stop  (called by Cursor, JSON on stdin)");

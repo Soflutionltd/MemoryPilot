@@ -5,6 +5,7 @@
 
 use super::text::{self, Reference};
 use super::{Message, Role, SourceConversation};
+use crate::secrets;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -129,6 +130,13 @@ impl ConversationStore {
         messages: &[Message],
         seen: &[u64],
     ) -> Result<usize, String> {
+        // Every source (Cursor, Claude Code, importers) lands here: secrets
+        // are masked before anything is hashed, indexed or embedded.
+        let redacted = SourceConversation {
+            title: source.title.as_deref().map(|title| secrets::redact(title).into_owned()),
+            ..source.clone()
+        };
+        let source = &redacted;
         let tx = self.conn.transaction().map_err(|error| format!("Sync transaction: {}", error))?;
         if is_main {
             tx.execute(
@@ -179,7 +187,7 @@ impl ConversationStore {
         let mut answer: Option<&Message> = None;
         let flush = |tx: &rusqlite::Transaction, turn: &Option<String>, answer: Option<&Message>| -> Result<usize, String> {
             let Some(message) = answer else { return Ok(0) };
-            let body = text::truncate_chars(message.text.trim(), text::MAX_ANSWER_CHARS);
+            let body = text::truncate_chars(secrets::redact(message.text.trim()).trim(), text::MAX_ANSWER_CHARS);
             if body.chars().count() < MIN_ASSISTANT_CHARS {
                 return Ok(0);
             }
@@ -193,7 +201,7 @@ impl ConversationStore {
                 Role::User => {
                     written += flush(&tx, &current_turn, answer.take())?;
                     let key = format!("{}:{}:{}", source.tool, source.origin_id, message.key);
-                    let body = text::clean_user_text(&message.text);
+                    let body = text::clean_user_text(&secrets::redact(&message.text));
                     if body.chars().count() >= MIN_USER_CHARS {
                         written += upsert_segment(&tx, source, "user", &key, message.at.as_deref(), &body)?;
                     }
@@ -269,6 +277,86 @@ impl ConversationStore {
         tx.commit().map_err(|error| format!("Embedding commit: {}", error))
     }
 
+    /// Masks the secrets already stored (`--redact-conversations`). Without
+    /// `apply` only counts; with it rewrites each touched segment (text,
+    /// hash, FTS row, references) and queues it for a new embedding, and
+    /// masks the titles. Values never leave this function.
+    pub fn redact_stored_secrets(&mut self, apply: bool) -> Result<RedactionReport, String> {
+        let mut report = RedactionReport { applied: apply, ..Default::default() };
+        let mut touched = std::collections::HashSet::new();
+        let count = |report: &mut RedactionReport, text: &str| {
+            for finding in secrets::findings(text) {
+                *report.secrets_by_kind.entry(finding.kind.to_string()).or_default() += 1;
+            }
+        };
+        let segments: Vec<StoredSegment> = {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT s.id, s.conversation_id, s.role, s.text, c.workspace
+                     FROM segments s LEFT JOIN conversations c ON c.id = s.conversation_id",
+                )
+                .map_err(|error| format!("Redaction scan: {}", error))?;
+            let rows = statement
+                .query_map([], |row| -> rusqlite::Result<StoredSegment> {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                })
+                .map_err(|error| format!("Redaction scan: {}", error))?;
+            rows.filter_map(Result::ok)
+                .filter(|(_, _, _, text, _)| !secrets::findings(text).is_empty())
+                .collect()
+        };
+        let titles: Vec<(String, String)> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT id, title FROM conversations WHERE title IS NOT NULL")
+                .map_err(|error| format!("Redaction scan: {}", error))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|error| format!("Redaction scan: {}", error))?;
+            rows.filter_map(Result::ok)
+                .filter(|(_, title): &(String, String)| !secrets::findings(title).is_empty())
+                .collect()
+        };
+        for (_, conversation_id, _, text, _) in &segments {
+            count(&mut report, text);
+            touched.insert(conversation_id.clone());
+        }
+        for (conversation_id, title) in &titles {
+            count(&mut report, title);
+            touched.insert(conversation_id.clone());
+        }
+        report.segments = segments.len();
+        report.titles = titles.len();
+        report.conversations = touched.len();
+        if !apply {
+            return Ok(report);
+        }
+        let tx = self.conn.transaction().map_err(|error| format!("Redaction transaction: {}", error))?;
+        for (id, conversation_id, role, text, workspace) in &segments {
+            let body = secrets::redact(text);
+            tx.execute("DELETE FROM segments_fts WHERE rowid = ?1", [id])
+                .map_err(|error| format!("FTS delete: {}", error))?;
+            tx.execute("DELETE FROM refs WHERE segment_id = ?1", [id])
+                .map_err(|error| format!("Refs delete: {}", error))?;
+            tx.execute(
+                "UPDATE segments SET text = ?2, text_hash = ?3, embed_state = ?4, embedding = NULL WHERE id = ?1",
+                params![id, body, crate::db::content_hash(&body), embed_state(role, &body)],
+            )
+            .map_err(|error| format!("Segment update: {}", error))?;
+            index_segment(&tx, conversation_id, workspace.as_deref(), *id, role, &body)?;
+        }
+        for (conversation_id, title) in &titles {
+            tx.execute(
+                "UPDATE conversations SET title = ?2 WHERE id = ?1",
+                params![conversation_id, secrets::redact(title)],
+            )
+            .map_err(|error| format!("Title update: {}", error))?;
+        }
+        tx.commit().map_err(|error| format!("Redaction commit: {}", error))?;
+        Ok(report)
+    }
+
     pub fn stats(&self) -> Result<HashMap<&'static str, i64>, String> {
         let count = |sql: &str| -> Result<i64, String> {
             self.conn.query_row(sql, [], |row| row.get(0)).map_err(|error| format!("Stats: {}", error))
@@ -281,6 +369,18 @@ impl ConversationStore {
         stats.insert("references", count("SELECT COUNT(*) FROM refs")?);
         Ok(stats)
     }
+}
+
+/// id, conversation id, role, text, workspace of the conversation.
+type StoredSegment = (i64, String, String, String, Option<String>);
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RedactionReport {
+    pub applied: bool,
+    pub segments: usize,
+    pub titles: usize,
+    pub conversations: usize,
+    pub secrets_by_kind: std::collections::BTreeMap<String, usize>,
 }
 
 /// Text given to the encoder: the conversation's title and project in
@@ -321,6 +421,7 @@ fn upsert_segment(
     at: Option<&str>,
     body: &str,
 ) -> Result<usize, String> {
+    let body = &secrets::redact(body);
     let hash = crate::db::content_hash(body);
     let existing: Option<(i64, String)> = tx
         .query_row(
@@ -333,11 +434,7 @@ fn upsert_segment(
     if existing.as_ref().is_some_and(|(_, old)| old == &hash) {
         return Ok(0);
     }
-    let wants_embedding = match role {
-        "assistant" => body.chars().count() >= EMBED_ASSISTANT_CHARS,
-        _ => true,
-    };
-    let embed_state = if wants_embedding { 1 } else { 0 };
+    let embed_state = embed_state(role, body);
     let id = match existing {
         Some((id, _)) => {
             tx.execute("DELETE FROM segments_fts WHERE rowid = ?1", [id])
@@ -361,6 +458,28 @@ fn upsert_segment(
             tx.last_insert_rowid()
         }
     };
+    index_segment(tx, &source.root_id, source.workspace.as_deref(), id, role, body)?;
+    Ok(1)
+}
+
+/// 1: queued for the encoder, 0: never embedded (short agent notes).
+fn embed_state(role: &str, body: &str) -> i64 {
+    match role {
+        "assistant" if body.chars().count() < EMBED_ASSISTANT_CHARS => 0,
+        _ => 1,
+    }
+}
+
+/// Writes the FTS row and the references of a segment whose old ones
+/// were deleted (or never existed).
+fn index_segment(
+    tx: &rusqlite::Transaction,
+    conversation_id: &str,
+    workspace: Option<&str>,
+    id: i64,
+    role: &str,
+    body: &str,
+) -> Result<(), String> {
     let stemmed = crate::stemming::stem_text(body);
     tx.execute(
         "INSERT INTO segments_fts (rowid, body) VALUES (?1, ?2)",
@@ -371,18 +490,18 @@ fn upsert_segment(
     let mut refs: Vec<Reference> = text::extract_references(body);
     refs.extend(project_hints(body).into_iter().map(|value| Reference { kind: "project", value }));
     if role == "title" {
-        if let Some(workspace) = source.workspace.as_deref() {
+        if let Some(workspace) = workspace {
             refs.push(Reference { kind: "project", value: project_name(workspace) });
         }
     }
     for reference in refs {
         tx.execute(
             "INSERT OR IGNORE INTO refs (conversation_id, segment_id, kind, value) VALUES (?1, ?2, ?3, ?4)",
-            params![source.root_id, id, reference.kind, reference.value],
+            params![conversation_id, id, reference.kind, reference.value],
         )
         .map_err(|error| format!("Refs insert: {}", error))?;
     }
-    Ok(1)
+    Ok(())
 }
 
 /// Project folders named in a message (`~/Cursor/App/<Project>/…`), the
@@ -472,6 +591,81 @@ mod tests {
                 ("assistant".to_string(), final_answer.to_string()),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redacts_secrets_stored_before_the_filter() {
+        let dir = std::env::temp_dir().join(format!("mp-conv-redact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("redact.db");
+        let _ = std::fs::remove_file(&path);
+        let mut store = ConversationStore::open(&path).unwrap();
+        let source = SourceConversation {
+            origin_id: "c1".to_string(),
+            root_id: "c1".to_string(),
+            tool: "cursor",
+            title: Some("Déploiement du CI".to_string()),
+            workspace: Some("/Users/x/Cursor/App/Konta".to_string()),
+            created_at: None,
+            version: "1".to_string(),
+            source_path: None,
+        };
+        store
+            .apply(&source, true, &[message("u1", Role::User, 1, "Corrige le déploiement du CI de Konta")], &[])
+            .unwrap();
+        // What an older version stored: the value in clear, indexed.
+        let token = format!("ghp_{}", crate::secrets::tests::fake(36, 80));
+        let leaked = format!("Le push passe avec token={} sur main", token);
+        let id: i64 = store.conn.query_row("SELECT id FROM segments WHERE role = 'user'", [], |row| row.get(0)).unwrap();
+        store.conn.execute("DELETE FROM segments_fts WHERE rowid = ?1", [id]).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE segments SET text = ?2, text_hash = ?3, embed_state = 2, embedding = x'00' WHERE id = ?1",
+                params![id, leaked, crate::db::content_hash(&leaked)],
+            )
+            .unwrap();
+        store.conn.execute("INSERT INTO segments_fts (rowid, body) VALUES (?1, ?2)", params![id, leaked]).unwrap();
+        store.conn.execute("UPDATE conversations SET title = ?1", [format!("CI {}", token)]).unwrap();
+        let hits = |store: &ConversationStore, phrase: &str| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM segments_fts WHERE segments_fts MATCH ?1",
+                    [format!("\"{}\"", phrase)],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        let dry = store.redact_stored_secrets(false).unwrap();
+        assert_eq!((dry.applied, dry.segments, dry.titles, dry.conversations), (false, 1, 1, 1));
+        assert_eq!(dry.secrets_by_kind.get("github_token"), Some(&2));
+        let unchanged: String = store.conn.query_row("SELECT text FROM segments WHERE id = ?1", [id], |row| row.get(0)).unwrap();
+        assert_eq!(unchanged, leaked);
+        assert_eq!(hits(&store, &token), 1);
+
+        let applied = store.redact_stored_secrets(true).unwrap();
+        assert_eq!((applied.applied, applied.segments, applied.titles), (true, 1, 1));
+        let (text, hash, embed_state, embedding): (String, String, i64, Option<Vec<u8>>) = store
+            .conn
+            .query_row("SELECT text, text_hash, embed_state, embedding FROM segments WHERE id = ?1", [id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap();
+        let masked = crate::secrets::mask("github_token", &token);
+        assert_eq!(text, format!("Le push passe avec token={} sur main", masked));
+        assert_eq!(hash, crate::db::content_hash(&text));
+        assert_eq!((embed_state, embedding), (1, None));
+        assert_eq!(hits(&store, &token), 0);
+        assert_eq!(hits(&store, "push passe avec token"), 1);
+        let title: String = store.conn.query_row("SELECT title FROM conversations", [], |row| row.get(0)).unwrap();
+        assert_eq!(title, format!("CI {}", masked));
+
+        let again = store.redact_stored_secrets(true).unwrap();
+        assert_eq!((again.segments, again.titles, again.conversations), (0, 0, 0));
+        assert!(again.secrets_by_kind.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

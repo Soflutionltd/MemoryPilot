@@ -503,61 +503,10 @@ fn extract_tag_contents(text: &str, tag: &str) -> Vec<String> {
     out
 }
 
-/// Redacts tokens that look like credentials before anything reaches the
-/// store: known API-key prefixes, JWTs, IBANs and long high-entropy strings.
+/// Redacts credentials before anything reaches the store: the same
+/// filter as the conversation index (`memorypilot_core::secrets`).
 pub fn redact_secrets(text: &str) -> String {
-    text.split(' ')
-        .map(|word| {
-            let core = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
-            if looks_secret(core) {
-                word.replace(core, "[REDACTED]")
-            } else {
-                word.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn looks_secret(token: &str) -> bool {
-    if token.len() < 16 {
-        return false;
-    }
-    const PREFIXES: [&str; 12] = [
-        "sk-", "sk_live_", "sk_test_", "rk_live_", "ghp_", "gho_", "github_pat_", "xoxb-",
-        "xoxp-", "AKIA", "AIza", "re_",
-    ];
-    if PREFIXES.iter().any(|p| token.starts_with(p)) {
-        return true;
-    }
-    if token.starts_with("eyJ") && token.matches('.').count() >= 2 {
-        return true;
-    }
-    // IBAN: 2 letters, 2 digits, then 11+ alphanumerics.
-    let bytes = token.as_bytes();
-    if token.len() >= 15
-        && token.len() <= 34
-        && bytes[0].is_ascii_uppercase()
-        && bytes[1].is_ascii_uppercase()
-        && bytes[2].is_ascii_digit()
-        && bytes[3].is_ascii_digit()
-        && token[4..].chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-    {
-        return true;
-    }
-    // Long mixed token (letters + digits, no spaces) typical of keys.
-    if token.len() >= 32 && !token.contains('/') && !token.contains('.') {
-        let has_digit = token.chars().any(|c| c.is_ascii_digit());
-        let has_upper = token.chars().any(|c| c.is_ascii_uppercase());
-        let has_lower = token.chars().any(|c| c.is_ascii_lowercase());
-        let alnum = token
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        if alnum && has_digit && has_upper && has_lower {
-            return true;
-        }
-    }
-    false
+    memorypilot_core::secrets::redact(text).into_owned()
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -759,10 +708,15 @@ not json
 
     #[test]
     fn redacts_obvious_secrets() {
-        let out = redact_secrets("clé sk-abcdefghijklmnop1234 et IBAN GB53REVO23012063435124 ok");
-        assert!(!out.contains("sk-abcdef"));
+        let out = redact_secrets("clé sk-aB3xY9kL2mN8pQ4rS7tU1v et IBAN GB53REVO23012063435124 ok");
+        assert!(!out.contains("sk-aB3x"));
         assert!(!out.contains("GB53REVO"));
-        assert!(out.contains("ok"));
+        assert!(out.contains("[secret masqué : openai "));
+        assert!(out.contains("[secret masqué : iban "));
+        assert!(out.ends_with(" ok"));
+        // Glued to `token=` or inside JSON quotes: the old space-only split missed both.
+        let glued = redact_secrets(r#"token=ghp_aB3xY9kL2mN8pQ4rS7tU1vW5zA6bC0dE2fGh {"key":"ghp_aB3xY9kL2mN8pQ4rS7tU1vW5zA6bC0dE2fGh"}"#);
+        assert!(!glued.contains("ghp_aB3x"), "{}", glued);
         assert_eq!(redact_secrets("MemoryPilot est un serveur MCP"), "MemoryPilot est un serveur MCP");
     }
 
