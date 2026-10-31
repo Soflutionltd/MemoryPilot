@@ -1,5 +1,6 @@
 //! Conversation index: finds a past conversation (Cursor, Claude Code,
-//! Claude desktop agent sessions) from a vague, spoken description, and
+//! Claude desktop agent sessions, and claude.ai or Gemini conversations an
+//! importer pushes) from a vague, spoken description, and
 //! the commits, files and projects it touched.
 //!
 //! Sources are read in place and read-only. Messages are indexed as
@@ -8,6 +9,7 @@
 
 pub mod claude;
 pub mod cursor;
+pub mod imported;
 pub mod search;
 pub mod store;
 pub mod text;

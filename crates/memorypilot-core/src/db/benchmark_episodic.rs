@@ -140,6 +140,9 @@ fn run_episodic_bench(db_path: &std::path::Path, sessions: usize) -> Result<Valu
     let mut covered_hits = 0usize;
     let mut fused_hits = 0usize;
     let mut recovered = Vec::new();
+    // Per needle: flat top-5 hit, and each top-3 episode as (score, carries
+    // the needle). Feeds the absolute-floor sweep below.
+    let mut floor_samples: Vec<(bool, Vec<(f64, bool)>)> = Vec::new();
 
     for needle in &needles {
         let flat = db.search(&needle.query, 10, Some(project), None, None, None)?;
@@ -157,6 +160,15 @@ fn run_episodic_bench(db_path: &std::path::Path, sessions: usize) -> Result<Valu
         // them. The needle is answerable if it's in the flat top-5 OR
         // inside the drill-down of one of the top-3 resonant episodes.
         let in_episode = needle_in_top_episodes(&db, &needle.query, project, &needle.memory_id)?;
+        let mut scored = Vec::new();
+        for hit in db.search_episodes(&needle.query, 3, Some(project))? {
+            let carries = db
+                .episode_memories(&hit.episode.id)?
+                .iter()
+                .any(|m| m.id == needle.memory_id);
+            scored.push((hit.score, carries));
+        }
+        floor_samples.push((flat_hit, scored));
         let covered = flat_hit || in_episode;
         if covered {
             covered_hits += 1;
@@ -186,8 +198,11 @@ fn run_episodic_bench(db_path: &std::path::Path, sessions: usize) -> Result<Valu
     let fused_r5 = fused_hits as f64 / total * 100.0;
     let lift = covered_r5 - flat_r5;
 
+    let floor_sweep = absolute_floor_sweep(&floor_samples);
+
     Ok(json!({
         "benchmark": "episodic-scale-v1",
+        "absolute_floor_sweep": floor_sweep,
         "corpus": {
             "sessions": sessions,
             "memories": sessions * 9,
@@ -209,6 +224,59 @@ fn run_episodic_bench(db_path: &std::path::Path, sessions: usize) -> Result<Valu
         "recovered_examples": recovered.into_iter().take(8).collect::<Vec<_>>(),
         "embedding_model": crate::embedding::model_label(),
     }))
+}
+
+/// For each candidate absolute floor (with the production relative floor),
+/// what `recall` would show: coverage@5, episodes per query, and how many
+/// of them miss the needle (noise). Also the score spread of needle-bearing
+/// and other episodes.
+fn absolute_floor_sweep(samples: &[(bool, Vec<(f64, bool)>)]) -> Value {
+    const FLOORS: [f64; 10] = [0.0, 0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7];
+    let total = samples.len().max(1) as f64;
+    let rows: Vec<Value> = FLOORS
+        .iter()
+        .map(|&floor| {
+            let mut covered = 0usize;
+            let mut shown = 0usize;
+            let mut noise = 0usize;
+            for (flat_hit, scored) in samples {
+                let best = scored.iter().map(|(score, _)| *score).fold(0.0, f64::max);
+                let kept: Vec<&(f64, bool)> = scored
+                    .iter()
+                    .filter(|(score, _)| *score >= floor && *score >= best * super::EPISODE_RELATIVE_FLOOR)
+                    .collect();
+                shown += kept.len();
+                noise += kept.iter().filter(|(_, carries)| !carries).count();
+                if *flat_hit || kept.iter().any(|(_, carries)| *carries) {
+                    covered += 1;
+                }
+            }
+            json!({
+                "floor": floor,
+                "coverage_at_5": format!("{:.1}%", covered as f64 / total * 100.0),
+                "episodes_per_query": format!("{:.2}", shown as f64 / total),
+                "off_target_per_query": format!("{:.2}", noise as f64 / total),
+            })
+        })
+        .collect();
+    let spread = |carrying: bool| {
+        let mut scores: Vec<f64> = samples
+            .iter()
+            .flat_map(|(_, scored)| scored.iter())
+            .filter(|(_, carries)| *carries == carrying)
+            .map(|(score, _)| *score)
+            .collect();
+        scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let at = |q: f64| scores.get(((scores.len() as f64 - 1.0) * q).round() as usize).copied();
+        json!({ "count": scores.len(), "min": at(0.0), "p10": at(0.1), "median": at(0.5), "max": at(1.0) })
+    };
+    json!({
+        "relative_floor": super::EPISODE_RELATIVE_FLOOR,
+        "default_absolute_floor": super::DEFAULT_EPISODE_ABSOLUTE_FLOOR,
+        "rows": rows,
+        "needle_episode_scores": spread(true),
+        "other_episode_scores": spread(false),
+    })
 }
 
 /// True if the needle appears in the drill-down of any of the top-3

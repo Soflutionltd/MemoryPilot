@@ -231,6 +231,23 @@ fn compact_json(mut value: Value) -> String {
     serde_json::to_string(&value).unwrap_or_default()
 }
 
+/// `ingest_conversation`: stores a claude.ai or Gemini conversation an
+/// importer pushes. Only messages not received before are written.
+pub fn handle_ingest_conversation(args: &Value) -> Value {
+    let conversation = match conversations::imported::parse(args) {
+        Ok(conversation) => conversation,
+        Err(error) => return tool_error(&error),
+    };
+    let mut store = match ConversationStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return tool_error(&error),
+    };
+    match conversations::imported::ingest(&mut store, &conversation) {
+        Ok(report) => tool_result(&compact_json(json!(report))),
+        Err(error) => tool_error(&error),
+    }
+}
+
 pub fn handle_read_conversation(args: &Value) -> Value {
     let Some(conversation_id) = args.get("conversation_id").and_then(Value::as_str) else {
         return tool_error("conversation_id required");

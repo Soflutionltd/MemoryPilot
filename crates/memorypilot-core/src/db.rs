@@ -107,7 +107,10 @@ use embed_worker::{
 };
 
 #[allow(unused_imports)]
-pub use episodic::{Episode, EpisodeHit, RollupReport};
+pub use episodic::{
+    novel_summary_lines, resonant_episodes, Episode, EpisodeHit, RollupReport,
+    DEFAULT_EPISODE_ABSOLUTE_FLOOR, EPISODE_ABSOLUTE_FLOOR_KEY, EPISODE_RELATIVE_FLOOR,
+};
 pub use consolidate::AUTO_THRESHOLD as AUTO_CONSOLIDATE_THRESHOLD;
 pub use benchmark_longmemeval::LongMemEvalOptions;
 

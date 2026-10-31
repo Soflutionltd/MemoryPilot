@@ -43,6 +43,19 @@ const MIN_INTERVALS_PER_DAY: usize = 2;
 /// Minimum daily episodes in a month before a long-term rollup is created.
 const MIN_DAILIES_PER_MONTH: usize = 2;
 
+/// An episode far below the best hit is mostly noise next to a recall.
+pub const EPISODE_RELATIVE_FLOOR: f64 = 0.75;
+/// Config key of the absolute floor: below it an episode is noise even
+/// when it is the best hit (off-topic queries score 0.29 to 0.38 on the
+/// real corpus, the weakest relevant one 0.55).
+///
+/// The score depends on the embedding model and the reranker: re-measure
+/// it with `MemoryPilot --benchmark-episodic` (absolute_floor_sweep) and
+/// off-topic queries on real data whenever either changes.
+pub const EPISODE_ABSOLUTE_FLOOR_KEY: &str = "episode_absolute_floor";
+/// Default floor, measured on 2026-10-31 with the current models.
+pub const DEFAULT_EPISODE_ABSOLUTE_FLOOR: f64 = 0.45;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Episode {
     pub id: String,
@@ -79,6 +92,51 @@ pub struct RollupReport {
     pub interval_created: usize,
     pub daily_created: usize,
     pub longterm_created: usize,
+}
+
+/// Hits worth showing next to a recall: above `absolute_floor` and close
+/// to the best hit.
+pub fn resonant_episodes(hits: Vec<EpisodeHit>, absolute_floor: f64) -> Vec<EpisodeHit> {
+    let best = hits.iter().map(|hit| hit.score).fold(0.0, f64::max);
+    hits.into_iter()
+        .filter(|hit| hit.score >= absolute_floor && hit.score >= best * EPISODE_RELATIVE_FLOOR)
+        .collect()
+}
+
+/// Summary lines that bring something new: a line goes only when it can
+/// be traced back to its source memories and all of them are in
+/// `known_ids`. A line no source contains stays.
+pub fn novel_summary_lines(
+    summary: &str,
+    sources: &[(String, Vec<String>)],
+    known_ids: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let body = squash_spaces(line.trim_start_matches("- "));
+            let from: Vec<&(String, Vec<String>)> = sources
+                .iter()
+                .filter(|(text, _)| {
+                    // Interval lines are cut from a memory; parent lines are
+                    // a child title followed by its time span.
+                    let text = squash_spaces(text);
+                    !body.is_empty() && !text.is_empty() && (text.contains(&body) || body.starts_with(&text))
+                })
+                .collect();
+            from.is_empty()
+                || !from
+                    .iter()
+                    .all(|(_, ids)| !ids.is_empty() && ids.iter().all(|id| known_ids.contains(id)))
+        })
+        .map(String::from)
+        .collect()
+}
+
+fn squash_spaces(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A raw memory reduced to the fields the rollup needs.
@@ -238,6 +296,55 @@ impl Database {
         });
         hits.truncate(limit);
         Ok(hits)
+    }
+
+    /// The absolute floor from the config, the default when unset or not a
+    /// score between 0 and 1.
+    pub fn episode_absolute_floor(&self) -> f64 {
+        self.get_config(EPISODE_ABSOLUTE_FLOOR_KEY)
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|floor| (0.0..=1.0).contains(floor))
+            .unwrap_or(DEFAULT_EPISODE_ABSOLUTE_FLOOR)
+    }
+
+    /// Top episodes for `query` that are worth showing next to a recall
+    /// ([`resonant_episodes`] with the configured floor).
+    pub fn resonant_episode_hits(
+        &self,
+        query: &str,
+        limit: usize,
+        project: Option<&str>,
+    ) -> Result<Vec<EpisodeHit>, String> {
+        let hits = self.search_episodes(query, limit, project)?;
+        Ok(resonant_episodes(hits, self.episode_absolute_floor()))
+    }
+
+    /// [`novel_summary_lines`] for a stored episode: an interval episode's
+    /// lines come from its raw memories, a parent's from its children's
+    /// titles (each child standing for all of its leaf memories).
+    pub fn episode_novel_lines(
+        &self,
+        episode: &Episode,
+        known_ids: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let sources: Vec<(String, Vec<String>)> = if episode.child_ids.is_empty() {
+            self.episode_memories(&episode.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|memory| (memory.content, vec![memory.id]))
+                .collect()
+        } else {
+            episode
+                .child_ids
+                .iter()
+                .filter_map(|id| self.get_episode(id).ok().flatten())
+                .map(|child| {
+                    let leaves = self.resolve_leaf_source_ids(&child.id, 0).unwrap_or_default();
+                    (child.title, leaves)
+                })
+                .collect()
+        };
+        novel_summary_lines(&episode.summary, &sources, known_ids)
     }
 
     /// Fetch a single episode by id.
@@ -783,4 +890,57 @@ fn significant_terms(query: &str) -> Vec<String> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod novel_lines_tests {
+    use super::novel_summary_lines;
+    use std::collections::HashSet;
+
+    fn ids(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn a_line_goes_only_when_all_its_sources_are_recalled() {
+        let sources = vec![
+            ("Prod OK après le déploiement du 30/10.".to_string(), vec!["m1".to_string()]),
+            ("Tarifs dans src/lib/plans.ts, free 0€.".to_string(), vec!["m2".to_string()]),
+        ];
+        let summary = "- Prod OK après le déploiement du 30/10.\n- Tarifs dans src/lib/plans.ts, free 0€.";
+        assert_eq!(
+            novel_summary_lines(summary, &sources, &ids(&["m2"])),
+            vec!["- Prod OK après le déploiement du 30/10."]
+        );
+    }
+
+    #[test]
+    fn a_short_line_found_in_the_recall_by_chance_stays() {
+        // "Prod OK" also sits in a recalled memory (m9), but this line comes
+        // from m1, which the recall does not carry.
+        let sources = vec![("Prod OK, rien à signaler.".to_string(), vec!["m1".to_string()])];
+        let summary = "- Prod OK";
+        assert!(summary.len() < 40);
+        assert_eq!(novel_summary_lines(summary, &sources, &ids(&["m9"])), vec!["- Prod OK"]);
+    }
+
+    #[test]
+    fn a_line_without_a_traceable_source_stays() {
+        let sources = vec![("Autre chose.".to_string(), vec!["m1".to_string()])];
+        assert_eq!(
+            novel_summary_lines("- Ligne de synthèse", &sources, &ids(&["m1"])),
+            vec!["- Ligne de synthèse"]
+        );
+    }
+
+    #[test]
+    fn a_parent_line_maps_to_its_child_leaves() {
+        let sources = vec![(
+            "Déploiement SendGenius".to_string(),
+            vec!["m1".to_string(), "m2".to_string()],
+        )];
+        let line = "- Déploiement SendGenius (10-30 12:46→12:59)";
+        assert!(novel_summary_lines(line, &sources, &ids(&["m1", "m2"])).is_empty());
+        assert_eq!(novel_summary_lines(line, &sources, &ids(&["m1"])), vec![line]);
+    }
 }

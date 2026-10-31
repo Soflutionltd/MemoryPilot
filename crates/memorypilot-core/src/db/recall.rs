@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// Longest memory text on one compact recall line.
+const COMPACT_LINE_BYTES: usize = 200;
+/// Id prefix shown on a cut line; `get_memory` accepts it.
+const SHORT_ID_LEN: usize = 8;
+
 impl Database {
     pub(super) fn preview_snippet(content: &str) -> String {
         let trimmed = content.trim().replace('\n', " ");
@@ -138,7 +143,14 @@ impl Database {
             "problem" => "PROB",
             _ => "MEM",
         };
-        let truncated = crate::text::preview(&mem.content, 200);
+        let truncated = crate::text::preview_words(&mem.content, COMPACT_LINE_BYTES);
+        // A cut line names its memory, so the agent can fetch the rest
+        // with get_memory.
+        let id_str = if mem.content.len() > COMPACT_LINE_BYTES {
+            format!(" [id:{}]", crate::text::prefix(&mem.id, SHORT_ID_LEN))
+        } else {
+            String::new()
+        };
         let tags_str = if mem.tags.is_empty() {
             String::new()
         } else {
@@ -150,10 +162,11 @@ impl Database {
             .map(|p| format!(" | proj:{}", p))
             .unwrap_or_default();
         format!(
-            "[{}:{}] {}{}{}",
+            "[{}:{}] {}{}{}{}",
             kind_short,
             mem.importance,
             truncated.replace('\n', " "),
+            id_str,
             tags_str,
             proj_str
         )
@@ -175,7 +188,7 @@ impl Database {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let truncated = crate::text::preview(s, 150);
+                let truncated = crate::text::preview_words(s, 150);
                 format!("[{}:{}] {}", tag, i + 1, truncated.replace('\n', " "))
             })
             .collect::<Vec<_>>()
@@ -749,6 +762,20 @@ impl Database {
                 .chain(&patterns)
                 .chain(&decisions),
         );
+        // Ids of the memories this recall shows, so the caller can leave out
+        // what it would repeat (episode lines). Internal: `recall` callers
+        // strip it before answering the agent.
+        let mut memory_ids: Vec<&str> = hint_results
+            .iter()
+            .map(|r| &r.memory)
+            .chain(&critical)
+            .chain(&scope_memories)
+            .chain(&proj_memories)
+            .chain(&prefs)
+            .chain(&patterns)
+            .chain(&decisions)
+            .map(|m| m.id.as_str())
+            .collect();
         if compact {
             let mut lines = Vec::new();
             lines.push(format!(
@@ -816,10 +843,13 @@ impl Database {
                 "project": proj_ref.unwrap_or("none"),
                 "compact": lines.join("\n"),
                 "stats": { "total_memories": total, "projects": projects_count },
+                "memory_ids": memory_ids,
             }));
         }
 
+        memory_ids.extend(pinned_memories.iter().map(|m| m.id.as_str()));
         let mut response = serde_json::json!({
+            "memory_ids": memory_ids,
             "status": "recalled",
             "mode": mode.as_str(),
             "project": proj_ref.unwrap_or("none"),

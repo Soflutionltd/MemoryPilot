@@ -243,6 +243,33 @@ impl Database {
         self.fetch_memory(id)
     }
 
+    /// [`get_memory`](Self::get_memory), also accepting the short id a
+    /// compact recall shows on a cut line (at least 6 characters, unique).
+    pub fn get_memory_by_id_or_prefix(&self, id: &str) -> Result<Option<Memory>, String> {
+        if let Some(memory) = self.fetch_memory(id)? {
+            return Ok(Some(memory));
+        }
+        let is_prefix = (6..36).contains(&id.len())
+            && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+        if !is_prefix {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM memories WHERE id LIKE ?1 || '%' LIMIT 2")
+            .map_err(|e| format!("Prepare: {}", e))?;
+        let matches: Vec<String> = stmt
+            .query_map(params![id], |row| row.get(0))
+            .map_err(|e| format!("Query: {}", e))?
+            .flatten()
+            .collect();
+        match matches.as_slice() {
+            [full] => self.fetch_memory(full),
+            [] => Ok(None),
+            _ => Err(format!("Ambiguous id prefix: {}", id)),
+        }
+    }
+
     // ─── BULK ADD ─────────────────────────────────────
 
     /// Add multiple memories in one call, with dedup per item. Returns (added, merged, skipped).

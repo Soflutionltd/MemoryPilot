@@ -132,6 +132,49 @@ fn episodic_rollup_search_and_drilldown() {
 }
 
 #[test]
+fn episode_floor_drops_off_topic_queries_and_keeps_relevant_ones() {
+    let path = temp_db_path("episode-floor");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let empty_tags: Vec<String> = Vec::new();
+        for content in [
+            "Decided to use Tokio for the async runtime in the ingestion worker.",
+            "Fixed a deadlock between two tokio mutexes in the rollup path.",
+            "Switched the embedding model to BGE-M3 for better multilingual recall.",
+        ] {
+            db.add_memory(content, "decision", Some("MemoryPilot"), &empty_tags, "test", 4, None, None, &MemoryScope::default())
+                .expect("add memory");
+        }
+        db.roll_up_episodes().expect("rollup");
+        assert_eq!(db.episode_absolute_floor(), super::DEFAULT_EPISODE_ABSOLUTE_FLOOR);
+
+        let relevant = db
+            .resonant_episode_hits("tokio async runtime deadlock", 3, Some("MemoryPilot"))
+            .expect("relevant query");
+        assert!(!relevant.is_empty(), "a relevant query keeps its episodes");
+
+        let off_topic = db
+            .resonant_episode_hits("recette de tarte aux pommes", 3, Some("MemoryPilot"))
+            .expect("off-topic query");
+        assert!(
+            off_topic.is_empty(),
+            "an off-topic query returns no episode, got scores {:?}",
+            off_topic.iter().map(|hit| hit.score).collect::<Vec<_>>()
+        );
+
+        // The floor comes from the config; an invalid value falls back.
+        db.set_config(super::EPISODE_ABSOLUTE_FLOOR_KEY, "0").expect("set floor");
+        assert!(!db
+            .resonant_episode_hits("recette de tarte aux pommes", 3, Some("MemoryPilot"))
+            .expect("floor 0")
+            .is_empty());
+        db.set_config(super::EPISODE_ABSOLUTE_FLOOR_KEY, "beaucoup").expect("set floor");
+        assert_eq!(db.episode_absolute_floor(), super::DEFAULT_EPISODE_ABSOLUTE_FLOOR);
+    }
+    cleanup_db_files(&path);
+}
+
+#[test]
 fn normalize_project_identity_merges_case_variants() {
     let path = temp_db_path("normalize-project-identity");
     {

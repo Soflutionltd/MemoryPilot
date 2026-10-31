@@ -25,6 +25,11 @@ const MAX_CONTEXT_CHARS: usize = 8000;
 /// Hard cap on the text sent to the distiller per turn.
 const MAX_INGEST_BYTES: usize = 400_000;
 const STATE_FILE: &str = "cursor-hooks-state.json";
+/// Workspace → time of the last successful session-start injection. McpHub
+/// reads it to skip a second full recall in the same session.
+const INJECTIONS_FILE: &str = "session-hook-injections.json";
+/// Injections older than this are dropped when the file is rewritten.
+const INJECTION_TRACE_TTL_HOURS: i64 = 24;
 const LOG_FILE: &str = "cursor-hooks.log";
 
 fn open_db() -> Result<Database, String> {
@@ -181,6 +186,9 @@ fn session_start_context(payload: &Value) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .unwrap_or_else(|| ctx.to_string());
+            if let Some(workspace) = working_dir.as_deref() {
+                record_injection(workspace);
+            }
             Some(format!(
                 "MemoryPilot (mémoire persistante d'Antoine, chargée automatiquement au démarrage) :\n{}",
                 truncate_chars(&text, MAX_CONTEXT_CHARS)
@@ -190,6 +198,30 @@ fn session_start_context(payload: &Value) -> Option<String> {
             log(&format!("session-start: recall failed: {}", error));
             None
         }
+    }
+}
+
+/// Notes that `workspace` just got the recall. Best effort: a lost trace
+/// only means McpHub recalls once more.
+fn record_injection(workspace: &str) {
+    let path = data_dir().join(INJECTIONS_FILE);
+    let now = chrono::Utc::now();
+    let mut traces = match read_json_or(&path, json!({})) {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    traces.retain(|_, at| {
+        at.as_str()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| now.signed_duration_since(at) < chrono::Duration::hours(INJECTION_TRACE_TTL_HOURS))
+    });
+    traces.insert(
+        workspace.trim_end_matches('/').to_string(),
+        json!(now.to_rfc3339()),
+    );
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, Value::Object(traces).to_string()).is_ok() {
+        let _ = std::fs::rename(tmp, path);
     }
 }
 
