@@ -509,7 +509,7 @@ MemoryPilot --backfill-force
 MemoryPilot --install-hooks
 ```
 
-Installs two hooks in every agent found (existing settings and hooks are kept, a `.bak` is written):
+Installs three hooks in every agent found (`./install.sh` runs it for you) (existing settings and hooks are kept, a `.bak` is written):
 
 | Agent | File | Session start output |
 |---|---|---|
@@ -518,9 +518,46 @@ Installs two hooks in every agent found (existing settings and hooks are kept, a
 | Codex | `~/.codex/hooks.json` | `hookSpecificOutput.additionalContext` |
 
 - **Session start** runs `MemoryPilot --hook session-start --agent <agent>` and injects the compact recall of the opened project.
+- **Session start** also runs `MemoryPilot --sync-agents` in the background (see below). When Cursor runs both its own hook and the Claude Code one, a session is served once.
 - **Stop** runs `MemoryPilot --hook stop --agent <agent>`, answers `{}` immediately and distills, in a detached process, only the transcript lines added since the previous turn. From user messages only what the user typed is kept (Cursor `<user_query>`, Claude Code meta lines skipped), agent narration ("Checking…", "Let me…", "Je vais…") is filtered out, and obvious secrets (API keys, JWTs, IBANs) are redacted before storage.
 
+- **Session end** (`SessionEnd`, Cursor `sessionEnd`) runs `MemoryPilot --hook session-end --agent <agent>`: the same incremental ingest, for the lines the last stop did not cover.
+
 State: `~/.MemoryPilot/cursor-hooks-state.json`. Log: `~/.MemoryPilot/cursor-hooks.log`. Set `MEMORYPILOT_DB=/path/copy.db` to test against a copy.
+
+#### Rules and skills for your agents
+
+`./install.sh` creates an empty `~/.MemoryPilot/agents/` and wires it into your tools. MemoryPilot ships no rules and no skills: write your own, once, for every agent.
+
+```
+~/.MemoryPilot/agents/
+├── rules/AGENTS.md          your rules (starts as an example comment)
+├── skills/<name>/SKILL.md   your skills (Agent Skills format)
+└── vendor/
+```
+
+```bash
+MemoryPilot --setup-agents [--tools claude,cursor,codex,...] [--dry-run]
+MemoryPilot --sync-agents                      # run by the session-start hook
+MemoryPilot --uninstall-agents [--tools codex]  # unwire, your files stay
+```
+
+| Tool | Rules | Skills |
+|---|---|---|
+| Claude Code | `@` import line in `~/.claude/CLAUDE.md` (`CLAUDE_CONFIG_DIR`) | link per skill in `~/.claude/skills/` |
+| Codex | generated block in `~/.codex/AGENTS.md` (`CODEX_HOME`) | `~/.agents/skills/` |
+| Gemini CLI | `@` import line in `~/.gemini/GEMINI.md` (`GEMINI_CLI_HOME`) | `~/.agents/skills/` |
+| Cursor | generated `~/.cursor/rules/agents.mdc` | `~/.agents/skills/` |
+| VS Code Copilot | generated block in `~/.copilot/copilot-instructions.md` | `~/.agents/skills/` |
+| OpenCode | path added to `instructions` in `~/.config/opencode/opencode.json` (`OPENCODE_CONFIG_DIR`) | `~/.agents/skills/` |
+| Cline | link `~/Documents/Cline/Rules/memorypilot-agents.md` | `~/.agents/skills/` |
+| Roo Code | link `~/.roo/rules/memorypilot-agents.md` | `~/.agents/skills/` |
+| Windsurf / Devin | reads `~/.claude/CLAUDE.md` | `~/.agents/skills/` |
+
+- Only detected tools are offered. Interactive `./install.sh` asks which ones (Enter = all); without a terminal, or with `--yes`, only Claude Code is wired unless `--agents-tools=claude,codex` says otherwise. `./install.sh --uninstall-agents [--tools ...]` undoes.
+- Nothing is overwritten: an existing `agents/` folder is left as is, a skill name already taken in a tool is skipped and reported, a `CLAUDE.md` that is a symbolic link is not written (Claude Cowork ignores linked ones).
+- `agents/.manifest.json` records every link, line, block and generated file with its fingerprint. `--sync-agents` writes nothing while AGENTS.md and the skill list are unchanged, never fails (errors go to `~/.MemoryPilot/agents-sync.log`), and leaves hand-edited copies alone. `--uninstall-agents` removes only what the manifest lists and is still unmodified.
+- Claude Desktop (chat) cannot be wired: its rules and skills live in your claude.ai account.
 
 ## Knowledge Graph
 

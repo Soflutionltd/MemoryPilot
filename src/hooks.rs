@@ -9,13 +9,17 @@
 //! only the lines added since the previous turn (anti-pollution, see
 //! `ingest_session_transcript`).
 //!
-//! `MemoryPilot --install-cursor-hooks` : merges both entries into
-//! `~/.cursor/hooks.json`, keeping any hook the user already has.
+//! `MemoryPilot --hook session-end` : the session is over; ingests the lines
+//! the last `stop` did not cover (same incremental ingest).
+//!
+//! `MemoryPilot --install-hooks` : merges the entries into Cursor, Claude Code
+//! and Codex settings, keeping any hook the user already has.
 //!
 //! Hooks must never break Cursor: every failure path prints `{}` and exits 0.
 
 use crate::db::{Database, MemoryScope, RecallMode};
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -31,6 +35,16 @@ const INJECTIONS_FILE: &str = "session-hook-injections.json";
 /// Injections older than this are dropped when the file is rewritten.
 const INJECTION_TRACE_TTL_HOURS: i64 = 24;
 const LOG_FILE: &str = "cursor-hooks.log";
+/// One marker per session id: Cursor also runs the Claude Code hooks, the
+/// second session-start of the same session stands down.
+const SESSION_MARKS_DIR: &str = "session-start-marks";
+/// A same-session start after this delay (resume, compaction) is served again.
+const SESSION_MARK_WINDOW_SECS: u64 = 120;
+/// Marks older than this are swept.
+const SESSION_MARK_TTL_SECS: u64 = 24 * 3600;
+/// Stop and SessionEnd can fire together: ingests of one transcript queue up.
+const INGEST_LOCK_WAIT_SECS: u64 = 120;
+const INGEST_LOCK_STALE_SECS: u64 = 600;
 
 fn open_db() -> Result<Database, String> {
     match std::env::var("MEMORYPILOT_DB") {
@@ -131,6 +145,11 @@ pub fn run_hook(event: &str, args: &[String]) {
     }
     let output = match event {
         "session-start" | "sessionStart" | "SessionStart" => {
+            if !claim_session_start(&data_dir().join(SESSION_MARKS_DIR), &payload) {
+                println!("{}", json!({}));
+                return;
+            }
+            spawn_detached(&["--sync-agents"], "session-start: sync-agents");
             match session_start_context(&payload) {
                 // Cursor: top-level `additional_context`. Claude Code and
                 // Codex: `hookSpecificOutput.additionalContext`.
@@ -144,7 +163,7 @@ pub fn run_hook(event: &str, args: &[String]) {
                 None => json!({}),
             }
         }
-        "stop" | "Stop" => {
+        "stop" | "Stop" | "session-end" | "sessionEnd" | "SessionEnd" => {
             spawn_ingest(&payload);
             json!({})
         }
@@ -154,6 +173,65 @@ pub fn run_hook(event: &str, args: &[String]) {
         }
     };
     println!("{}", output);
+}
+
+fn age_secs(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(modified.elapsed().map(|d| d.as_secs()).unwrap_or(0))
+}
+
+/// True when this hook should serve the session start: no session id, or
+/// the first claim of `session_id` + `source` within the window. The
+/// marker is created atomically, so two hooks firing together cannot both win.
+fn claim_session_start(dir: &Path, payload: &Value) -> bool {
+    let Some(session) = conversation_id(payload) else {
+        return true;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return true;
+    }
+    let source = str_field(payload, "source").unwrap_or_default();
+    let digest = sha2::Sha256::digest(format!("{}|{}", session, source).as_bytes());
+    let name: String = digest.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+    let mark = dir.join(name);
+    let create = || std::fs::OpenOptions::new().write(true).create_new(true).open(&mark).is_ok();
+    if create() {
+        sweep_old_marks(dir);
+        return true;
+    }
+    match age_secs(&mark) {
+        Some(age) if age < SESSION_MARK_WINDOW_SECS => false,
+        _ => std::fs::remove_file(&mark).is_ok() && create(),
+    }
+}
+
+fn sweep_old_marks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if age_secs(&entry.path()).is_some_and(|age| age > SESSION_MARK_TTL_SECS) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Runs `MemoryPilot <args>` detached, without waiting or failing the hook.
+fn spawn_detached(args: &[&str], label: &str) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            log(&format!("{}: current_exe failed: {}", label, error));
+            return;
+        }
+    };
+    let spawned = std::process::Command::new(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Err(error) = spawned {
+        log(&format!("{}: spawn failed: {}", label, error));
+    }
 }
 
 fn session_start_context(payload: &Value) -> Option<String> {
@@ -232,26 +310,39 @@ fn spawn_ingest(payload: &Value) {
     };
     let conversation = conversation_id(payload).unwrap_or_default();
     let root = first_workspace_root(payload).unwrap_or_default();
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            log(&format!("stop: current_exe failed: {}", error));
-            return;
-        }
-    };
-    // Detached child: Cursor gets its answer immediately, the distillation
+    // Detached child: the agent gets its answer immediately, the distillation
     // (embedding model load + dedup) runs in the background.
-    let spawned = std::process::Command::new(exe)
-        .arg("--hook-ingest")
-        .arg(&transcript)
-        .arg(&conversation)
-        .arg(&root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    if let Err(error) = spawned {
-        log(&format!("stop: spawn failed: {}", error));
+    spawn_detached(&["--hook-ingest", &transcript, &conversation, &root], "stop");
+}
+
+/// Exclusive lock file, removed on drop.
+struct IngestLock(PathBuf);
+
+impl IngestLock {
+    fn acquire(transcript: &str) -> Option<IngestLock> {
+        let digest = sha2::Sha256::digest(transcript.as_bytes());
+        let name: String = digest.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+        let path = data_dir().join(format!("ingest-{}.lock", name));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(INGEST_LOCK_WAIT_SECS);
+        loop {
+            if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
+                return Some(IngestLock(path));
+            }
+            if age_secs(&path).is_some_and(|age| age > INGEST_LOCK_STALE_SECS) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+}
+
+impl Drop for IngestLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -266,6 +357,10 @@ pub fn run_ingest(args: &[String]) {
     if transcript.is_empty() {
         return;
     }
+    let Some(_lock) = IngestLock::acquire(&transcript) else {
+        log(&format!("ingest {}: another ingest still running, skipped", conversation));
+        return;
+    };
     match ingest_new_lines(&transcript, &conversation, &root) {
         Ok(summary) => log(&format!("ingest {}: {}", conversation, summary)),
         Err(error) => log(&format!("ingest {} failed: {}", conversation, error)),
@@ -543,7 +638,7 @@ fn read_json_or(path: &Path, default: Value) -> Value {
         .unwrap_or(default)
 }
 
-fn write_json_with_backup(path: &Path, value: &Value) -> Result<(), String> {
+pub(crate) fn write_json_with_backup(path: &Path, value: &Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -572,6 +667,7 @@ fn install_cursor(exe: &str, home: &Path) -> Result<PathBuf, String> {
     for (event, arg, timeout) in [
         ("sessionStart", "session-start", 20),
         ("stop", "stop", 10),
+        ("sessionEnd", "session-end", 10),
     ] {
         let list = hooks.entry(event).or_insert_with(|| json!([]));
         if !list.is_array() {
@@ -599,6 +695,7 @@ fn install_matcher_style(exe: &str, path: &Path, agent: &str) -> Result<PathBuf,
     for (event, arg, matcher, timeout) in [
         ("SessionStart", "session-start", "startup|resume|clear|compact", 20),
         ("Stop", "stop", "*", 10),
+        ("SessionEnd", "session-end", "*", 10),
     ] {
         let list = hooks.entry(event).or_insert_with(|| json!([]));
         if !list.is_array() {
@@ -758,6 +855,21 @@ not json
         assert!(is_cursor_running_foreign_hook("claude", &cursor_payload));
         assert!(!is_cursor_running_foreign_hook("cursor", &cursor_payload));
         assert!(!is_cursor_running_foreign_hook("claude", &json!({"session_id": "s", "cwd": "/x"})));
+    }
+
+    #[test]
+    fn session_start_is_served_once_per_session() {
+        let dir = std::env::temp_dir().join(format!("mp-session-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let payload = json!({"session_id": "abc", "source": "startup"});
+        assert!(claim_session_start(&dir, &payload));
+        assert!(!claim_session_start(&dir, &payload), "same session twice");
+        assert!(!claim_session_start(&dir, &json!({"conversation_id": "abc", "source": "startup"})));
+        assert!(claim_session_start(&dir, &json!({"session_id": "abc", "source": "compact"})));
+        assert!(claim_session_start(&dir, &json!({"session_id": "other"})));
+        assert!(claim_session_start(&dir, &json!({})), "no id: always served");
+        assert!(claim_session_start(&dir, &json!({})));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

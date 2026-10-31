@@ -2,6 +2,7 @@
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
 /// (c) SOFLUTION LTD — Apache 2.0 License
+mod agents;
 mod conversations_cli;
 mod hooks;
 #[cfg(feature = "http")]
@@ -67,6 +68,16 @@ fn main() {
     {
         hooks::install_hooks();
         return;
+    }
+    if args.iter().any(|a| a == "--setup-agents") {
+        std::process::exit(agents::setup_agents(&args));
+    }
+    if args.iter().any(|a| a == "--sync-agents") {
+        agents::sync_agents();
+        return;
+    }
+    if args.iter().any(|a| a == "--uninstall-agents") {
+        std::process::exit(agents::uninstall_agents(&args));
     }
     if args.iter().any(|a| a == "--index-conversations") {
         conversations_cli::run_index(&args);
@@ -1167,8 +1178,11 @@ fn print_help() {
     println!("  MemoryPilot --repair-credentials [--apply]  Re-mask leaking labels, reclassify credentials holding no secret");
     println!("  MemoryPilot --redact-conversations [--apply]  Mask secrets already in the conversation index (counts only without --apply)");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
-    println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop auto-ingest");
-    println!("  MemoryPilot --hook session-start|stop  (called by Cursor, JSON on stdin)");
+    println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop/session-end auto-ingest");
+    println!("  MemoryPilot --hook session-start|stop|session-end  (called by the agents, JSON on stdin)");
+    println!("  MemoryPilot --setup-agents [--tools claude,cursor,...] [--dry-run]  Create ~/.MemoryPilot/agents (your rules and skills) and wire it into your tools");
+    println!("  MemoryPilot --sync-agents    Wire new skills, regenerate rule copies (no write when nothing changed, never fails)");
+    println!("  MemoryPilot --uninstall-agents [--tools ...]  Unwire what --setup-agents added; your rules and skills stay");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");
