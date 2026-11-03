@@ -358,6 +358,12 @@ impl ConversationStore {
             .map_err(|error| format!("Title update: {}", error))?;
         }
         tx.commit().map_err(|error| format!("Redaction commit: {}", error))?;
+        // The old values stay in freed pages until the file is rewritten.
+        if report.segments + report.titles > 0 {
+            self.conn
+                .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(|error| format!("Redaction vacuum: {}", error))?;
+        }
         Ok(report)
     }
 
@@ -666,6 +672,10 @@ mod tests {
         assert_eq!(hits(&store, "push passe avec token"), 1);
         let title: String = store.conn.query_row("SELECT title FROM conversations", [], |row| row.get(0)).unwrap();
         assert_eq!(title, format!("CI {}", masked));
+        for file in [path.clone(), dir.join("redact.db-wal")] {
+            let bytes = std::fs::read(&file).unwrap_or_default();
+            assert!(!bytes.windows(token.len()).any(|window| window == token.as_bytes()));
+        }
 
         let again = store.redact_stored_secrets(true).unwrap();
         assert_eq!((again.segments, again.titles, again.conversations), (0, 0, 0));
