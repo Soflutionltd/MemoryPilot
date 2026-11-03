@@ -266,6 +266,7 @@ pub fn run_ingest(args: &[String]) {
     if transcript.is_empty() {
         return;
     }
+    memorypilot_core::secrets::ensure_known_secrets();
     match ingest_new_lines(&transcript, &conversation, &root) {
         Ok(summary) => log(&format!("ingest {}: {}", conversation, summary)),
         Err(error) => log(&format!("ingest {} failed: {}", conversation, error)),
