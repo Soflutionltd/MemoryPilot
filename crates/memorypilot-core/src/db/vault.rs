@@ -41,7 +41,8 @@ fn decode_key(text: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-#[cfg(target_os = "macos")]
+// Tests use a generated key instead (see `key`).
+#[cfg(all(target_os = "macos", not(test)))]
 fn load_or_create_key() -> Option<[u8; 32]> {
     // Keychain Services API directly: the key never appears on a command
     // line (visible to `ps`) as it would with /usr/bin/security -w.
@@ -68,7 +69,7 @@ fn load_or_create_key() -> Option<[u8; 32]> {
     decode_key(&String::from_utf8_lossy(&check))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 fn load_or_create_key() -> Option<[u8; 32]> {
     if std::env::var("MEMORYPILOT_VAULT").map(|v| v == "off").unwrap_or(false) {
         return None;
