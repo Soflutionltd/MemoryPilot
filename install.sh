@@ -18,6 +18,23 @@ NC='\033[0m'
 configured=()
 skipped=()
 
+# Options: --yes (no questions), --agents-tools=claude,cursor,... (tools whose
+# rules and skills get wired), --uninstall-agents [--tools ...] (passed to
+# the binary, nothing else runs).
+ASSUME_YES=0
+AGENTS_TOOLS=""
+AGENTS_TOOLS_SET=0
+UNINSTALL_AGENTS=0
+UNINSTALL_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --yes|-y) ASSUME_YES=1 ;;
+        --agents-tools=*) AGENTS_TOOLS="${arg#*=}"; AGENTS_TOOLS_SET=1 ;;
+        --uninstall-agents) UNINSTALL_AGENTS=1 ;;
+        *) if [ "$UNINSTALL_AGENTS" = 1 ]; then UNINSTALL_ARGS+=("$arg"); fi ;;
+    esac
+done
+
 info()  { printf "${BOLD}▸${NC} %s\n" "$1"; }
 ok()    { printf "${GREEN}✓${NC} %s\n" "$1"; }
 warn()  { printf "${YELLOW}⚠${NC} %s\n" "$1"; }
@@ -168,6 +185,14 @@ with open(sys.argv[3], 'w') as f:
 " "$root_key" "$server_json" "$file"
     fi
 }
+
+if [ "$UNINSTALL_AGENTS" = 1 ]; then
+    if [ ! -x "$BINARY_PATH" ]; then
+        fail "$BINARY_PATH not found: nothing to uninstall."
+        exit 1
+    fi
+    exec "$BINARY_PATH" --uninstall-agents ${UNINSTALL_ARGS[@]+"${UNINSTALL_ARGS[@]}"}
+fi
 
 # ─── Step 1: Build or locate binary ───────────────────────────────────────────
 
@@ -326,7 +351,65 @@ else
     skipped+=("Codex")
 fi
 
-# ─── Step 3: Summary ─────────────────────────────────────────────────────────
+# ─── Step 3: Hooks, rules and skills ─────────────────────────────────────────
+
+printf "\n${BOLD}Hooks, rules and skills...${NC}\n\n"
+
+# Detected before --install-hooks, which creates ~/.cursor/hooks.json.
+detected_ids=()
+detected_names=()
+while IFS=$'\t' read -r tool_id tool_label; do
+    [ -n "$tool_id" ] || continue
+    detected_ids+=("$tool_id")
+    detected_names+=("$tool_label")
+done < <("$BINARY_PATH" --setup-agents --list-tools 2>/dev/null || true)
+
+if "$BINARY_PATH" --install-hooks; then
+    ok "Session hooks installed"
+else
+    warn "Session hooks failed: run $BINARY_PATH --install-hooks later"
+fi
+
+is_detected() {
+    local tool
+    for tool in ${detected_ids[@]+"${detected_ids[@]}"}; do
+        [ "$tool" = "$1" ] && return 0
+    done
+    return 1
+}
+
+all_detected="$(IFS=,; echo "${detected_ids[*]+"${detected_ids[*]}"}")"
+if [ "$AGENTS_TOOLS_SET" = 1 ]; then
+    agents_tools="$AGENTS_TOOLS"
+elif [ "$ASSUME_YES" = 0 ] && [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
+    agents_tools=""
+    if [ -n "$all_detected" ]; then
+        printf "\n  Your own rules and skills live in ~/.MemoryPilot/agents (empty to start).\n"
+        printf "  Detected tools:\n"
+        for i in "${!detected_ids[@]}"; do
+            printf "    %-9s %s\n" "${detected_ids[$i]}" "${detected_names[$i]}"
+        done
+        printf "  Wire them into which tools? Enter = all (%s), or ids separated by commas, or none: " "$all_detected"
+        answer=""
+        read -r answer </dev/tty || answer=""
+        agents_tools="${answer:-$all_detected}"
+    fi
+else
+    # Non-interactive: Claude Code only, unless --agents-tools says otherwise.
+    agents_tools=""
+    if is_detected claude; then
+        agents_tools="claude"
+    fi
+fi
+if [ "$agents_tools" = "none" ]; then
+    agents_tools=""
+fi
+printf "\n"
+if ! "$BINARY_PATH" --setup-agents --tools "$agents_tools"; then
+    warn "Rules and skills setup failed: run $BINARY_PATH --setup-agents later"
+fi
+
+# ─── Step 4: Summary ─────────────────────────────────────────────────────────
 
 printf "\n━━━━━━━━━━━━━━━━━━━━━\n"
 printf "${BOLD}Summary${NC}\n\n"
