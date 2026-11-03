@@ -64,7 +64,7 @@ pub fn seal_backup_file(path: &std::path::Path) -> Result<usize, String> {
     vault::seal_file(path)
 }
 
-pub(crate) use vault::contains_secret_value;
+pub(crate) use vault::{contains_secret_value, credential_clear_texts};
 #[path = "db/transcript.rs"]
 mod transcript;
 #[path = "db/lifecycle.rs"]

@@ -1,7 +1,8 @@
 //! Secret redaction for text stored as said (conversations, hook
 //! transcripts). One filter: known credential formats, private key
 //! blocks, passwords in URIs, values after a password or token name,
-//! bearer tokens, IBANs and long random tokens.
+//! bearer tokens, IBANs and long random tokens, and the values listed as
+//! known secrets (SHA-256 prints only) whatever they look like.
 //!
 //! Each value becomes `[secret masqué : <kind> <print>]`, the print being
 //! the first 4 hex digits of its SHA-256: two mentions of the same secret
@@ -10,9 +11,19 @@
 
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
 
 const MASK_OPEN: &str = "[secret masqué : ";
+
+/// One SHA-256 print (64 hex digits) per line, next to conversations.db.
+pub const KNOWN_SECRETS_FILE: &str = "known-secrets.sha256";
+/// Shortest value matched against the known prints.
+const KNOWN_MIN_CHARS: usize = 8;
+/// Shortest token of a credential's text taken as a known secret.
+const CREDENTIAL_TOKEN_MIN_CHARS: usize = 12;
 
 /// Credential prefixes, the minimum length of what follows, and the kind
 /// shown in the mask. Longer prefixes come before the ones they extend.
@@ -61,7 +72,24 @@ const CONNECTORS: &[&str] = &["est", "is", "vaut", "was", "était"];
 const REFERENCES: &[&str] = &[
     "1password", "op-sof", "trousseau", "keychain", "stocké", "stockée", "stored", "dans", "in", "via", "voir",
     "see", "env", "variable", "manager", "redacted", "masqué", "oublié", "reset", "réinitialisation", "requis",
-    "required",
+    "required", "changé", "modifié", "expiré", "incorrect", "invalide", "invalid", "wrong", "faux", "correct",
+    "changed", "expired", "missing", "manquant", "vide", "empty",
+];
+
+/// Type names and placeholders written where a password value would go.
+const CODE_WORDS: &[&str] = &[
+    "string", "str", "text", "number", "boolean", "bool", "null", "none", "undefined", "optional", "password",
+    "secret", "hidden", "true", "false", "example", "exemple", "placeholder", "xxxxxx", "xxxxxxxx",
+];
+
+/// Labels of public ids in a credential's text: the value after them is
+/// not a secret (`Account ID a4b5…`, `client_id=…`, `login: …`).
+const PUBLIC_LABELS: &[&str] = &[
+    "account id", "account_id", "accountid", "account", "zone id", "zone_id", "app id", "app_id", "team id",
+    "team_id", "key id", "key_id", "issuer id", "issuer_id", "client id", "client_id", "clientid", "project id",
+    "project_id", "tenant id", "tenant_id", "org id", "org_id", "user id", "user_id", "user", "username", "login",
+    "email", "e-mail", "identifiant", "utilisateur", "compte", "id", "issuer", "apiissuer", "workspace", "build",
+    "bundle", "hash", "hashes", "hachage",
 ];
 
 const PASSWORD_SYMBOLS: &[char] = &['!', '@', '#', '$', '%', '^', '&', '*', '?', '+', '=', '~', '§', '€', '£'];
@@ -72,9 +100,199 @@ pub struct Finding {
     pub kind: &'static str,
 }
 
+/// SHA-256 prints of secret values that have no recognisable format.
+/// Only prints are held, never the values.
+#[derive(Debug, Default, Clone)]
+pub struct KnownSecrets {
+    prints: HashSet<[u8; 32]>,
+}
+
+impl KnownSecrets {
+    pub fn len(&self) -> usize {
+        self.prints.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prints.is_empty()
+    }
+
+    pub fn insert(&mut self, value: &str) {
+        self.prints.insert(Sha256::digest(value.as_bytes()).into());
+    }
+
+    pub fn contains(&self, value: &str) -> bool {
+        !self.prints.is_empty() && self.prints.contains(&<[u8; 32]>::from(Sha256::digest(value.as_bytes())))
+    }
+
+    /// A print written as 64 hex digits; false when the line is not one.
+    pub fn insert_print(&mut self, hex: &str) -> bool {
+        let hex = hex.trim();
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        let mut print = [0u8; 32];
+        for (index, byte) in print.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * index..2 * index + 2], 16).unwrap_or(0);
+        }
+        self.prints.insert(print)
+    }
+
+    /// Prints of a file of known secrets; a missing file adds nothing.
+    pub fn read_file(&mut self, path: &Path) -> usize {
+        let Ok(content) = std::fs::read_to_string(path) else { return 0 };
+        content.lines().filter(|line| self.insert_print(line)).count()
+    }
+
+    /// Every token of the credentials' clear texts that may be a secret
+    /// value: no logins, hosts, emails, file names or plain words, and no
+    /// value written after a public-id label in any of them.
+    pub fn insert_credential_texts<S: AsRef<str>>(&mut self, texts: &[S]) -> usize {
+        let mut public = HashSet::new();
+        let mut secret = Vec::new();
+        for clear in texts.iter().map(AsRef::as_ref) {
+            for token in whitespace_tokens(clear) {
+                let url = clear[token.clone()].contains("://");
+                for range in candidates(clear, token) {
+                    let value = &clear[range.clone()];
+                    if value.chars().count() < CREDENTIAL_TOKEN_MIN_CHARS || !credential_secret(value) {
+                        continue;
+                    }
+                    // In a URL only a query value or the password before `@`.
+                    if url && !(clear[..range.start].ends_with('=') || clear[range.end..].starts_with('@')) {
+                        continue;
+                    }
+                    if public_label_before(clear, range.start) {
+                        public.insert(value);
+                    } else {
+                        secret.push(value);
+                    }
+                }
+            }
+        }
+        let before = self.len();
+        for value in secret.into_iter().filter(|value| !public.contains(value)) {
+            self.insert(value);
+        }
+        self.len() - before
+    }
+}
+
+static KNOWN: RwLock<Option<Arc<KnownSecrets>>> = RwLock::new(None);
+static KNOWN_LOADED: OnceLock<()> = OnceLock::new();
+
+/// Replaces the known secrets used by `redact` and `findings`.
+pub fn set_known_secrets(known: KnownSecrets) {
+    if let Ok(mut slot) = KNOWN.write() {
+        *slot = Some(Arc::new(known));
+    }
+}
+
+fn known_secrets() -> Option<Arc<KnownSecrets>> {
+    KNOWN.read().ok().and_then(|slot| slot.clone())
+}
+
+/// Loads the known secrets once per process (see `reload_known_secrets`).
+pub fn ensure_known_secrets() {
+    KNOWN_LOADED.get_or_init(|| {
+        reload_known_secrets();
+    });
+}
+
+/// Loads the known secrets again from both sources: the prints file and
+/// the credentials of memory.db. A missing file, database or vault key
+/// only leaves that source out. Returns how many prints are held.
+pub fn reload_known_secrets() -> usize {
+    let known = load_known_secrets_from(known_secrets_path().as_deref(), memory_db_path().as_deref());
+    let count = known.len();
+    set_known_secrets(known);
+    count
+}
+
+pub fn load_known_secrets_from(file: Option<&Path>, memory_db: Option<&Path>) -> KnownSecrets {
+    let mut known = KnownSecrets::default();
+    if let Some(file) = file {
+        known.read_file(file);
+    }
+    if let Some(db) = memory_db.filter(|db| db.exists()) {
+        known.insert_credential_texts(&crate::db::credential_clear_texts(db).unwrap_or_default());
+    }
+    known
+}
+
+/// The folder of conversations.db / memory.db (`MEMORYPILOT_CONVERSATIONS_DB`,
+/// then `MEMORYPILOT_DB`, else ~/.MemoryPilot).
+fn data_dir() -> Option<PathBuf> {
+    for variable in ["MEMORYPILOT_CONVERSATIONS_DB", "MEMORYPILOT_DB"] {
+        if let Ok(path) = std::env::var(variable) {
+            if !path.trim().is_empty() {
+                return Path::new(&path).parent().map(Path::to_path_buf);
+            }
+        }
+    }
+    Some(dirs::home_dir()?.join(".MemoryPilot"))
+}
+
+pub fn known_secrets_path() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join(KNOWN_SECRETS_FILE))
+}
+
+fn memory_db_path() -> Option<PathBuf> {
+    match std::env::var("MEMORYPILOT_DB") {
+        Ok(path) if !path.trim().is_empty() => Some(PathBuf::from(path)),
+        _ => Some(dirs::home_dir()?.join(".MemoryPilot").join("memory.db")),
+    }
+}
+
+/// Adds the print of `value` to the known secrets file (created 0600) and
+/// returns its short print. The value itself is never written.
+pub fn add_known_secret(value: &str, path: &Path) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("empty value: nothing added".into());
+    }
+    if value.contains(char::is_whitespace) {
+        return Err("the value contains spaces: only single tokens can be recognised".into());
+    }
+    if value.chars().count() < KNOWN_MIN_CHARS {
+        return Err(format!("value shorter than {} characters: too likely to appear by chance", KNOWN_MIN_CHARS));
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{:02x}", byte)).collect();
+    let short = hex[..4].to_string();
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {}", dir.display(), error))?;
+    }
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if !existing.lines().any(|line| line.trim().eq_ignore_ascii_case(&hex)) {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(path).map_err(|error| format!("{}: {}", path.display(), error))?;
+        let separator = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+        writeln!(file, "{}{}", separator, hex).map_err(|error| format!("{}: {}", path.display(), error))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("{}: {}", path.display(), error))?;
+    }
+    Ok(short)
+}
+
 /// The text with every secret value replaced by its mask.
 pub fn redact(text: &str) -> Cow<'_, str> {
-    let found = findings(text);
+    match known_secrets() {
+        Some(known) => redact_with(text, &known),
+        None => redact_with(text, &KnownSecrets::default()),
+    }
+}
+
+/// `redact` with an explicit set of known secrets.
+pub fn redact_with<'a>(text: &'a str, known: &KnownSecrets) -> Cow<'a, str> {
+    let found = findings_with(text, known);
     if found.is_empty() {
         return Cow::Borrowed(text);
     }
@@ -97,6 +315,13 @@ pub fn mask(kind: &str, value: &str) -> String {
 
 /// Secret values of the text, in order, without overlaps.
 pub fn findings(text: &str) -> Vec<Finding> {
+    match known_secrets() {
+        Some(known) => findings_with(text, &known),
+        None => findings_with(text, &KnownSecrets::default()),
+    }
+}
+
+pub fn findings_with(text: &str, known: &KnownSecrets) -> Vec<Finding> {
     let mut found = Found { taken: masks(text), out: Vec::new() };
     private_keys(text, &mut found);
     uri_passwords(text, &mut found);
@@ -113,6 +338,7 @@ pub fn findings(text: &str) -> Vec<Finding> {
     for index in 0..words.len() {
         named_value(text, &words, index, &mut found);
     }
+    known_values(text, known, &mut found);
     let mut out = found.out;
     out.sort_by_key(|finding| finding.range.start);
     out
@@ -352,6 +578,136 @@ pub(crate) fn made_of_words<'a>(parts: impl IntoIterator<Item = &'a str>) -> boo
     total.1 >= 3 * total.0
 }
 
+fn whitespace_tokens(text: &str) -> Vec<Range<usize>> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(start) = start.take() {
+                tokens.push(start..index);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(start) = start {
+        tokens.push(start..text.len());
+    }
+    tokens
+}
+
+/// Readings of a token that may be a whole value, longest first: as
+/// written, without its quotes or brackets, without a final punctuation,
+/// and each piece between `=`, `:`, `@`, `/`, `&`, `?` and the like.
+fn candidates(text: &str, token: Range<usize>) -> Vec<Range<usize>> {
+    // `/` splits URLs only: base64 values contain it.
+    let separators = if text[token.clone()].contains("://") { "=:\"'`,()[]{}<>;\\@&?/" } else { "=:\"'`,()[]{}<>;\\@&?" };
+    let narrow = |range: &Range<usize>, chars: &str, both: bool| {
+        let slice = &text[range.clone()];
+        let start = if both { range.start + (slice.len() - slice.trim_start_matches(|c: char| chars.contains(c)).len()) } else { range.start };
+        let end = range.end - (slice.len() - slice.trim_end_matches(|c: char| chars.contains(c)).len());
+        start..end.max(start)
+    };
+    let unquoted = narrow(&token, "\"'`()[]{}<>«»", true);
+    let unpunctuated = narrow(&unquoted, ".,;:", false);
+    let mut out = vec![token.clone(), unquoted.clone(), unpunctuated.clone()];
+    let mut start = unquoted.start;
+    for (index, c) in text[unquoted.clone()].char_indices() {
+        let padding = c == '=' && text[unquoted.start + index..unquoted.end].bytes().all(|b| b == b'=');
+        if separators.contains(c) && !padding {
+            out.push(start..unquoted.start + index);
+            start = unquoted.start + index + c.len_utf8();
+        }
+    }
+    if start > unquoted.start {
+        let last = start..unquoted.end;
+        out.push(narrow(&last, ".,;:", false));
+        out.push(last);
+    }
+    out.retain(|range| text[range.clone()].chars().count() >= KNOWN_MIN_CHARS);
+    out.sort_by_key(|range| std::cmp::Reverse(range.len()));
+    out.dedup();
+    out
+}
+
+/// Values of the text whose print is a known secret, whatever they look like.
+fn known_values(text: &str, known: &KnownSecrets, found: &mut Found) {
+    if known.is_empty() {
+        return;
+    }
+    for token in whitespace_tokens(text) {
+        if let Some(range) = candidates(text, token).into_iter().find(|range| known.contains(&text[range.clone()])) {
+            // Symbols glued after a known part belong to the value (`…@!`).
+            let rest = &text[range.end..];
+            let tail = rest
+                .char_indices()
+                .find(|&(index, c)| {
+                    !PASSWORD_SYMBOLS.contains(&c)
+                        || matches!(c, '?' | '=')
+                        || (c == '&' && starts_with_assignment(&rest[index + 1..]))
+                })
+                .map_or(rest.len(), |(index, _)| index);
+            found.add(range.start..range.end + tail, "known");
+        }
+    }
+}
+
+/// A token of a credential's text worth remembering as a secret value.
+fn credential_secret(value: &str) -> bool {
+    let letters = value.chars().filter(|c| c.is_alphabetic() && !matches!(c, 'T' | 'Z')).count();
+    let host = value.contains('.')
+        && value.split(['.', ':', '/']).all(|part| part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '*'));
+    let file = value.rsplit_once('.').is_some_and(|(stem, extension)| {
+        (1..=5).contains(&extension.len())
+            && extension.chars().all(|c| c.is_ascii_alphanumeric())
+            && extension.chars().any(|c| c.is_ascii_alphabetic())
+            && stem.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
+    });
+    // `NAME=value` and `key:value` are split into their pieces; base64 keeps its padding.
+    let assignment = value.trim_end_matches('=').contains('=') || value.contains(':');
+    // Ids of workspaces, builds and users far outnumber UUID-shaped keys.
+    let uuid = value.split('-').map(str::len).eq([8, 4, 4, 4, 12]) && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    value.chars().count() <= 200
+        && letters > 0
+        && !host
+        && !file
+        && !uuid
+        && !assignment
+        && !contains_email(value)
+        && !value.contains('•')
+        && !value.contains("://")
+        && !value.starts_with(['/', '~', '$', '<', '{', '%', '#'])
+        && !value.starts_with("op:")
+        && !value.starts_with(SEAL_MARK)
+        && !is_email(value)
+        && !PUBLIC_PREFIXES.iter().any(|prefix| value.starts_with(prefix))
+        && (value.chars().any(|c| c.is_ascii_digit()) || value.chars().any(|c| PASSWORD_SYMBOLS.contains(&c)))
+        && !identifier_like(value.split(['-', '_', '.']))
+}
+
+const SEAL_MARK: &str = "🔒";
+
+/// True when a public-id label (`Account ID`, `CLOUDFLARE_ACCOUNT_ID=`,
+/// `**Issuer** :`) comes right before `start`.
+fn public_label_before(text: &str, start: usize) -> bool {
+    let before = text[..start].trim_end_matches(|c: char| c.is_whitespace() || "=:\"'`→*|-()".contains(c));
+    let lower = before.to_lowercase();
+    PUBLIC_LABELS
+        .iter()
+        .any(|label| lower.ends_with(label) && !lower[..lower.len() - label.len()].ends_with(char::is_alphanumeric))
+}
+
+/// `user@domain.tld` anywhere in the value.
+fn contains_email(value: &str) -> bool {
+    value.match_indices('@').any(|(at, _)| {
+        let domain: String = value[at + 1..].chars().take_while(|c| c.is_alphanumeric() || *c == '.' || *c == '-').collect();
+        at > 0 && value[..at].ends_with(|c: char| c.is_alphanumeric() || "._+-".contains(c)) && {
+            let domain = domain.trim_end_matches('.');
+            domain.contains('.') && domain.rsplit('.').next().is_some_and(|tld| tld.len() >= 2 && tld.chars().all(char::is_alphabetic))
+        }
+    })
+}
+
 /// `-----BEGIN … PRIVATE KEY-----` up to its END line, or to the end of
 /// the key material when the END line is missing.
 fn private_keys(text: &str, found: &mut Found) {
@@ -436,45 +792,65 @@ fn bearer_token(text: &str, word: Range<usize>, found: &mut Found) {
 }
 
 /// A value announced by its name: `password: …`, `TOKEN=…`, `"api_key": "…"`,
-/// `mot de passe : …`.
+/// `mot de passe : …`, `le mot de passe est `…``, `MDP `…``.
 fn named_value(text: &str, words: &[Range<usize>], index: usize, found: &mut Found) {
     let word = &words[index];
     let name = text[word.clone()].to_lowercase();
     let name = name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
     let spelled_out = name == "passe"
         && index >= 2
-        && text[words[index - 2].clone()].eq_ignore_ascii_case("mot")
+        && text[words[index - 2].clone()].trim_start_matches(|c: char| !c.is_alphanumeric()).eq_ignore_ascii_case("mot")
         && text[words[index - 1].clone()].eq_ignore_ascii_case("de");
     let password = spelled_out || PASSWORD_NAMES.iter().any(|n| name.ends_with(n));
-    if !password && !TOKEN_NAMES.iter().any(|n| name.ends_with(n)) {
+    if (!password && !TOKEN_NAMES.iter().any(|n| name.ends_with(n))) || name.ends_with("1password") {
         return;
     }
-    // Closing quote of a JSON or YAML key, then `:`, `=`, `=>`, `:=` or `→`.
-    let mut at = skip(text, word.end, |c| matches!(c, '"' | '\'' | '`' | '\\'));
+    // `?user=a&password=…`: the value ends at the next `&`.
+    let name_end = word.start + text[word.clone()].trim_end_matches(|c: char| !c.is_alphanumeric()).len();
+    let name_start = text[..name_end]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .last()
+        .map_or(name_end, |(i, _)| i);
+    let in_query = text[..name_start].ends_with(['?', '&']);
+    // A quote after a space opens the value (`MDP `…``); right after the
+    // name it closes a JSON or YAML key.
+    let spaced = skip(text, word.end, |c| c == ' ' || c == '\t');
+    let direct_quote = password && spaced > word.end && text[spaced..].starts_with(['`', '"', '\'']);
+    let mut at = if direct_quote { spaced } else { skip(text, word.end, |c| matches!(c, '"' | '\'' | '`' | '\\')) };
     at = skip(text, at, |c| c == ' ' || c == '\t');
-    let tail = &text[at..];
-    let operator = ["=>", ":=", "=", ":", "→"].into_iter().find(|op| tail.starts_with(op));
-    let mut assigned = operator.is_some();
-    if let Some(op) = operator {
-        at += op.len();
-        if text[at..].starts_with('=') {
-            return; // a comparison (`password == …`)
+    let mut assigned = direct_quote;
+    let mut connected = false;
+    let mut arrow = false;
+    if !direct_quote {
+        if password {
+            let lower = text[at..].to_lowercase();
+            if let Some(connector) = CONNECTORS
+                .iter()
+                .find(|w| lower.starts_with(*w) && lower[w.len()..].starts_with([' ', '\t']))
+            {
+                at = skip(text, at + connector.len(), |c| c == ' ' || c == '\t');
+                assigned = true;
+                connected = true;
+            }
         }
-    }
-    at = skip(text, at, |c| c == ' ' || c == '\t');
-    if password {
-        let lower = text[at..].to_lowercase();
-        if let Some(connector) = CONNECTORS
-            .iter()
-            .find(|w| lower.starts_with(*w) && lower[w.len()..].starts_with([' ', '\t']))
-        {
-            at = skip(text, at + connector.len(), |c| c == ' ' || c == '\t');
+        // `:`, `=`, `=>`, `:=` or `→`, also after a connector (`est : …`).
+        let tail = &text[at..];
+        if let Some(op) = ["=>", ":=", "=", ":", "→"].into_iter().find(|op| tail.starts_with(op)) {
+            at += op.len();
+            if text[at..].starts_with('=') {
+                return; // a comparison (`password == …`)
+            }
             assigned = true;
+            arrow = op == "→" || op == "=>";
+            at = skip(text, at, |c| c == ' ' || c == '\t');
         }
-    } else if !assigned {
-        return;
+        if !password && !assigned {
+            return;
+        }
     }
-    let (start, value) = match text[at..].strip_prefix("\\\"").map(|_| "\\\"").or_else(|| {
+    let (start, value, quote) = match text[at..].strip_prefix("\\\"").map(|_| "\\\"").or_else(|| {
         ["\"", "'", "`"].into_iter().find(|q| text[at..].starts_with(q))
     }) {
         Some(quote) => {
@@ -485,11 +861,15 @@ fn named_value(text: &str, words: &[Range<usize>], index: usize, found: &mut Fou
             if value.contains(char::is_whitespace) {
                 return;
             }
-            (start, value)
+            (start, value, Some(quote))
         }
-        None => (at, unquoted_value(text, at)),
+        None if password && assigned && !in_query => (at, password_value(text, at), None),
+        None => (at, unquoted_value(text, at), None),
     };
-    if secret_value(value, password, assigned) {
+    // Without a digit or a symbol, only a value set apart in backticks, or
+    // quoted after "est"/"is", reads as a password.
+    let set_apart = password && assigned && !arrow && (quote == Some("`") || (connected && quote.is_some()));
+    if secret_value(value, password, assigned, set_apart) {
         found.add(start..start + value.len(), if password { "password" } else { "generic" });
     }
 }
@@ -507,18 +887,69 @@ fn unquoted_value(text: &str, start: usize) -> &str {
     rest[..end].trim_end_matches('.')
 }
 
-fn secret_value(value: &str, password: bool, assigned: bool) -> bool {
+/// A password runs to the next space or quote: `&`, `,` and `;` may be part
+/// of it. Only a following `name=` (`;Database=…`) ends it earlier, and a
+/// closing bracket it never opened.
+fn password_value(text: &str, start: usize) -> &str {
+    let rest = &text[start..];
+    let mut end = rest.find(|c: char| c.is_whitespace() || "\"'`\\".contains(c)).unwrap_or(rest.len());
+    if let Some(cut) = rest[..end]
+        .char_indices()
+        .find(|(index, c)| matches!(c, '&' | ';') && starts_with_assignment(&rest[index + 1..end]))
+        .map(|(index, _)| index)
+    {
+        end = cut;
+    }
+    // Markdown bold around the line (`**mot de passe : …**`).
+    let mut value = rest[..end].strip_suffix("**").unwrap_or(&rest[..end]).trim_end_matches('.');
+    while let Some(last) = value.chars().last() {
+        let open = match last {
+            ')' => '(',
+            ']' => '[',
+            '}' => '{',
+            '>' => '<',
+            _ => break,
+        };
+        if value.matches(open).count() >= value.matches(last).count() {
+            break;
+        }
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn starts_with_assignment(text: &str) -> bool {
+    let name = text.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')).unwrap_or(text.len());
+    name > 0 && text[name..].starts_with('=')
+}
+
+/// Code rather than a value: a call, a path or a closure (`z.string().min(8)`,
+/// `bcrypt::hash(&pw,`, `os.getenv(`).
+fn is_code(value: &str) -> bool {
+    value.contains("()")
+        || value.contains("::")
+        || value.contains("=>")
+        || value.contains("->")
+        || value
+            .char_indices()
+            .any(|(index, c)| c == '(' && value[..index].ends_with(|p: char| p.is_ascii_alphanumeric() || p == '_'))
+}
+
+fn secret_value(value: &str, password: bool, assigned: bool, set_apart: bool) -> bool {
     let len = value.chars().count();
-    if len < if password { 6 } else { 8 } || len > 200 {
+    if len < if password { 5 } else { 8 } || len > 200 {
         return false;
     }
     let lower = value.to_lowercase();
-    let reference = value.starts_with(['$', '<', '(', '[', '{', '•', '%', '*', '&', '/', '~', '.'])
+    let bare = lower.trim_matches(|c: char| !c.is_alphanumeric());
+    let reference = value.starts_with(['$', '<', '(', '[', '{', ')', ']', '}', '•', '%', '*', '&', '/', '~', '.'])
         || ["op://", "env:", "secret:", "process.env", "import.meta", "os.environ", "env."]
             .iter()
             .any(|scheme| lower.starts_with(scheme))
         || lower.contains("://")
-        || REFERENCES.contains(&lower.trim_matches(|c: char| !c.is_alphanumeric()))
+        || REFERENCES.contains(&bare)
+        || CODE_WORDS.contains(&bare)
+        || is_code(value)
         || is_email(value);
     if reference {
         return false;
@@ -526,7 +957,10 @@ fn secret_value(value: &str, password: bool, assigned: bool) -> bool {
     let digit = value.chars().any(|c| c.is_ascii_digit());
     let symbol = value.chars().any(|c| PASSWORD_SYMBOLS.contains(&c));
     if !digit && !symbol {
-        return false; // a word or a variable name
+        // A word or a variable name, unless set apart as the value.
+        return set_apart
+            && value.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            && !(value.contains('_') && identifier_like(value.split(['_', '-'])));
     }
     if !assigned && (!digit || !symbol) {
         return false; // unannounced: only a value mixing digits and symbols
@@ -690,5 +1124,162 @@ pub(crate) mod tests {
         for text in negatives {
             assert_eq!(redact(text), text);
         }
+    }
+    fn fake_hex(seed: &str) -> String {
+        Sha256::digest(seed.as_bytes())[..16].iter().map(|byte| format!("{:02x}", byte)).collect()
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mp-secrets-{}-{}-{}", name, std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn password_keeps_its_last_characters() {
+        for value in ["Ab3xQ9k&!", "Zq8wV3nL;", "Tr0ub4dor#,", "Kp4!m&Zr2&!"] {
+            for template in ["password: {} et la suite", "mdp={}", "le mot de passe est {}", "DB_PASSWORD={}"] {
+                let text = template.replace("{}", value);
+                let out = redact_with(&text, &KnownSecrets::default());
+                assert_eq!(out, template.replace("{}", &mask("password", value)), "{}", text);
+            }
+        }
+        let url = "https://example.com/login?user=a&password=Xy9!k&next=1";
+        assert_eq!(
+            redact(url),
+            format!("https://example.com/login?user=a&password={}&next=1", mask("password", "Xy9!k"))
+        );
+        let listed = "Server=db;User Id=sa;Password=Abc123!x;Database=app";
+        assert_eq!(redact(listed), format!("Server=db;User Id=sa;Password={};Database=app", mask("password", "Abc123!x")));
+    }
+
+    #[test]
+    fn password_announced_in_a_sentence() {
+        let cases = [
+            ("le mot de passe est `Soleil2026@@`", "Soleil2026@@"),
+            ("password is Hx9!kLm2", "Hx9!kLm2"),
+            ("MDP : `abcdEFGH`", "abcdEFGH"),
+            ("MDP `abcdEFGH` pour le NAS", "abcdEFGH"),
+            ("le mot de passe est `soleilbleu`", "soleilbleu"),
+            ("mot de passe : Rz7#pLq2", "Rz7#pLq2"),
+            ("le mot de passe vaut \"Qw3rty!9\"", "Qw3rty!9"),
+            ("**Mot de passe : Abc123!x**", "Abc123!x"),
+        ];
+        for (text, value) in cases {
+            let out = redact_with(text, &KnownSecrets::default());
+            assert!(!out.contains(value) && out.contains(&mask("password", value)), "{} -> {}", text, out);
+        }
+        let negatives = [
+            "le mot de passe est dans 1Password",
+            "password is required",
+            "mot de passe oublié",
+            "le mot de passe est oublié",
+            "le mot de passe est requis",
+            "le mot de passe est changé",
+            "the password is wrong",
+            r#"{"password": "Passwort", "forgotPassword": "Passwort vergessen?"}"#,
+            "password: `string`",
+            "let hash = bcrypt::hash(&password, 12)?;",
+            "password = os.getenv(\"DB_PASSWORD\", \"\")",
+            "password: z.string().min(8).max(64),",
+            "`app.example.io/signup/set-password` → `app.example.io/signup/set-password`",
+            "postgres://postgres.abcdef:[TON-PASSWORD]@aws-0-eu-west-3.pooler.supabase.com:5432/postgres",
+            "**1Password est verrouillé.** L'onglet reste ouvert",
+            "après MDP → `submit` auto",
+            "Fallback `/etc/passwd` : `chemin/vers/fichier.txt`",
+        ];
+        for text in negatives {
+            assert_eq!(redact_with(text, &KnownSecrets::default()), text);
+        }
+    }
+
+    #[test]
+    fn known_secret_from_the_prints_file() {
+        let token = fake_hex("known-file");
+        let text = format!("export BREVO_KEY_ID={} puis `{}`.", token, token);
+        assert_eq!(redact_with(&text, &KnownSecrets::default()), text, "an unknown hex token stays");
+        let dir = temp_dir("file");
+        let file = dir.join(KNOWN_SECRETS_FILE);
+        assert!(add_known_secret("", &file).is_err());
+        assert!(add_known_secret(" \n", &file).is_err());
+        assert!(!file.exists());
+        let short = add_known_secret(&format!("{}\n", token), &file).unwrap();
+        assert_eq!(add_known_secret(&token, &file).unwrap(), short);
+        let content = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].len() == 64 && lines[0].bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(lines[0].starts_with(&short) && !content.contains(&token));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let known = load_known_secrets_from(Some(&file), None);
+        let masked = mask("known", &token);
+        assert_eq!(masked.len(), mask("generic", &token).len() - "generic".len() + "known".len());
+        assert_eq!(redact_with(&text, &known), format!("export BREVO_KEY_ID={} puis `{}`.", masked, masked));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn known_secret_from_a_credential() {
+        let token = fake_hex("known-credential");
+        let account = fake_hex("public-account");
+        let dir = temp_dir("credential");
+        let path = dir.join("memory.db");
+        {
+            let db = crate::db::Database::open_at(&path).unwrap();
+            let content = format!("Cloudflare Account ID {} — jeton d'API {} (login admin@example.com)", account, token);
+            let (stored, _) = db
+                .add_memory(&content, "credential", Some("test"), &[], "test", 3, None, None, &Default::default())
+                .unwrap();
+            assert!(stored.content.starts_with(crate::db::SEAL_PREFIX));
+        }
+        let known = load_known_secrets_from(Some(&dir.join(KNOWN_SECRETS_FILE)), Some(&path));
+        let text = format!("le token {} du compte {} (admin@example.com)", token, account);
+        let out = redact_with(&text, &known);
+        assert_eq!(out, format!("le token {} du compte {} (admin@example.com)", mask("known", &token), account));
+        assert!(redact_with(&text, &KnownSecrets::default()).contains(&token));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn credential_tokens_skip_public_values() {
+        let mut known = KnownSecrets::default();
+        let clear = "Prod DB postgres://admin:Pg5ecret!2026x@db.example.com:5432/app, host db.example.com:5432, \
+                     user admin@example.com, client_id=Abc123DefGhi456, 2026-10-31T12:00:00Z";
+        let account = fake_hex("account-id");
+        let issuer = "69a6de70-03db-47e3-e053-5b8c7c11a4d1";
+        let client_secret = format!("{}/{}=", fake(24, 90), fake(7, 91));
+        let second = format!(
+            "CLOUDFLARE_ACCOUNT_ID={} **Issuer** : {} AuthKey_77ZLGAGK7W.p8 NODE_ENV=production \
+             550e8400-e29b-41d4-a716-446655440000 \
+             https://app.example.com/projects/a93315ed/web/app1b2c3d4e5f6 CLIENT_SECRET={}",
+            account, issuer, client_secret
+        );
+        let third = format!("Cloudflare {} et {}", account, issuer);
+        known.insert_credential_texts(&[clear, second.as_str(), third.as_str()]);
+        assert!(known.contains("Pg5ecret!2026x"));
+        assert!(known.contains(&client_secret));
+        for public in [
+            "db.example.com:5432",
+            "admin@example.com",
+            "Abc123DefGhi456",
+            "2026-10-31T12:00:00Z",
+            &account,
+            issuer,
+            "AuthKey_77ZLGAGK7W.p8",
+            "NODE_ENV=production",
+            "app1b2c3d4e5f6",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            assert!(!known.contains(public), "{} taken as a secret", public);
+        }
+        // Symbols glued after a known part are masked with it.
+        let mut known = KnownSecrets::default();
+        known.insert("9182736450aZ");
+        let out = redact_with("`9182736450aZ@&!` puis 9182736450aZ.", &known);
+        assert_eq!(out, format!("`{}` puis {}.", mask("known", "9182736450aZ@&!"), mask("known", "9182736450aZ")));
     }
 }

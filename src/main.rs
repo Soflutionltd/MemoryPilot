@@ -83,6 +83,26 @@ fn main() {
         conversations_cli::run_index(&args);
         return;
     }
+    if args.iter().any(|a| a == "--add-known-secret") {
+        // The value comes on stdin only: never on a command line or in a log.
+        let mut value = String::new();
+        if io::Read::read_to_string(&mut io::stdin(), &mut value).is_err() {
+            eprintln!("✗ no value on stdin");
+            std::process::exit(1);
+        }
+        let Some(path) = memorypilot_core::secrets::known_secrets_path() else {
+            eprintln!("✗ Cannot find home directory");
+            std::process::exit(1);
+        };
+        match memorypilot_core::secrets::add_known_secret(&value, &path) {
+            Ok(print) => println!("✓ Empreinte {} ajoutée aux secrets connus.", print),
+            Err(error) => {
+                eprintln!("✗ {}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--redact-conversations") {
         conversations_cli::run_redact(&args);
         return;
@@ -1177,6 +1197,7 @@ fn print_help() {
     println!("  MemoryPilot --sync-1password [--apply]  Point every credential to 1Password (Soflution vault), creating missing items; back up the vault key");
     println!("  MemoryPilot --repair-credentials [--apply]  Re-mask leaking labels, reclassify credentials holding no secret");
     println!("  MemoryPilot --redact-conversations [--apply]  Mask secrets already in the conversation index (counts only without --apply)");
+    println!("  MemoryPilot --add-known-secret  Read one secret value on stdin, keep only its SHA-256 print so it is masked everywhere");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop/session-end auto-ingest");
     println!("  MemoryPilot --hook session-start|stop|session-end  (called by the agents, JSON on stdin)");

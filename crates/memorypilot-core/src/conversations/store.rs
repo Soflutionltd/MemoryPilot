@@ -95,8 +95,12 @@ impl ConversationStore {
         Ok(Self { conn })
     }
 
+    /// The index at its usual place, with the known secrets loaded so that
+    /// everything written through it is redacted with them.
     pub fn open_default() -> Result<Self, String> {
-        Self::open(&default_path()?)
+        let path = default_path()?;
+        secrets::ensure_known_secrets();
+        Self::open(&path)
     }
 
     pub(super) fn origin_version(&self, origin_id: &str) -> Result<Option<String>, String> {

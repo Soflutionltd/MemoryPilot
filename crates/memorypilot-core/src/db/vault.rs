@@ -41,7 +41,8 @@ fn decode_key(text: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-#[cfg(target_os = "macos")]
+// Tests use a generated key instead (see `key`).
+#[cfg(all(target_os = "macos", not(test)))]
 fn load_or_create_key() -> Option<[u8; 32]> {
     // Keychain Services API directly: the key never appears on a command
     // line (visible to `ps`) as it would with /usr/bin/security -w.
@@ -68,7 +69,7 @@ fn load_or_create_key() -> Option<[u8; 32]> {
     decode_key(&String::from_utf8_lossy(&check))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 fn load_or_create_key() -> Option<[u8; 32]> {
     if std::env::var("MEMORYPILOT_VAULT").map(|v| v == "off").unwrap_or(false) {
         return None;
@@ -105,6 +106,67 @@ fn key() -> Option<&'static [u8; 32]> {
     {
         KEY.get_or_init(load_or_create_key).as_ref()
     }
+}
+
+/// The vault key if it already exists: never created, never prompted for
+/// beyond a Keychain read.
+fn existing_key() -> Option<[u8; 32]> {
+    #[cfg(test)]
+    {
+        key().copied()
+    }
+    #[cfg(not(test))]
+    {
+        if let Some(found) = KEY.get() {
+            return *found;
+        }
+        if std::env::var("MEMORYPILOT_VAULT").map(|v| v == "off").unwrap_or(false) {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        let found = security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .ok()
+            .and_then(|bytes| decode_key(&String::from_utf8_lossy(&bytes)));
+        #[cfg(not(target_os = "macos"))]
+        let found = dirs::home_dir()
+            .map(|home| home.join(".MemoryPilot").join("credentials.key"))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| decode_key(&text));
+        if let Some(key) = found {
+            let _ = KEY.set(Some(key));
+        }
+        found
+    }
+}
+
+/// Clear texts of the credentials of `db_path`, through a read-only
+/// connection: used to recognise their values elsewhere, never stored.
+/// Sealed credentials are left out when the key is unavailable.
+pub(crate) fn credential_clear_texts(db_path: &std::path::Path) -> Result<Vec<String>, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open {}: {}", db_path.display(), e))?;
+    let mut stmt = conn
+        .prepare("SELECT content, metadata FROM memories WHERE kind = 'credential'")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    let key = if rows.iter().any(|(content, _)| content.starts_with(SEAL_PREFIX)) { existing_key() } else { None };
+    Ok(rows
+        .into_iter()
+        .filter_map(|(content, metadata)| {
+            if !content.starts_with(SEAL_PREFIX) {
+                return Some(content);
+            }
+            let metadata: serde_json::Value = serde_json::from_str(&metadata?).ok()?;
+            decrypt_with(key.as_ref()?, metadata.get("enc")?.as_str()?)
+        })
+        .collect())
 }
 
 fn encrypt(plain: &str) -> Option<String> {
