@@ -467,11 +467,18 @@ fn known_format(value: &str) -> Option<(usize, &'static str)> {
 }
 
 /// Values meant to be public, whoever found them: publishable keys, Twilio
-/// Account SIDs, Supabase anon JWTs and JWT parts without their signature.
+/// Account SIDs, AWS documentation examples, Supabase anon JWTs and JWT parts
+/// without their signature.
 fn public_value(value: &str) -> bool {
     PUBLIC_PREFIXES.iter().any(|prefix| value.starts_with(prefix))
         || twilio_account_sid(value)
+        || aws_documentation_example(value)
         || public_jwt(value)
+}
+
+/// The access key ids of the AWS documentation, such as `AKIAIOSFODNN7EXAMPLE`.
+fn aws_documentation_example(value: &str) -> bool {
+    value.len() == 20 && (value.starts_with("AKIA") || value.starts_with("ASIA")) && value.ends_with("EXAMPLE")
 }
 
 /// `AC` and 32 lowercase hex digits.
@@ -1156,6 +1163,7 @@ pub(crate) mod tests {
             "Account ID Cloudflare a4b52d0892a12d1c1bbd8bf93c70c3f7",
             "App ID 6758370345, Team ID TB8CC687M3, bundle com.soflution.prive",
             "Key ID 77ZLGAGK7W, Issuer ID 69a6de70-03db-47e3-e053-5b8c7c11a4d1",
+            "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
             &stripe_public,
             &clerk_public,
             &supabase_publishable,
