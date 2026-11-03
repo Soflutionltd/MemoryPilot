@@ -52,11 +52,12 @@ const PREFIXES: &[(&str, usize, &str)] = &[
     ("xoxs-", 20, "slack"),
     ("AIza", 30, "google_api"),
     ("sbp_", 40, "generic"),
+    ("sb_secret_", 20, "supabase_secret"),
 ];
 
 /// Public ids that only point at a resource: never masked, however random.
 const PUBLIC_PREFIXES: &[&str] = &[
-    "pk_live_", "pk_test_", "acct_", "prod_", "price_", "plink_", "cus_", "sub_", "evt_", "we_", "prj_", "team_",
+    "pk_", "sb_publishable_", "acct_", "prod_", "price_", "plink_", "cus_", "sub_", "evt_", "we_", "prj_", "team_",
 ];
 
 /// Names whose value is a password (`password:`, `DB_PASSWD=`, `mdp :`).
@@ -340,6 +341,7 @@ pub fn findings_with(text: &str, known: &KnownSecrets) -> Vec<Finding> {
     }
     known_values(text, known, &mut found);
     let mut out = found.out;
+    out.retain(|finding| !public_value(&text[finding.range.clone()]));
     out.sort_by_key(|finding| finding.range.start);
     out
 }
@@ -462,6 +464,39 @@ fn known_format(value: &str) -> Option<(usize, &'static str)> {
         }
     }
     None
+}
+
+/// Values meant to be public, whoever found them: publishable keys, Twilio
+/// Account SIDs, Supabase anon JWTs and JWT parts without their signature.
+fn public_value(value: &str) -> bool {
+    PUBLIC_PREFIXES.iter().any(|prefix| value.starts_with(prefix))
+        || twilio_account_sid(value)
+        || public_jwt(value)
+}
+
+/// `AC` and 32 lowercase hex digits.
+fn twilio_account_sid(value: &str) -> bool {
+    value.len() == 34
+        && value.starts_with("AC")
+        && value[2..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A JWT whose payload has the `anon` role, or a header and payload alone.
+fn public_jwt(value: &str) -> bool {
+    use base64::Engine;
+    if !value.starts_with("eyJ") {
+        return false;
+    }
+    let claims = |part: &str| -> Option<serde_json::Map<String, serde_json::Value>> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part.trim_end_matches('=')).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let parts: Vec<&str> = value.split('.').collect();
+    match parts.len() {
+        1 | 2 => parts.iter().all(|part| claims(part).is_some()),
+        3 => claims(parts[1]).is_some_and(|payload| payload.get("role").and_then(|role| role.as_str()) == Some("anon")),
+        _ => false,
+    }
 }
 
 /// 2 letters, 2 check digits, 11 to 30 letters or digits, valid checksum.
@@ -680,7 +715,7 @@ fn credential_secret(value: &str) -> bool {
         && !value.starts_with("op:")
         && !value.starts_with(SEAL_MARK)
         && !is_email(value)
-        && !PUBLIC_PREFIXES.iter().any(|prefix| value.starts_with(prefix))
+        && !public_value(value)
         && (value.chars().any(|c| c.is_ascii_digit()) || value.chars().any(|c| PASSWORD_SYMBOLS.contains(&c)))
         && !identifier_like(value.split(['-', '_', '.']))
 }
@@ -1008,6 +1043,18 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// A Supabase-shaped JWT with the given role and a fake signature.
+    pub(crate) fn supabase_jwt(role: &str, seed: u64) -> String {
+        use base64::Engine;
+        let encode = |json: String| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        format!(
+            "{}.{}.{}",
+            encode(r#"{"alg":"HS256","typ":"JWT"}"#.to_string()),
+            encode(format!(r#"{{"iss":"supabase","ref":"{}","role":"{}","iat":1700000000}}"#, fake(20, seed).to_lowercase(), role)),
+            fake(43, seed + 1)
+        )
+    }
+
     fn positives() -> Vec<(String, &'static str, String)> {
         let mut cases = Vec::new();
         let mut case = |template: &str, kind: &'static str, value: String| {
@@ -1030,6 +1077,8 @@ pub(crate) mod tests {
         case("slack {}", "slack", format!("xoxb-1234567890-1234567890123-{}", fake(24, 20)));
         case("aws_access_key_id = {}", "aws", "AKIAQ7ZK3M9X2B5N8W4R".to_string());
         case("maps {}", "google_api", format!("AIza{}", fake(35, 21)));
+        case("SUPABASE_SECRET_KEY={}", "supabase_secret", format!("sb_secret_{}", fake(32, 34)));
+        case("**Anon Key** : `{}`", "jwt", supabase_jwt("service_role", 35));
         case(
             "cookie session={}; Path=/",
             "jwt",
@@ -1092,6 +1141,13 @@ pub(crate) mod tests {
     fn leaves_public_ids_and_ordinary_text_alone() {
         let image = format!("data:image/png;base64,{}", fake(400, 50));
         let stripe_public = format!("pk_live_{}", fake(99, 51));
+        let clerk_public = format!("CLERK_PUBLISHABLE_KEY=pk_test_{}", fake(48, 52));
+        let supabase_publishable = format!("PUBLIC_SUPABASE_KEY=`sb_publishable_{}`", fake(31, 53));
+        let anon = format!("NEXT_PUBLIC_SUPABASE_ANON_KEY={}", supabase_jwt("anon", 54));
+        let anon_token = format!("token: {} et Bearer {}", supabase_jwt("anon", 56), supabase_jwt("anon", 56));
+        let truncated = format!("`{}...` (ta clé anon)", supabase_jwt("anon", 58).split('.').next().unwrap());
+        let unsigned = supabase_jwt("anon", 60).rsplit_once('.').unwrap().0.to_string();
+        let twilio = format!("Account SID : AC{} - api_key: AC{}", fake_hex("twilio"), fake_hex("twilio2"));
         let negatives = [
             "commit 3f9c2a1b7e4d8f0a6c5b9e2d1f3a7c8b9d0e1f2a puis a1b2c3d",
             "uuid 550e8400-e29b-41d4-a716-446655440000",
@@ -1101,6 +1157,13 @@ pub(crate) mod tests {
             "App ID 6758370345, Team ID TB8CC687M3, bundle com.soflution.prive",
             "Key ID 77ZLGAGK7W, Issuer ID 69a6de70-03db-47e3-e053-5b8c7c11a4d1",
             &stripe_public,
+            &clerk_public,
+            &supabase_publishable,
+            &anon,
+            &anon_token,
+            &truncated,
+            &unsigned,
+            &twilio,
             "re_render et re_export, sk-learn (scikit-learn)",
             "/Users/antoinepinelli/Cursor/App/MemoryPilot/src/hooks.rs et ~/Cursor/App/Konta/apps/web",
             "https://docs.example.com/api/v2?page=3#auth postgres://localhost:5432/app git@github.com:Soflutionltd/MemoryPilot.git",
@@ -1258,7 +1321,10 @@ pub(crate) mod tests {
              https://app.example.com/projects/a93315ed/web/app1b2c3d4e5f6 CLIENT_SECRET={}",
             account, issuer, client_secret
         );
-        let third = format!("Cloudflare {} et {}", account, issuer);
+        let anon = supabase_jwt("anon", 92);
+        let twilio = format!("AC{}", fake_hex("twilio-sid"));
+        let publishable = format!("sb_publishable_{}", fake(31, 93));
+        let third = format!("Cloudflare {} et {} Anon Key {} SID {} {}", account, issuer, anon, twilio, publishable);
         known.insert_credential_texts(&[clear, second.as_str(), third.as_str()]);
         assert!(known.contains("Pg5ecret!2026x"));
         assert!(known.contains(&client_secret));
@@ -1273,6 +1339,9 @@ pub(crate) mod tests {
             "NODE_ENV=production",
             "app1b2c3d4e5f6",
             "550e8400-e29b-41d4-a716-446655440000",
+            &anon,
+            &twilio,
+            &publishable,
         ] {
             assert!(!known.contains(public), "{} taken as a secret", public);
         }
