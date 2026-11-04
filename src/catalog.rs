@@ -6,6 +6,8 @@
 //! - `origin`: `perso` (written here) or `vendor` (imported, kept as is);
 //! - `version`, `source`, `url`: for vendor items, where they come from;
 //! - `targets`: `claude_code`, `cursor`, `claude_app` (true when deployed);
+//! - `cursor_via` (plugins): `claude_code` when Cursor imports the Claude Code
+//!   plugin, `cursor_variant` when it gets the `cursor/` folder;
 //! - `updated`: date of the most recent file of the item;
 //! - `status`: `ok` (deployed to every wired tool), `partial` or `not_deployed`.
 //!
@@ -180,13 +182,24 @@ impl Ctx<'_> {
             .into_iter()
             .map(|p| {
                 let source = crate::plugins::read_source(&p.dir);
-                let cursor = p.cursor_dir.as_ref().is_some_and(|c| links_to(&self.home.join(".cursor/plugins/local").join(&p.name), c));
+                let claude_code = installed["plugins"].get(format!("{}@{}", p.name, crate::plugins::MARKETPLACE)).is_some();
+                let cursor_variant = p.cursor_dir.as_ref().is_some_and(|c| links_to(&self.home.join(".cursor/plugins/local").join(&p.name), c));
+                // Cursor imports the Claude Code plugins (third-party setting):
+                // with both wired, that import is its only copy.
+                let cursor_via = if cursor_variant {
+                    Some("cursor_variant")
+                } else if self.wired("cursor") && claude_code {
+                    Some("claude_code")
+                } else {
+                    None
+                };
                 let targets = json!({
-                    "claude_code": installed["plugins"].get(format!("{}@{}", p.name, crate::plugins::MARKETPLACE)).is_some(),
-                    "cursor": cursor,
+                    "claude_code": claude_code,
+                    "cursor": cursor_via.is_some(),
                     "claude_app": app,
                 });
                 let extra = json!({
+                    "cursor_via": cursor_via,
                     "version": (!p.version.is_empty()).then_some(p.version.clone()),
                     "source": source.as_ref().map(|s| format!("git {}", &s.commit[..s.commit.len().min(7)])),
                     "url": source.as_ref().map(|s| s.repo.clone()),

@@ -417,9 +417,10 @@ fn import_text(rules: &Path) -> String {
 }
 
 /// Whether a tool needs the links in `~/.agents/skills`. Cursor reads
-/// `~/.claude/skills` too ("Include third-party Plugins, Skills, and other
-/// configs", on by default and needed for its local plugins): with Claude Code
-/// wired, a second set would show every skill twice in Cursor.
+/// `~/.claude/skills` and imports Claude Code plugins too ("Include
+/// third-party Plugins, Skills, and other configs", on by default and needed
+/// for its local plugins): with Claude Code wired, a second set would show
+/// everything twice in Cursor.
 fn shared_skills_needed(tools: &[String]) -> bool {
     let has_claude = tools.iter().any(|t| t == "claude");
     tools.iter().any(|t| t != "claude" && !(has_claude && t == "cursor"))
@@ -478,18 +479,17 @@ fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
             });
         }
         match &plugin.cursor_dir {
-            // Cursor gets the plugin in its own format; its skills are not
-            // linked again into ~/.agents/skills, which Cursor reads too.
-            Some(cursor_dir) if has("cursor") => out.push(Entry::Link {
+            // Without Claude Code, Cursor gets the plugin in its own format;
+            // its skills are not linked again into ~/.agents/skills, which
+            // Cursor reads too. With it, Cursor imports the Claude Code plugin.
+            Some(cursor_dir) if has("cursor") && !has("claude") => out.push(Entry::Link {
                 tool: "cursor".into(),
                 path: paths.home.join(".cursor/plugins/local").join(&plugin.name),
                 target: cursor_dir.clone(),
                 adopted: false,
             }),
             Some(_) => {}
-            // Whether Cursor imports Claude Code plugins is not established:
-            // their skills stay linked for it.
-            None if tools.iter().any(|t| t != "claude") => {
+            None if shared_skills_needed(tools) => {
                 for dir in list_plugin_skills(&plugin.dir) {
                     let name = dir.file_name().unwrap_or_default().to_os_string();
                     out.push(Entry::Link {
@@ -1364,14 +1364,10 @@ pub fn uninstall_agents(args: &[String]) -> i32 {
         }
     };
     let remaining: Vec<String> = manifest.tools.iter().filter(|t| !removed.contains(t)).cloned().collect();
-    let skills_needed = shared_skills_needed(&remaining);
-    let plugin_skills_needed = remaining.iter().any(|t| t != "claude");
+    let shared_needed = shared_skills_needed(&remaining);
     let goes = |e: &Entry| {
         if e.tool() == SHARED_SKILLS {
-            match e {
-                Entry::Link { target, .. } if target.starts_with(paths.skills()) => !skills_needed,
-                _ => !plugin_skills_needed,
-            }
+            !shared_needed
         } else {
             removed.iter().any(|t| t == e.tool())
         }

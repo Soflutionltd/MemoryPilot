@@ -446,7 +446,7 @@ fn claude_calls(home: &Home) -> Vec<String> {
 }
 
 #[test]
-fn plugins_install_in_claude_code_link_cursor_variant_and_update() {
+fn plugins_install_in_claude_code_once_for_cursor_and_update() {
     let home = Home::new("plugins");
     home.mkdirs(&[".claude", ".cursor"]);
     fake_claude(&home);
@@ -471,9 +471,13 @@ fn plugins_install_in_claude_code_link_cursor_variant_and_update() {
     let market: Value = serde_json::from_str(&home.read(&format!("{}/.claude-plugin/marketplace.json", plugins))).unwrap();
     assert_eq!(market["name"], "memorypilot");
     assert_eq!(market["plugins"].as_array().unwrap().len(), 2);
-    assert!(is_link_to(&home.p(".cursor/plugins/local/kit"), &home.p(&format!("{}/kit/cursor", plugins))));
-    assert!(is_link_to(&home.p(".agents/skills/polish"), &home.p(&format!("{}/solo/skills/polish", plugins))));
-    assert!(std::fs::symlink_metadata(home.p(".agents/skills/audit")).is_err(), "kit has a Cursor variant: no shared skill link");
+    // Cursor imports the Claude Code plugins: no Cursor variant, no shared skill link.
+    assert!(std::fs::symlink_metadata(home.p(".cursor/plugins/local/kit")).is_err(), "single source: the Claude Code plugin");
+    assert!(std::fs::symlink_metadata(home.p(".agents/skills/polish")).is_err());
+    assert!(std::fs::symlink_metadata(home.p(".agents/skills/audit")).is_err());
+    let catalog: Value = serde_json::from_str(&home.read(".MemoryPilot/agents/catalog.json")).unwrap();
+    let kit = catalog["items"].as_array().unwrap().iter().find(|i| i["name"] == "kit").cloned().unwrap();
+    assert_eq!((kit["targets"]["cursor"].as_bool(), kit["cursor_via"].as_str(), kit["status"].as_str()), (Some(true), Some("claude_code"), Some("ok")));
 
     home.run(&["--sync-agents"]);
     assert_eq!(claude_calls(&home).len(), 3, "nothing changed: no claude call");
@@ -499,7 +503,10 @@ fn plugins_install_in_claude_code_link_cursor_variant_and_update() {
         ]
     );
     assert!(!home.p(&format!("{}/.claude-plugin/marketplace.json", plugins)).exists());
-    assert!(is_link_to(&home.p(".cursor/plugins/local/kit"), &home.p(&format!("{}/kit/cursor", plugins))), "Cursor still wired");
+    home.run(&["--sync-agents"]);
+    assert!(is_link_to(&home.p(".cursor/plugins/local/kit"), &home.p(&format!("{}/kit/cursor", plugins))), "Cursor alone gets its variant");
+    assert!(is_link_to(&home.p(".agents/skills/polish"), &home.p(&format!("{}/solo/skills/polish", plugins))));
+    assert!(std::fs::symlink_metadata(home.p(".agents/skills/audit")).is_err(), "kit has a Cursor variant: no shared skill link");
 }
 
 #[test]
