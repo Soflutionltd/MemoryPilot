@@ -307,7 +307,7 @@ fn handle_mcp_request(
                 },
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": { "name": "MemoryPilot", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials."
+                "instructions": crate::tools::server_instructions()
             }),
         ),
         "notifications/initialized" => {

@@ -2,6 +2,7 @@
 /// MemoryPilot v4.0 — God-Tier MCP memory server.
 /// Hybrid search (BM25 + fastembed RRF), Temporal Knowledge Graph, GC, Project Brain, File Watcher, HTTP server.
 /// (c) SOFLUTION LTD — Apache 2.0 License
+mod agent_skills;
 mod agents;
 mod conversations_cli;
 mod hooks;
@@ -452,7 +453,7 @@ fn handle_request(db: &db::Database, req: &JsonRpcRequest) -> JsonRpcResponse {
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": { "name": SERVER_NAME, "version": VERSION },
-                "instructions": "CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials."
+                "instructions": tools::server_instructions()
             }),
         ),
         "notifications/initialized" => JsonRpcResponse::success(req.id.clone(), json!({})),

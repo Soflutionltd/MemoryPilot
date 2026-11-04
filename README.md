@@ -533,7 +533,8 @@ State: `~/.MemoryPilot/cursor-hooks-state.json`. Log: `~/.MemoryPilot/cursor-hoo
 ~/.MemoryPilot/agents/
 ├── rules/AGENTS.md          your rules (starts as an example comment)
 ├── skills/<name>/SKILL.md   your skills (Agent Skills format)
-└── vendor/
+├── vendor/
+└── plugins/<plugin>/          whole plugins (skills read over MCP)
 ```
 
 ```bash
@@ -558,6 +559,7 @@ MemoryPilot --uninstall-agents [--tools codex]  # unwire, your files stay
 - Nothing is overwritten: an existing `agents/` folder is left as is, a skill name already taken in a tool is skipped and reported, a `CLAUDE.md` that is a symbolic link is not written (Claude Cowork ignores linked ones).
 - `agents/.manifest.json` records every link, line, block and generated file with its fingerprint. `--sync-agents` writes nothing while AGENTS.md and the skill list are unchanged, never fails (errors go to `~/.MemoryPilot/agents-sync.log`), and leaves hand-edited copies alone. `--uninstall-agents` removes only what the manifest lists and is still unmodified.
 - Claude Desktop (chat) cannot be wired: its rules and skills live in your claude.ai account.
+- Over MCP, `list_agent_skills` returns every skill (name, description, origin: `perso`, `vendor` or `plugin:<name>`) and `get_agent_skill(name, file?)` returns its `SKILL.md` and the list of its other files, or one of them such as `references/guide.md` (never a path outside the skill folder). The server `instructions` carry the skill names, so a client that does not read the folder (Claude app, remote access) still knows they exist. Plugin skills (`agents/plugins/<plugin>/skills/<name>/SKILL.md`) are named `<plugin>:<name>`.
 
 ## Knowledge Graph
 

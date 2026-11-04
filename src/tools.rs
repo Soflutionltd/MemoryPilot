@@ -33,6 +33,8 @@ const CORE_TOOLS: &[&str] = &[
     "list_skills",
     "get_skill",
     "rate_skill",
+    "list_agent_skills",
+    "get_agent_skill",
 ];
 
 pub fn init_tools_profile(db: &Database) {
@@ -877,6 +879,23 @@ fn all_tool_definitions() -> Value {
                 "properties": { "id": { "type": "string" } },
                 "required": ["id"]
             }
+        },
+        {
+            "name": "list_agent_skills",
+            "description": "List the user's agent skills (playbooks in ~/.MemoryPilot/agents: own skills, vendor skills and plugin skills named <plugin>:<skill>) with their description and origin. Read one with get_agent_skill before a task it covers.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "get_agent_skill",
+            "description": "Read an agent skill: its SKILL.md and the list of its other files. Pass `file` (relative path such as references/guide.md) to read one of those files instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Skill name from list_agent_skills, e.g. design-system-web or impeccable:audit (a bare plugin skill name works when unique)." },
+                    "file": { "type": "string", "description": "Optional file of the skill folder, relative, e.g. references/typography.md." }
+                },
+                "required": ["name"]
+            }
         }
     ]})
 }
@@ -953,6 +972,8 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
             Err(e) => tool_error(&e),
         },
         "get_skill" => handle_get_skill(db, args),
+        "list_agent_skills" => handle_list_agent_skills(),
+        "get_agent_skill" => handle_get_agent_skill(args),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
 }
@@ -2337,6 +2358,38 @@ fn handle_list_skills(db: &Database, args: &Value) -> Value {
         Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
     }
+}
+
+fn handle_list_agent_skills() -> Value {
+    match crate::agent_skills::agents_dir() {
+        Some(root) => tool_result(&crate::agent_skills::list_json(&root).to_string()),
+        None => tool_error("Home directory not found: ~/.MemoryPilot/agents is unreachable."),
+    }
+}
+
+fn handle_get_agent_skill(args: &Value) -> Value {
+    let Some(name) = args.get("name").and_then(|v| v.as_str()).filter(|n| !n.trim().is_empty()) else {
+        return tool_error("'name' is required. Call list_agent_skills for the names.");
+    };
+    let Some(root) = crate::agent_skills::agents_dir() else {
+        return tool_error("Home directory not found: ~/.MemoryPilot/agents is unreachable.");
+    };
+    let file = args.get("file").and_then(|v| v.as_str()).filter(|f| !f.trim().is_empty());
+    match crate::agent_skills::get_json(&root, name.trim(), file) {
+        Ok(value) => tool_result(&value.to_string()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+/// MCP `instructions`, shared by the stdio and HTTP servers, with the names
+/// of the agent skills so the client knows they exist.
+pub fn server_instructions() -> String {
+    let mut text = String::from("CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials.");
+    if let Some(line) = crate::agent_skills::agents_dir().and_then(|root| crate::agent_skills::instructions_line(&root)) {
+        text.push_str("\n4. ");
+        text.push_str(&line);
+    }
+    text
 }
 
 fn handle_get_skill(db: &Database, args: &Value) -> Value {
