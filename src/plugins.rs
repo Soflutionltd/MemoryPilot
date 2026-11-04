@@ -99,6 +99,10 @@ fn files(dir: &Path, skip: &[&str]) -> Vec<PathBuf> {
             if current == dir && skip.iter().any(|s| rel == Path::new(s)) {
                 continue;
             }
+            // A plugin at the root of its repository must not carry the clone's history.
+            if entry.file_name() == ".git" {
+                continue;
+            }
             let Ok(kind) = entry.file_type() else { continue };
             if kind.is_dir() {
                 stack.push(path);
@@ -278,20 +282,18 @@ fn version_of(dir: &Path) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
-/// Moves the current copy to `.backups/<folder>-<version>-<date>` and keeps
+/// Moves the current copy to `.backups/<folder>/<version>-<date>` and keeps
 /// the `BACKUPS_KEPT` most recent ones of this plugin.
 fn backup(root: &Path, folder: &str, dir: &Path) -> Result<PathBuf, String> {
-    let backups = root.join(BACKUPS_DIR);
+    let backups = root.join(BACKUPS_DIR).join(folder);
     std::fs::create_dir_all(&backups).map_err(|e| format!("{}: {}", backups.display(), e))?;
-    let name = format!("{}-{}-{}", folder, version_of(dir), chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let name = format!("{}-{}", version_of(dir), chrono::Local::now().format("%Y%m%d-%H%M%S"));
     let dest = backups.join(&name);
     std::fs::rename(dir, &dest).map_err(|e| format!("{}: {}", dest.display(), e))?;
-    let prefix = format!("{}-", folder);
     let mut olds: Vec<PathBuf> = std::fs::read_dir(&backups)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
         .map(|e| e.path())
         .collect();
     olds.sort_by_key(|p| p.metadata().and_then(|m| m.modified()).ok());
@@ -313,11 +315,8 @@ pub fn update_plugins(args: &[String]) -> i32 {
     };
     let root = home.join(".MemoryPilot/agents/plugins");
     let apply = args.iter().any(|a| a == "--apply");
-    let only: Option<&String> = args
-        .iter()
-        .position(|a| a == "--update-plugins")
-        .and_then(|i| args.get(i + 1))
-        .filter(|a| !a.starts_with("--"));
+    // args[0] is the binary: the plugin name is the first other argument that is not an option.
+    let only: Option<&String> = args.iter().skip(1).find(|a| !a.starts_with("--"));
     let plugins: Vec<Plugin> = list(&root).into_iter().filter(|p| only.is_none_or(|n| *n == p.name)).collect();
     if plugins.is_empty() {
         eprintln!("No plugin{} in {}", only.map(|n| format!(" named {}", n)).unwrap_or_default(), root.display());
@@ -337,9 +336,13 @@ pub fn update_plugins(args: &[String]) -> i32 {
                 status = 1;
                 continue;
             };
-            match backup(&root, &folder, &plugin.dir).and_then(|kept| {
-                std::fs::rename(&staged, &plugin.dir).map_err(|e| e.to_string())?;
-                Ok(kept)
+            match backup(&root, &folder, &plugin.dir).and_then(|kept| match std::fs::rename(&staged, &plugin.dir) {
+                Ok(()) => Ok(kept),
+                Err(e) => {
+                    // Put the previous copy back: the plugin must never be left missing.
+                    let restored = std::fs::rename(&kept, &plugin.dir).is_ok();
+                    Err(format!("{} ({})", e, if restored { "previous copy restored" } else { "previous copy left in .backups" }))
+                }
             }) {
                 Ok(kept) => println!(
                     "{}: {} → {} applied (commit {}), previous copy in {}",
@@ -433,6 +436,14 @@ mod tests {
     }
 
     #[test]
+    fn copies_skip_the_git_folder() {
+        let root = temp_root();
+        write(&root.0.join("repo/.git/HEAD"), "ref");
+        write(&root.0.join("repo/skills/a/SKILL.md"), "a");
+        assert_eq!(files(&root.0.join("repo"), &[]), vec![PathBuf::from("skills/a/SKILL.md")]);
+    }
+
+    #[test]
     fn fingerprint_ignores_the_cursor_copy_and_source_file() {
         let root = temp_root();
         let dir = root.0.join("kit");
@@ -456,8 +467,11 @@ mod tests {
             backup(r, "kit", &dir).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(1100));
         }
-        let left: Vec<String> = std::fs::read_dir(r.join(BACKUPS_DIR)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        write(&r.join("kit-pro/.claude-plugin/plugin.json"), r#"{"version":"9.0"}"#);
+        backup(r, "kit-pro", &r.join("kit-pro")).unwrap();
+        let left: Vec<String> = std::fs::read_dir(r.join(BACKUPS_DIR).join("kit")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
         assert_eq!(left.len(), BACKUPS_KEPT);
-        assert!(left.iter().all(|n| !n.starts_with("kit-1.0-") && !n.starts_with("kit-1.1-")), "{:?}", left);
+        assert!(left.iter().all(|n| !n.starts_with("1.0-") && !n.starts_with("1.1-")), "{:?}", left);
+        assert_eq!(std::fs::read_dir(r.join(BACKUPS_DIR).join("kit-pro")).unwrap().count(), 1, "another plugin's backups are untouched");
     }
 }

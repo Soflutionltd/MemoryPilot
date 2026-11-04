@@ -534,3 +534,42 @@ fn cursor_sees_each_skill_once() {
     home.run(&["--sync-agents"]);
     assert!(std::fs::symlink_metadata(home.p(".agents/skills/theirs")).is_err());
 }
+
+#[test]
+fn cursor_cleanup_spares_other_tools_and_linked_folders() {
+    // ~/.cursor/skills is itself a link into the agents folder: nothing is removed.
+    let home = Home::new("cursor-linked");
+    home.mkdirs(&[".cursor"]);
+    home.add_skill("mine");
+    std::os::unix::fs::symlink(home.p(".MemoryPilot/agents/skills"), home.p(".cursor/skills")).unwrap();
+    home.run(&["--setup-agents", "--tools", "cursor"]);
+    assert!(home.p(".MemoryPilot/agents/skills/mine/SKILL.md").is_file());
+    assert!(is_link_to(&home.p(".agents/skills/mine"), &home.p(".MemoryPilot/agents/skills/mine")));
+
+    // A third-party folder of the same name in ~/.cursor/skills does not cost
+    // Codex its link; a vendor link is not removed.
+    let home = Home::new("cursor-codex");
+    home.mkdirs(&[".cursor/skills", ".codex"]);
+    home.add_skill("foo");
+    home.write(".cursor/skills/foo/SKILL.md", "---\nname: foo\n---\n");
+    home.write(".MemoryPilot/agents/vendor/bar/SKILL.md", "---\nname: bar\n---\n");
+    std::os::unix::fs::symlink(home.p(".MemoryPilot/agents/vendor/bar"), home.p(".cursor/skills/bar")).unwrap();
+    home.run(&["--setup-agents", "--tools", "cursor,codex"]);
+    assert!(is_link_to(&home.p(".agents/skills/foo"), &home.p(".MemoryPilot/agents/skills/foo")), "Codex keeps the skill");
+    assert!(is_link_to(&home.p(".cursor/skills/bar"), &home.p(".MemoryPilot/agents/vendor/bar")), "vendor link kept");
+}
+
+#[test]
+fn renamed_plugin_replaces_the_old_one() {
+    let home = Home::new("plugin-rename");
+    home.mkdirs(&[".claude"]);
+    fake_claude(&home);
+    home.run(&["--setup-agents", "--tools", "claude"]);
+    home.write(".MemoryPilot/agents/plugins/kit/.claude-plugin/plugin.json", r#"{"name":"kit"}"#);
+    home.run(&["--sync-agents"]);
+    home.write(".MemoryPilot/agents/plugins/kit/.claude-plugin/plugin.json", r#"{"name":"kit2"}"#);
+    home.run(&["--sync-agents"]);
+    let calls = claude_calls(&home);
+    assert!(calls.contains(&"plugin uninstall kit@memorypilot --scope user".to_string()), "{:?}", calls);
+    assert_eq!(calls.last().unwrap(), "plugin install kit2@memorypilot --scope user");
+}

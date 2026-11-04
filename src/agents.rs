@@ -268,14 +268,21 @@ fn inputs_fingerprint(paths: &Paths, tools: &[String]) -> String {
         .iter()
         .map(|p| format!("{}:{}:{}", p.name, crate::plugins::claude_fingerprint(&p.dir), p.cursor_dir.is_some()))
         .collect();
+    let cursor_skills: Vec<String> = cursor_skills_dir(paths)
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|entries| entries.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
+        .unwrap_or_default();
+    let mut cursor_skills = cursor_skills;
+    cursor_skills.sort();
     let text = format!(
-        "v{}|{}|cursor_rule={}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "v{}|{}|cursor_rule={}|{}|{}|{}|cursor_skills={}|{}|{}|{}|{}|{}",
         MANIFEST_VERSION,
         tools.join(","),
         CURSOR_RULE_FROM_AGENTS_MD,
         rules,
         list_skills(paths).join("/"),
         plugins.join("/"),
+        cursor_skills.join("/"),
         paths.agents.display(),
         paths.claude.display(),
         paths.codex.display(),
@@ -434,10 +441,11 @@ fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
     if tools.iter().any(|t| t != "claude") {
         skill_links(&mut out, SHARED_SKILLS, paths.home.join(".agents").join("skills"));
     }
-    if has("cursor") {
+    let only_cursor_reads_shared = tools.iter().all(|t| t == "claude" || t == "cursor");
+    if let Some(cursor_skills) = cursor_skills_dir(paths).filter(|_| has("cursor") && only_cursor_reads_shared) {
         // Cursor also reads ~/.cursor/skills: a skill already there would be
-        // seen twice, so it gets no second link in ~/.agents/skills.
-        let cursor_skills = paths.home.join(".cursor/skills");
+        // seen twice, so it gets no second link in ~/.agents/skills. Kept when
+        // another tool reads ~/.agents/skills: it must not lose the skill.
         out.retain(|e| match e {
             Entry::Link { tool, path, .. } if tool == SHARED_SKILLS => path
                 .file_name()
@@ -552,7 +560,21 @@ fn list_plugin_skills(plugin: &Path) -> Vec<PathBuf> {
 }
 
 fn same_slot(a: &Entry, b: &Entry) -> bool {
+    if let (Entry::ClaudePlugin { name: a_name, .. }, Entry::ClaudePlugin { name: b_name, .. }) = (a, b) {
+        // A renamed plugin is another plugin for Claude Code: the old one is uninstalled.
+        return a_name == b_name && a.path() == b.path();
+    }
     std::mem::discriminant(a) == std::mem::discriminant(b) && a.path() == b.path()
+}
+
+/// `~/.cursor/skills` when it is a real folder of its own. `None` when it is
+/// missing or resolves into the agents folder (then its entries are ours, not
+/// Cursor's, and must neither be cleaned nor taken as taken names).
+fn cursor_skills_dir(paths: &Paths) -> Option<PathBuf> {
+    let dir = paths.home.join(".cursor/skills");
+    let real = dir.canonicalize().ok()?;
+    let agents = paths.agents.canonicalize().unwrap_or_else(|_| paths.agents.clone());
+    (!is_symlink(&dir) && !real.starts_with(&agents)).then_some(dir)
 }
 
 impl Ctx<'_> {
@@ -753,7 +775,7 @@ impl Ctx<'_> {
                         self.did(format!("add marketplace {} to Claude Code", crate::plugins::MARKETPLACE));
                     } else if let Err(e) = crate::plugins::claude_cli(&home, &["plugin", "marketplace", "add", &root.to_string_lossy()]) {
                         self.fail(e);
-                        return None;
+                        return old.cloned();
                     } else {
                         self.did(format!("add marketplace {} to Claude Code", crate::plugins::MARKETPLACE));
                     }
@@ -783,8 +805,32 @@ impl Ctx<'_> {
         }
     }
 
-    /// Undoes one recorded entry if it is still exactly ours.
-    fn remove(&mut self, entry: &Entry) {
+    /// Undoes one recorded entry if it is still exactly ours. False only when
+    /// a Claude Code plugin could not be uninstalled: the entry must stay recorded.
+    fn remove(&mut self, entry: &Entry) -> bool {
+        if let Entry::ClaudePlugin { name, .. } = entry {
+            return self.uninstall_claude_plugin(name);
+        }
+        self.remove_wiring(entry);
+        true
+    }
+
+    fn uninstall_claude_plugin(&mut self, name: &str) -> bool {
+        if !crate::plugins::plugin_installed(&self.paths.claude, name) {
+            return true;
+        }
+        let id = format!("{}@{}", name, crate::plugins::MARKETPLACE);
+        if !self.dry_run {
+            if let Err(e) = crate::plugins::claude_cli(&self.paths.home, &["plugin", "uninstall", &id, "--scope", "user"]) {
+                self.fail(e);
+                return false;
+            }
+        }
+        self.did(format!("uninstall Claude Code plugin {}", id));
+        true
+    }
+
+    fn remove_wiring(&mut self, entry: &Entry) {
         let shown = display(self.paths, entry.path());
         match entry {
             Entry::Link { path, target, .. } => {
@@ -831,19 +877,7 @@ impl Ctx<'_> {
                     self.write(path, &updated, format!("remove rules from {}", shown));
                 }
             }
-            Entry::ClaudePlugin { name, .. } => {
-                if !crate::plugins::plugin_installed(&self.paths.claude, name) {
-                    return;
-                }
-                let id = format!("{}@{}", name, crate::plugins::MARKETPLACE);
-                if !self.dry_run {
-                    if let Err(e) = crate::plugins::claude_cli(&self.paths.home, &["plugin", "uninstall", &id, "--scope", "user"]) {
-                        self.fail(e);
-                        return;
-                    }
-                }
-                self.did(format!("uninstall Claude Code plugin {}", id));
-            }
+            Entry::ClaudePlugin { .. } => {}
         }
     }
 
@@ -882,14 +916,22 @@ impl Ctx<'_> {
     /// wiring made by hand before MemoryPilot. Cursor gets the same skills
     /// from `~/.agents/skills`, so they would make every skill appear twice.
     fn remove_legacy_cursor_links(&mut self) {
-        let dir = self.paths.home.join(".cursor/skills");
-        let Ok(agents) = self.paths.agents.canonicalize() else { return };
+        let Some(dir) = cursor_skills_dir(self.paths) else { return };
+        let Ok(skills) = self.paths.skills().canonicalize() else { return };
+        let relinked = list_skills(self.paths);
         let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        // Only links to a skill MemoryPilot links again in ~/.agents/skills:
+        // anything else (vendor, plugins, other folders) is left for Cursor.
         let mut links: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
             .filter(|p| is_symlink(p))
-            .filter(|p| p.canonicalize().is_ok_and(|target| target.starts_with(&agents)))
+            .filter(|p| {
+                p.canonicalize().is_ok_and(|target| {
+                    target.parent() == Some(skills.as_path())
+                        && target.file_name().is_some_and(|n| relinked.iter().any(|r| n == r.as_str()))
+                })
+            })
             .collect();
         links.sort();
         for link in links {
@@ -903,12 +945,12 @@ impl Ctx<'_> {
             self.remove_legacy_cursor_links();
         }
         let wanted = desired(self.paths, tools);
+        let mut kept = Vec::new();
         for entry in old {
-            if !wanted.iter().any(|w| same_slot(w, entry) && w.tool() == entry.tool()) {
-                self.remove(entry);
+            if !wanted.iter().any(|w| same_slot(w, entry) && w.tool() == entry.tool()) && !self.remove(entry) {
+                kept.push(entry.clone());
             }
         }
-        let mut kept = Vec::new();
         for want in wanted {
             let previous = old.iter().find(|e| same_slot(e, &want));
             if let Some(entry) = self.ensure(want, previous) {
@@ -1304,9 +1346,7 @@ pub fn uninstall_agents(args: &[String]) -> i32 {
     let mut ctx = Ctx { paths: &paths, dry_run, report: Report::default() };
     let mut entries = Vec::new();
     for entry in &manifest.entries {
-        if goes(entry) {
-            ctx.remove(entry);
-        } else {
+        if !goes(entry) || !ctx.remove(entry) {
             entries.push(entry.clone());
         }
     }
