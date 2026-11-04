@@ -8,6 +8,7 @@ mod conversations_cli;
 mod hooks;
 #[cfg(feature = "http")]
 mod http;
+mod plugins;
 mod protocol;
 mod tools;
 mod update;
@@ -79,6 +80,9 @@ fn main() {
     }
     if args.iter().any(|a| a == "--uninstall-agents") {
         std::process::exit(agents::uninstall_agents(&args));
+    }
+    if args.iter().any(|a| a == "--update-plugins") {
+        std::process::exit(plugins::update_plugins(&args));
     }
     if args.iter().any(|a| a == "--index-conversations") {
         conversations_cli::run_index(&args);
@@ -1205,6 +1209,7 @@ fn print_help() {
     println!("  MemoryPilot --setup-agents [--tools claude,cursor,...] [--dry-run]  Create ~/.MemoryPilot/agents (your rules and skills) and wire it into your tools");
     println!("  MemoryPilot --sync-agents    Wire new skills, regenerate rule copies (no write when nothing changed, never fails)");
     println!("  MemoryPilot --uninstall-agents [--tools ...]  Unwire what --setup-agents added; your rules and skills stay");
+    println!("  MemoryPilot --update-plugins [NAME] [--apply]  Show the upstream diff of vendor plugins (agents/plugins/*/plugin.source.json); --apply installs the reviewed copy, previous one kept in plugins/.backups");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");

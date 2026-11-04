@@ -411,3 +411,107 @@ fn dry_run_writes_nothing() {
     assert!(out.contains("Dry run"), "{}", out);
     assert_eq!(files_under(&home.0), vec![".claude/", "bin/"]);
 }
+
+/// Fake `claude` in `~/bin`: logs each call and keeps the two files
+/// MemoryPilot reads to know what is installed.
+fn fake_claude(home: &Home) {
+    home.write(
+        "bin/claude",
+        r#"#!/bin/sh
+PATH=/bin:/usr/bin
+P="$HOME/.claude/plugins"
+mkdir -p "$P"
+echo "$*" >> "$HOME/claude-calls.log"
+case "$1 $2 $3" in
+  "plugin marketplace add") echo '{"memorypilot":{}}' > "$P/known_marketplaces.json" ;;
+  "plugin marketplace remove") echo '{}' > "$P/known_marketplaces.json" ;;
+esac
+case "$1 $2" in
+  "plugin install")
+    old=$(cat "$P/installed.list" 2>/dev/null)
+    printf '%s\n%s\n' "$old" "$3" | grep . > "$P/installed.list" ;;
+  "plugin uninstall")
+    grep -vx "$3" "$P/installed.list" > "$P/installed.tmp"; mv "$P/installed.tmp" "$P/installed.list" ;;
+esac
+{ printf '{"plugins":{'; sep=""; while read -r id; do printf '%s"%s":[{}]' "$sep" "$id"; sep=","; done < "$P/installed.list"; printf '}}'; } > "$P/installed_plugins.json" 2>/dev/null
+exit 0
+"#,
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(home.p("bin/claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn claude_calls(home: &Home) -> Vec<String> {
+    std::fs::read_to_string(home.p("claude-calls.log")).unwrap_or_default().lines().map(str::to_string).collect()
+}
+
+#[test]
+fn plugins_install_in_claude_code_link_cursor_variant_and_update() {
+    let home = Home::new("plugins");
+    home.mkdirs(&[".claude", ".cursor"]);
+    fake_claude(&home);
+    home.run(&["--setup-agents", "--tools", "claude,cursor"]);
+    let plugins = ".MemoryPilot/agents/plugins";
+    home.write(&format!("{}/kit/.claude-plugin/plugin.json", plugins), r#"{"name":"kit","version":"1.0.0"}"#);
+    home.write(&format!("{}/kit/skills/audit/SKILL.md", plugins), "---\nname: audit\n---\n");
+    home.write(&format!("{}/kit/cursor/.cursor-plugin/plugin.json", plugins), r#"{"name":"kit"}"#);
+    home.write(&format!("{}/solo/.claude-plugin/plugin.json", plugins), r#"{"name":"solo"}"#);
+    home.write(&format!("{}/solo/skills/polish/SKILL.md", plugins), "---\nname: polish\n---\n");
+
+    home.run(&["--sync-agents"]);
+    let calls = claude_calls(&home);
+    assert_eq!(
+        calls,
+        vec![
+            format!("plugin marketplace add {}", home.p(plugins).display()),
+            "plugin install kit@memorypilot --scope user".to_string(),
+            "plugin install solo@memorypilot --scope user".to_string(),
+        ]
+    );
+    let market: Value = serde_json::from_str(&home.read(&format!("{}/.claude-plugin/marketplace.json", plugins))).unwrap();
+    assert_eq!(market["name"], "memorypilot");
+    assert_eq!(market["plugins"].as_array().unwrap().len(), 2);
+    assert!(is_link_to(&home.p(".cursor/plugins/local/kit"), &home.p(&format!("{}/kit/cursor", plugins))));
+    assert!(is_link_to(&home.p(".agents/skills/polish"), &home.p(&format!("{}/solo/skills/polish", plugins))));
+    assert!(std::fs::symlink_metadata(home.p(".agents/skills/audit")).is_err(), "kit has a Cursor variant: no shared skill link");
+
+    home.run(&["--sync-agents"]);
+    assert_eq!(claude_calls(&home).len(), 3, "nothing changed: no claude call");
+
+    home.write(&format!("{}/kit/skills/audit/SKILL.md", plugins), "---\nname: audit\n---\nv2\n");
+    home.run(&["--sync-agents"]);
+    assert_eq!(
+        claude_calls(&home)[3..],
+        ["plugin marketplace update memorypilot".to_string(), "plugin update kit@memorypilot --scope user".to_string()]
+    );
+
+    home.write(&format!("{}/kit/cursor/README.md", plugins), "cursor only");
+    home.run(&["--sync-agents"]);
+    assert_eq!(claude_calls(&home).len(), 5, "a change in cursor/ needs no Claude Code update");
+
+    home.run(&["--uninstall-agents", "--tools", "claude"]);
+    assert_eq!(
+        claude_calls(&home)[5..],
+        [
+            "plugin uninstall kit@memorypilot --scope user".to_string(),
+            "plugin uninstall solo@memorypilot --scope user".to_string(),
+            "plugin marketplace remove memorypilot".to_string(),
+        ]
+    );
+    assert!(!home.p(&format!("{}/.claude-plugin/marketplace.json", plugins)).exists());
+    assert!(is_link_to(&home.p(".cursor/plugins/local/kit"), &home.p(&format!("{}/kit/cursor", plugins))), "Cursor still wired");
+}
+
+#[test]
+fn failed_claude_call_is_retried_at_next_sync() {
+    let home = Home::new("plugins-retry");
+    home.mkdirs(&[".claude"]);
+    home.run(&["--setup-agents", "--tools", "claude"]);
+    home.write(".MemoryPilot/agents/plugins/kit/.claude-plugin/plugin.json", r#"{"name":"kit"}"#);
+    home.run(&["--sync-agents"]);
+    assert!(home.read(".MemoryPilot/agents-sync.log").contains("claude command not found"));
+    assert_eq!(home.manifest()["inputs"], "", "empty print: next session retries");
+    fake_claude(&home);
+    home.run(&["--sync-agents"]);
+    assert_eq!(claude_calls(&home).last().unwrap(), "plugin install kit@memorypilot --scope user");
+}

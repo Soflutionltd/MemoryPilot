@@ -1,7 +1,10 @@
 //! The user's own rules and skills for every coding agent.
 //!
 //! `~/.MemoryPilot/agents/` holds `rules/AGENTS.md`, `skills/<name>/SKILL.md`
-//! (Agent Skills format) and `vendor/`. MemoryPilot ships none of them: it
+//! (Agent Skills format), `vendor/` and `plugins/<name>/` (whole plugins, see
+//! `plugins.rs`): Claude Code installs them as plugins of the generated
+//! `memorypilot` marketplace, Cursor links their `cursor/` variant into
+//! `~/.cursor/plugins/local/`, and without one the other tools get their skills. MemoryPilot ships none of them: it
 //! only creates the empty folder and wires it into the tools the user picked.
 //!
 //! `MemoryPilot --setup-agents [--tools a,b] [--dry-run]` : creates the folder
@@ -96,6 +99,10 @@ impl Paths {
         self.agents.join("skills")
     }
 
+    fn plugins(&self) -> PathBuf {
+        self.agents.join("plugins")
+    }
+
     fn manifest(&self) -> PathBuf {
         self.agents.join(MANIFEST_FILE)
     }
@@ -175,6 +182,9 @@ enum Entry {
         #[serde(default)]
         created_file: bool,
     },
+    /// Plugin folder `path` installed in Claude Code as `<name>@memorypilot`;
+    /// `sha256` of its content when last installed or updated.
+    ClaudePlugin { tool: String, path: PathBuf, name: String, sha256: String },
 }
 
 impl Entry {
@@ -184,7 +194,8 @@ impl Entry {
             | Entry::Import { tool, .. }
             | Entry::Block { tool, .. }
             | Entry::File { tool, .. }
-            | Entry::JsonArray { tool, .. } => tool,
+            | Entry::JsonArray { tool, .. }
+            | Entry::ClaudePlugin { tool, .. } => tool,
         }
     }
 
@@ -194,7 +205,8 @@ impl Entry {
             | Entry::Import { path, .. }
             | Entry::Block { path, .. }
             | Entry::File { path, .. }
-            | Entry::JsonArray { path, .. } => path,
+            | Entry::JsonArray { path, .. }
+            | Entry::ClaudePlugin { path, .. } => path,
         }
     }
 }
@@ -252,13 +264,18 @@ fn list_skills(paths: &Paths) -> Vec<String> {
 
 fn inputs_fingerprint(paths: &Paths, tools: &[String]) -> String {
     let rules = std::fs::read(paths.rules()).map(|b| sha256_hex(&b)).unwrap_or_else(|_| "none".into());
+    let plugins: Vec<String> = crate::plugins::list(&paths.plugins())
+        .iter()
+        .map(|p| format!("{}:{}:{}", p.name, crate::plugins::claude_fingerprint(&p.dir), p.cursor_dir.is_some()))
+        .collect();
     let text = format!(
-        "v{}|{}|cursor_rule={}|{}|{}|{}|{}|{}|{}|{}",
+        "v{}|{}|cursor_rule={}|{}|{}|{}|{}|{}|{}|{}|{}",
         MANIFEST_VERSION,
         tools.join(","),
         CURSOR_RULE_FROM_AGENTS_MD,
         rules,
         list_skills(paths).join("/"),
+        plugins.join("/"),
         paths.agents.display(),
         paths.claude.display(),
         paths.codex.display(),
@@ -417,6 +434,39 @@ fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
     if tools.iter().any(|t| t != "claude") {
         skill_links(&mut out, SHARED_SKILLS, paths.home.join(".agents").join("skills"));
     }
+    for plugin in crate::plugins::list(&paths.plugins()) {
+        if has("claude") {
+            out.push(Entry::ClaudePlugin {
+                tool: "claude".into(),
+                sha256: crate::plugins::claude_fingerprint(&plugin.dir),
+                path: plugin.dir.clone(),
+                name: plugin.name.clone(),
+            });
+        }
+        match &plugin.cursor_dir {
+            // Cursor gets the plugin in its own format; its skills are not
+            // linked again into ~/.agents/skills, which Cursor reads too.
+            Some(cursor_dir) if has("cursor") => out.push(Entry::Link {
+                tool: "cursor".into(),
+                path: paths.home.join(".cursor/plugins/local").join(&plugin.name),
+                target: cursor_dir.clone(),
+                adopted: false,
+            }),
+            Some(_) => {}
+            None if tools.iter().any(|t| t != "claude") => {
+                for dir in list_plugin_skills(&plugin.dir) {
+                    let name = dir.file_name().unwrap_or_default().to_os_string();
+                    out.push(Entry::Link {
+                        tool: SHARED_SKILLS.into(),
+                        path: paths.home.join(".agents/skills").join(name),
+                        target: dir,
+                        adopted: false,
+                    });
+                }
+            }
+            None => {}
+        }
+    }
     let Some(rules) = rules else {
         return out;
     };
@@ -475,6 +525,19 @@ fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
         }
     }
     out
+}
+
+/// Skill folders of a plugin (`skills/<name>/SKILL.md`), sorted.
+fn list_plugin_skills(plugin: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(plugin.join("skills"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("SKILL.md").is_file())
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 fn same_slot(a: &Entry, b: &Entry) -> bool {
@@ -665,6 +728,47 @@ impl Ctx<'_> {
                 let ok = self.write(&path, &updated, format!("add rules to {}", shown));
                 ok.then_some(Entry::JsonArray { tool, path, key, value, created_file: created_before || existing.is_none() })
             }
+            Entry::ClaudePlugin { tool, path, name, sha256 } => {
+                let id = format!("{}@{}", name, crate::plugins::MARKETPLACE);
+                let root = self.paths.plugins();
+                let market = crate::plugins::marketplace_path(&root);
+                if !self.write(&market, &crate::plugins::render_marketplace(&root), format!("generate {}", display(self.paths, &market))) {
+                    return None;
+                }
+                let claude = self.paths.claude.clone();
+                let home = self.paths.home.clone();
+                if !crate::plugins::marketplace_known(&claude) {
+                    if self.dry_run {
+                        self.did(format!("add marketplace {} to Claude Code", crate::plugins::MARKETPLACE));
+                    } else if let Err(e) = crate::plugins::claude_cli(&home, &["plugin", "marketplace", "add", &root.to_string_lossy()]) {
+                        self.fail(e);
+                        return None;
+                    } else {
+                        self.did(format!("add marketplace {} to Claude Code", crate::plugins::MARKETPLACE));
+                    }
+                }
+                let installed = crate::plugins::plugin_installed(&claude, &name);
+                let changed = !matches!(old, Some(Entry::ClaudePlugin { sha256: old_sha, .. }) if *old_sha == sha256);
+                let steps: Vec<Vec<&str>> = if !installed {
+                    vec![vec!["plugin", "install", &id, "--scope", "user"]]
+                } else if changed {
+                    vec![vec!["plugin", "marketplace", "update", crate::plugins::MARKETPLACE], vec!["plugin", "update", &id, "--scope", "user"]]
+                } else {
+                    return Some(Entry::ClaudePlugin { tool, path, name, sha256 });
+                };
+                let what = if installed { format!("update Claude Code plugin {}", id) } else { format!("install Claude Code plugin {}", id) };
+                if !self.dry_run {
+                    for step in &steps {
+                        if let Err(e) = crate::plugins::claude_cli(&home, step) {
+                            self.fail(e);
+                            // Keep the previous print so the next sync tries again.
+                            return old.cloned().filter(|_| installed);
+                        }
+                    }
+                }
+                self.did(what);
+                Some(Entry::ClaudePlugin { tool, path, name, sha256 })
+            }
         }
     }
 
@@ -716,6 +820,40 @@ impl Ctx<'_> {
                     self.write(path, &updated, format!("remove rules from {}", shown));
                 }
             }
+            Entry::ClaudePlugin { name, .. } => {
+                if !crate::plugins::plugin_installed(&self.paths.claude, name) {
+                    return;
+                }
+                let id = format!("{}@{}", name, crate::plugins::MARKETPLACE);
+                if !self.dry_run {
+                    if let Err(e) = crate::plugins::claude_cli(&self.paths.home, &["plugin", "uninstall", &id, "--scope", "user"]) {
+                        self.fail(e);
+                        return;
+                    }
+                }
+                self.did(format!("uninstall Claude Code plugin {}", id));
+            }
+        }
+    }
+
+    /// Once no plugin is installed through it any more, removes the
+    /// `memorypilot` marketplace from Claude Code and its generated file.
+    fn drop_marketplace_if_unused(&mut self, entries: &[Entry]) {
+        if entries.iter().any(|e| matches!(e, Entry::ClaudePlugin { .. })) {
+            return;
+        }
+        if crate::plugins::marketplace_known(&self.paths.claude) {
+            if !self.dry_run {
+                if let Err(e) = crate::plugins::claude_cli(&self.paths.home, &["plugin", "marketplace", "remove", crate::plugins::MARKETPLACE]) {
+                    self.fail(e);
+                    return;
+                }
+            }
+            self.did(format!("remove marketplace {} from Claude Code", crate::plugins::MARKETPLACE));
+        }
+        let market = crate::plugins::marketplace_path(&self.paths.plugins());
+        if market.is_file() {
+            self.remove_file(&market, format!("remove {}", display(self.paths, &market)));
         }
     }
 
@@ -742,6 +880,9 @@ impl Ctx<'_> {
             if let Some(entry) = self.ensure(want, previous) {
                 kept.push(entry);
             }
+        }
+        if old.iter().any(|e| matches!(e, Entry::ClaudePlugin { .. })) {
+            self.drop_marketplace_if_unused(&kept);
         }
         kept
     }
@@ -1073,6 +1214,9 @@ pub fn sync_agents() {
     }
     let mut ctx = Ctx { paths: &paths, dry_run: false, report: Report::default() };
     let entries = ctx.reconcile(&manifest.entries, &manifest.tools);
+    // After an error (a `claude plugin` command that failed, a locked file),
+    // an empty print makes the next session try again.
+    let inputs = if ctx.report.errors.is_empty() { inputs } else { String::new() };
     let updated = Manifest { inputs, entries, ..manifest };
     if let Err(e) = save_manifest(&paths, &updated) {
         ctx.fail(e);
@@ -1131,6 +1275,9 @@ pub fn uninstall_agents(args: &[String]) -> i32 {
         } else {
             entries.push(entry.clone());
         }
+    }
+    if manifest.entries.iter().any(|e| matches!(e, Entry::ClaudePlugin { .. })) {
+        ctx.drop_marketplace_if_unused(&entries);
     }
     let in_sync = manifest.inputs == inputs_fingerprint(&paths, &manifest.tools);
     let inputs = if in_sync { inputs_fingerprint(&paths, &remaining) } else { manifest.inputs.clone() };
