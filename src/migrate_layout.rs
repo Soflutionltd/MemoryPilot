@@ -76,7 +76,12 @@ fn private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_move(root: &Path, m: &Move) -> Result<(), String> {
+/// `Ok(false)` when the source is gone since the plan (SQLite removes -wal
+/// and -shm when the last connection closes, as the backup does).
+fn apply_move(root: &Path, m: &Move) -> Result<bool, String> {
+    if std::fs::symlink_metadata(&m.from).is_err() {
+        return Ok(false);
+    }
     if std::fs::symlink_metadata(&m.to).is_ok() {
         return Err(format!("{} already exists: {} left in place", shown(root, &m.to), shown(root, &m.from)));
     }
@@ -88,7 +93,7 @@ fn apply_move(root: &Path, m: &Move) -> Result<(), String> {
     if m.link_back {
         std::os::unix::fs::symlink(&m.to, &m.from).map_err(|e| format!("link {}: {}", shown(root, &m.from), e))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -160,9 +165,11 @@ pub fn run(args: &[String]) -> i32 {
 
     let mut failed = 0;
     let mut moved = 0;
+    let mut gone = 0;
     for m in &moves {
         match apply_move(&root, m) {
-            Ok(()) => moved += 1,
+            Ok(true) => moved += 1,
+            Ok(false) => gone += 1,
             Err(e) => {
                 failed += 1;
                 eprintln!("  ✗ {}", e);
@@ -184,6 +191,6 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
     restart(service);
-    println!("{} of {} entries moved, {} problem(s). Nothing deleted.", moved, moves.len(), failed);
+    println!("{} of {} entries moved, {} gone since the plan, {} problem(s). Nothing deleted.", moved, moves.len(), gone, failed);
     if failed == 0 { 0 } else { 1 }
 }

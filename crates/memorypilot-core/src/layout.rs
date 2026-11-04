@@ -134,7 +134,9 @@ pub fn plan(root: &Path) -> Vec<Move> {
             }
         };
         let (to, link_back) = if is_db_file(&name, "memory.db") || is_db_file(&name, "conversations.db") {
-            (target(Area::Data, None), true)
+            // SQLite resolves the link of the database and keeps -wal and -shm
+            // beside the real file: a link to them would dangle once they are removed.
+            (target(Area::Data, None), !name.ends_with("-wal") && !name.ends_with("-shm"))
         } else if name.starts_with("memory.db.bak-") || name.starts_with("memory.db.bak") {
             (target(Area::Backups, Some("memory")), false)
         } else {
@@ -218,10 +220,10 @@ mod tests {
         let moves = plan(r);
         let find = |name: &str| moves.iter().find(|m| m.from == r.join(name)).map(|m| (m.to.strip_prefix(r).unwrap().to_path_buf(), m.link_back));
         assert_eq!(find("memory.db"), Some((PathBuf::from("data/memory.db"), true)));
-        assert_eq!(find("memory.db-wal"), Some((PathBuf::from("data/memory.db-wal"), true)));
+        assert_eq!(find("memory.db-wal"), Some((PathBuf::from("data/memory.db-wal"), false)));
         assert_eq!(find("memory.db.query_cache.sqlite"), Some((PathBuf::from("data/memory.db.query_cache.sqlite"), true)));
         assert_eq!(find("memory.db.bak-v4.10-20261028-0123-shm"), Some((PathBuf::from("backups/memory/memory.db.bak-v4.10-20261028-0123-shm"), false)));
-        assert_eq!(find("conversations.db-wal"), Some((PathBuf::from("data/conversations.db-wal"), true)));
+        assert_eq!(find("conversations.db-wal"), Some((PathBuf::from("data/conversations.db-wal"), false)));
         assert_eq!(find("http.token"), Some((PathBuf::from("config/http.token"), true)));
         assert_eq!(find("session-hook-injections.json"), Some((PathBuf::from("state/session-hook-injections.json"), true)));
         assert_eq!(find("session-start-marks"), Some((PathBuf::from("state/session-start-marks"), true)));
