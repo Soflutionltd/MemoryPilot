@@ -91,8 +91,12 @@ impl Ctx<'_> {
 
     /// Claude Desktop reads the skills over MCP (get_agent_skill) when it has MemoryPilot.
     fn claude_app_has_memorypilot(&self) -> bool {
+        self.claude_app_has_server("MemoryPilot")
+    }
+
+    fn claude_app_has_server(&self, name: &str) -> bool {
         read_json(&self.home.join("Library/Application Support/Claude/claude_desktop_config.json"))
-            .is_some_and(|v| v["mcpServers"].get("MemoryPilot").is_some())
+            .is_some_and(|v| v["mcpServers"].get(name).is_some())
     }
 
     fn status(&self, targets: &Value) -> &'static str {
@@ -194,6 +198,7 @@ impl Ctx<'_> {
         let Some(config) = read_json(&self.home.join(".mcphub/config.json")) else { return Vec::new() };
         let Some(servers) = config.get("servers").and_then(|s| s.as_object()) else { return Vec::new() };
         let own = self.home.join("Cursor").display().to_string();
+        let app = self.claude_app_has_server("McpHub");
         let mut out: Vec<Value> = servers
             .iter()
             .map(|(name, server)| {
@@ -218,7 +223,12 @@ impl Ctx<'_> {
                     "source": if url.is_some() { Value::Null } else { json!(source) },
                     "url": url,
                     "path": Value::Null,
-                    "targets": { "claude_code": true, "cursor": true, "claude_app": false },
+                    // Served by McpHub to the clients that have it; nothing when disabled.
+                    "targets": {
+                        "claude_code": server["disabled"] != true,
+                        "cursor": server["disabled"] != true,
+                        "claude_app": server["disabled"] != true && app,
+                    },
                     "via": "McpHub",
                     "updated": Value::Null,
                     "status": if server["disabled"] == true { "disabled" } else { "ok" },
