@@ -536,6 +536,23 @@ fn cursor_sees_each_skill_once() {
 }
 
 #[test]
+fn cursor_reads_the_claude_links_when_both_are_wired() {
+    // Cursor reads ~/.claude/skills: no second set in ~/.agents/skills, and
+    // the set left by an earlier wiring with Codex goes when Codex leaves.
+    let home = Home::new("cursor-claude");
+    home.mkdirs(&[".claude", ".cursor", ".codex"]);
+    home.add_skill("mine");
+    home.run(&["--setup-agents", "--tools", "claude,cursor,codex"]);
+    assert!(is_link_to(&home.p(".agents/skills/mine"), &home.p(".MemoryPilot/agents/skills/mine")), "Codex needs the shared link");
+    home.run(&["--uninstall-agents", "--tools", "codex"]);
+    assert!(std::fs::symlink_metadata(home.p(".agents/skills/mine")).is_err(), "no second copy for Cursor");
+    assert!(is_link_to(&home.p(".claude/skills/mine"), &home.p(".MemoryPilot/agents/skills/mine")));
+    let catalog: Value = serde_json::from_str(&home.read(".MemoryPilot/agents/catalog.json")).unwrap();
+    let mine = catalog["items"].as_array().unwrap().iter().find(|i| i["name"] == "mine").cloned().unwrap();
+    assert_eq!((mine["targets"]["cursor"].as_bool(), mine["status"].as_str()), (Some(true), Some("ok")));
+}
+
+#[test]
 fn cursor_cleanup_spares_other_tools_and_linked_folders() {
     // ~/.cursor/skills is itself a link into the agents folder: nothing is removed.
     let home = Home::new("cursor-linked");

@@ -416,6 +416,15 @@ fn import_text(rules: &Path) -> String {
     format!("{}\n@{}\n", IMPORT_MARKER, rules.display())
 }
 
+/// Whether a tool needs the links in `~/.agents/skills`. Cursor reads
+/// `~/.claude/skills` too ("Include third-party Plugins, Skills, and other
+/// configs", on by default and needed for its local plugins): with Claude Code
+/// wired, a second set would show every skill twice in Cursor.
+fn shared_skills_needed(tools: &[String]) -> bool {
+    let has_claude = tools.iter().any(|t| t == "claude");
+    tools.iter().any(|t| t != "claude" && !(has_claude && t == "cursor"))
+}
+
 /// What the wiring of the given tools should be.
 fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
     let has = |id: &str| tools.iter().any(|t| t == id);
@@ -444,7 +453,7 @@ fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
         }
         skill_links(&mut out, "claude", paths.claude.join("skills"));
     }
-    if tools.iter().any(|t| t != "claude") {
+    if shared_skills_needed(tools) {
         skill_links(&mut out, SHARED_SKILLS, paths.home.join(".agents").join("skills"));
     }
     let only_cursor_reads_shared = tools.iter().all(|t| t == "claude" || t == "cursor");
@@ -478,6 +487,8 @@ fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
                 adopted: false,
             }),
             Some(_) => {}
+            // Whether Cursor imports Claude Code plugins is not established:
+            // their skills stay linked for it.
             None if tools.iter().any(|t| t != "claude") => {
                 for dir in list_plugin_skills(&plugin.dir) {
                     let name = dir.file_name().unwrap_or_default().to_os_string();
@@ -1353,10 +1364,14 @@ pub fn uninstall_agents(args: &[String]) -> i32 {
         }
     };
     let remaining: Vec<String> = manifest.tools.iter().filter(|t| !removed.contains(t)).cloned().collect();
-    let shared_needed = remaining.iter().any(|t| t != "claude");
+    let skills_needed = shared_skills_needed(&remaining);
+    let plugin_skills_needed = remaining.iter().any(|t| t != "claude");
     let goes = |e: &Entry| {
         if e.tool() == SHARED_SKILLS {
-            !shared_needed
+            match e {
+                Entry::Link { target, .. } if target.starts_with(paths.skills()) => !skills_needed,
+                _ => !plugin_skills_needed,
+            }
         } else {
             removed.iter().any(|t| t == e.tool())
         }

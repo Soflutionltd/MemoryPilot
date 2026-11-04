@@ -156,9 +156,12 @@ impl Ctx<'_> {
             .filter(|dir| dir.join("SKILL.md").is_file())
             .map(|dir| {
                 let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let claude_code = links_to(&self.claude.join("skills").join(&name), &dir);
+                // Cursor reads ~/.claude/skills as well as ~/.agents/skills.
+                let cursor = self.wired("cursor") && (claude_code || links_to(&self.home.join(".agents/skills").join(&name), &dir));
                 let targets = json!({
-                    "claude_code": links_to(&self.claude.join("skills").join(&name), &dir),
-                    "cursor": links_to(&self.home.join(".agents/skills").join(&name), &dir),
+                    "claude_code": claude_code,
+                    "cursor": cursor,
                     "claude_app": app,
                 });
                 let extra = if origin == "vendor" {

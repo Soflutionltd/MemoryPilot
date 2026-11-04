@@ -548,7 +548,7 @@ MemoryPilot --uninstall-agents [--tools codex]  # unwire, your files stay
 | Claude Code | `@` import line in `~/.claude/CLAUDE.md` (`CLAUDE_CONFIG_DIR`) | link per skill in `~/.claude/skills/` |
 | Codex | generated block in `~/.codex/AGENTS.md` (`CODEX_HOME`) | `~/.agents/skills/` |
 | Gemini CLI | `@` import line in `~/.gemini/GEMINI.md` (`GEMINI_CLI_HOME`) | `~/.agents/skills/` |
-| Cursor | generated `~/.cursor/rules/agents.mdc` | `~/.agents/skills/` |
+| Cursor | generated `~/.cursor/rules/agents.mdc` | `~/.agents/skills/`, or none when Claude Code is wired (Cursor reads `~/.claude/skills`) |
 | VS Code Copilot | generated block in `~/.copilot/copilot-instructions.md` | `~/.agents/skills/` |
 | OpenCode | path added to `instructions` in `~/.config/opencode/opencode.json` (`OPENCODE_CONFIG_DIR`) | `~/.agents/skills/` |
 | Cline | link `~/Documents/Cline/Rules/memorypilot-agents.md` | `~/.agents/skills/` |
