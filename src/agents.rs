@@ -1386,8 +1386,10 @@ pub fn uninstall_agents(args: &[String]) -> i32 {
     if manifest.entries.iter().any(|e| matches!(e, Entry::ClaudePlugin { .. })) {
         ctx.drop_marketplace_if_unused(&entries);
     }
-    let in_sync = manifest.inputs == inputs_fingerprint(&paths, &manifest.tools);
-    let inputs = if in_sync { inputs_fingerprint(&paths, &remaining) } else { manifest.inputs.clone() };
+    // What the remaining tools need can change with the one removed (Cursor
+    // gets its plugin variant back once Claude Code goes): an empty print
+    // makes the next sync reconcile them.
+    let inputs = String::new();
     let updated = Manifest { tools: remaining, inputs, entries, ..manifest };
     if !dry_run {
         if let Err(e) = save_manifest(&paths, &updated) {
