@@ -515,3 +515,22 @@ fn failed_claude_call_is_retried_at_next_sync() {
     home.run(&["--sync-agents"]);
     assert_eq!(claude_calls(&home).last().unwrap(), "plugin install kit@memorypilot --scope user");
 }
+
+#[test]
+fn cursor_sees_each_skill_once() {
+    let home = Home::new("cursor-once");
+    home.mkdirs(&[".cursor/skills"]);
+    home.add_skill("mine");
+    home.add_skill("theirs");
+    // Hand-made link to the agents folder (old wiring) and a third-party
+    // skill of the same name as one of ours.
+    std::os::unix::fs::symlink(home.p(".MemoryPilot/agents/skills/mine"), home.p(".cursor/skills/mine")).unwrap();
+    home.write(".cursor/skills/theirs/SKILL.md", "---\nname: theirs\n---\n");
+    home.run(&["--setup-agents", "--tools", "cursor"]);
+    assert!(std::fs::symlink_metadata(home.p(".cursor/skills/mine")).is_err(), "legacy link removed");
+    assert!(is_link_to(&home.p(".agents/skills/mine"), &home.p(".MemoryPilot/agents/skills/mine")));
+    assert!(std::fs::symlink_metadata(home.p(".agents/skills/theirs")).is_err(), "no second copy for Cursor");
+    assert!(home.p(".cursor/skills/theirs/SKILL.md").is_file(), "third-party folder untouched");
+    home.run(&["--sync-agents"]);
+    assert!(std::fs::symlink_metadata(home.p(".agents/skills/theirs")).is_err());
+}

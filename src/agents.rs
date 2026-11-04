@@ -434,6 +434,17 @@ fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
     if tools.iter().any(|t| t != "claude") {
         skill_links(&mut out, SHARED_SKILLS, paths.home.join(".agents").join("skills"));
     }
+    if has("cursor") {
+        // Cursor also reads ~/.cursor/skills: a skill already there would be
+        // seen twice, so it gets no second link in ~/.agents/skills.
+        let cursor_skills = paths.home.join(".cursor/skills");
+        out.retain(|e| match e {
+            Entry::Link { tool, path, .. } if tool == SHARED_SKILLS => path
+                .file_name()
+                .is_none_or(|name| std::fs::symlink_metadata(cursor_skills.join(name)).is_err()),
+            _ => true,
+        });
+    }
     for plugin in crate::plugins::list(&paths.plugins()) {
         if has("claude") {
             out.push(Entry::ClaudePlugin {
@@ -867,7 +878,30 @@ impl Ctx<'_> {
 
     /// Makes the wiring match `tools`: removes recorded entries no longer
     /// wanted, creates or regenerates the wanted ones. Writes only what differs.
+    /// Links in `~/.cursor/skills` that point into the agents folder: the
+    /// wiring made by hand before MemoryPilot. Cursor gets the same skills
+    /// from `~/.agents/skills`, so they would make every skill appear twice.
+    fn remove_legacy_cursor_links(&mut self) {
+        let dir = self.paths.home.join(".cursor/skills");
+        let Ok(agents) = self.paths.agents.canonicalize() else { return };
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let mut links: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_symlink(p))
+            .filter(|p| p.canonicalize().is_ok_and(|target| target.starts_with(&agents)))
+            .collect();
+        links.sort();
+        for link in links {
+            let shown = display(self.paths, &link);
+            self.remove_file(&link, format!("remove legacy link {} (Cursor reads ~/.agents/skills)", shown));
+        }
+    }
+
     fn reconcile(&mut self, old: &[Entry], tools: &[String]) -> Vec<Entry> {
+        if tools.iter().any(|t| t == "cursor") {
+            self.remove_legacy_cursor_links();
+        }
         let wanted = desired(self.paths, tools);
         for entry in old {
             if !wanted.iter().any(|w| same_slot(w, entry) && w.tool() == entry.tool()) {
