@@ -45,7 +45,7 @@ const PROBATION: Duration = Duration::from_secs(120);
 /// Startup crashes of a new version tolerated before going back.
 const MAX_CRASHED_BOOTS: usize = 3;
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(120);
-const BACKUPS_KEPT: usize = 2;
+const BACKUPS_KEPT: usize = 3;
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 3600);
 
 static EXECUTABLE: OnceLock<Option<Executable>> = OnceLock::new();
@@ -116,11 +116,21 @@ fn log(message: impl Display) {
 }
 
 fn data_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".MemoryPilot"))
+    memorypilot_core::layout::root()
 }
 
 fn update_dir() -> Option<PathBuf> {
-    data_dir().map(|dir| dir.join("update"))
+    data_dir().map(|root| state_update_dir(&root))
+}
+
+/// `state/update` (or `update` at the root before --migrate-layout).
+fn state_update_dir(root: &Path) -> PathBuf {
+    memorypilot_core::layout::path_in(root, memorypilot_core::layout::Area::State, "update")
+}
+
+/// `backups/memory`: copies of the database taken before an update.
+fn memory_backups_dir(root: &Path) -> PathBuf {
+    memorypilot_core::layout::dir_in(root, memorypilot_core::layout::Area::Backups).join("memory")
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +385,10 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
         return Err(reason.to_string());
     }
     let data = data_dir().ok_or("cannot find the home directory")?;
-    let dir = data.join("update");
+    let dir = state_update_dir(&data);
+    if let Some(parent) = dir.parent() {
+        ensure_private_dir(parent)?;
+    }
     ensure_private_dir(&dir)?;
     let _lock = UpdateLock::acquire(&dir)?;
 
@@ -420,7 +433,7 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
         to: manifest.version.clone(),
     });
     write_state(&dir, &state)?;
-    prune_backups(&data.join("backups"), BACKUPS_KEPT);
+    prune_backups(&memory_backups_dir(&data), BACKUPS_KEPT);
     Ok(Outcome::Installed {
         version: manifest.version,
         backup,
@@ -574,13 +587,16 @@ fn reports_version(binary: &Path, version: &str) -> bool {
 }
 
 /// Copy of `memory.db` taken before the new version touches it, kept in
-/// `~/.MemoryPilot/backups/` (owner only). `None` on a fresh install.
+/// `~/.MemoryPilot/backups/memory/` (owner only). `None` on a fresh install.
 fn backup_database(data: &Path, version: &str) -> Result<Option<PathBuf>, String> {
-    let live = data.join("memory.db");
+    let live = memorypilot_core::layout::path_in(data, memorypilot_core::layout::Area::Data, "memory.db");
     if !live.is_file() {
         return Ok(None);
     }
-    let backups = data.join("backups");
+    let backups = memory_backups_dir(data);
+    if let Some(parent) = backups.parent() {
+        ensure_private_dir(parent)?;
+    }
     ensure_private_dir(&backups)?;
     let target = backups.join(format!("memory-before-v{}.db", version));
     let _ = fs::remove_file(&target);
@@ -1119,17 +1135,17 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        for version in ["9.0.1", "9.0.2"] {
+        for version in ["9.0.1", "9.0.2", "9.0.3"] {
             std::thread::sleep(Duration::from_millis(20));
             backup_database(&data.path, version).unwrap();
         }
-        prune_backups(&data.path.join("backups"), BACKUPS_KEPT);
-        let mut left: Vec<String> = fs::read_dir(data.path.join("backups"))
+        prune_backups(&memory_backups_dir(&data.path), BACKUPS_KEPT);
+        let mut left: Vec<String> = fs::read_dir(memory_backups_dir(&data.path))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, vec!["memory-before-v9.0.1.db", "memory-before-v9.0.2.db"]);
+        assert_eq!(left, vec!["memory-before-v9.0.1.db", "memory-before-v9.0.2.db", "memory-before-v9.0.3.db"]);
         assert_eq!(backup_database(&data.path.join("absent"), "9.0.0").unwrap(), None);
     }
 

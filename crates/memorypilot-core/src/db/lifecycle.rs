@@ -4,11 +4,11 @@ use super::*;
 
 impl Database {
     pub fn open() -> Result<Self, String> {
-        let dir = dirs::home_dir()
-            .ok_or("Cannot find home directory")?
-            .join(DB_DIR);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create dir: {}", e))?;
-        Self::open_at(&dir.join(DB_FILE))
+        let path = crate::layout::memory_db().ok_or("Cannot find home directory")?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create dir: {}", e))?;
+        }
+        Self::open_at(&path)
     }
 
     pub fn open_at(path: &Path) -> Result<Self, String> {

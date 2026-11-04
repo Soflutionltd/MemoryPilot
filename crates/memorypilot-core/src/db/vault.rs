@@ -74,7 +74,10 @@ fn load_or_create_key() -> Option<[u8; 32]> {
     if std::env::var("MEMORYPILOT_VAULT").map(|v| v == "off").unwrap_or(false) {
         return None;
     }
-    let path = dirs::home_dir()?.join(".MemoryPilot").join("credentials.key");
+    let path = crate::layout::path(crate::layout::Area::Config, "credentials.key")?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     if path.exists() {
         // Never replace an existing key file, even an unreadable one.
         return decode_key(&std::fs::read_to_string(&path).ok()?);
@@ -129,7 +132,7 @@ fn existing_key() -> Option<[u8; 32]> {
             .and_then(|bytes| decode_key(&String::from_utf8_lossy(&bytes)));
         #[cfg(not(target_os = "macos"))]
         let found = dirs::home_dir()
-            .map(|home| home.join(".MemoryPilot").join("credentials.key"))
+            .and_then(|_| crate::layout::path(crate::layout::Area::Config, "credentials.key"))
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| decode_key(&text));
         if let Some(key) = found {
@@ -399,7 +402,7 @@ fn ask_user(_message: &str) -> Result<bool, String> {
 }
 
 fn audit(memory: &Memory, reason: &str, outcome: &str) {
-    let Some(dir) = dirs::home_dir().map(|home| home.join(".MemoryPilot").join("logs")) else {
+    let Some(dir) = crate::layout::dir(crate::layout::Area::Logs) else {
         return;
     };
     if std::fs::create_dir_all(&dir).is_err() {

@@ -380,7 +380,9 @@ impl Database {
     }
 
     pub fn migrate_from_v1(&self) -> Result<usize, String> {
-        let v1_dir = dirs::home_dir().ok_or("No home")?.join(DB_DIR);
+        // v1 files: at the root before --migrate-layout, in archive/v1 after.
+        let root = crate::layout::root().ok_or("No home")?;
+        let v1_dir = if root.join("global.json").exists() { root } else { crate::layout::dir_in(&root, crate::layout::Area::Archive).join("v1") };
         let mut batch: Vec<(String, String, Option<String>, Vec<String>, String)> = Vec::new();
 
         // Load global.json

@@ -222,26 +222,18 @@ pub fn load_known_secrets_from(file: Option<&Path>, memory_db: Option<&Path>) ->
 
 /// The folder of conversations.db / memory.db (`MEMORYPILOT_CONVERSATIONS_DB`,
 /// then `MEMORYPILOT_DB`, else ~/.MemoryPilot).
-fn data_dir() -> Option<PathBuf> {
-    for variable in ["MEMORYPILOT_CONVERSATIONS_DB", "MEMORYPILOT_DB"] {
-        if let Ok(path) = std::env::var(variable) {
-            if !path.trim().is_empty() {
-                return Path::new(&path).parent().map(Path::to_path_buf);
-            }
-        }
-    }
-    Some(dirs::home_dir()?.join(".MemoryPilot"))
-}
-
 pub fn known_secrets_path() -> Option<PathBuf> {
-    data_dir().map(|dir| dir.join(KNOWN_SECRETS_FILE))
+    // Next to a database chosen by environment variable (tests), else config/.
+    match crate::layout::beside_db_or(crate::layout::Area::Config) {
+        Some(dir) if std::env::var_os("MEMORYPILOT_DB").is_some() || std::env::var_os("MEMORYPILOT_CONVERSATIONS_DB").is_some() => {
+            Some(dir.join(KNOWN_SECRETS_FILE))
+        }
+        _ => crate::layout::path(crate::layout::Area::Config, KNOWN_SECRETS_FILE),
+    }
 }
 
 fn memory_db_path() -> Option<PathBuf> {
-    match std::env::var("MEMORYPILOT_DB") {
-        Ok(path) if !path.trim().is_empty() => Some(PathBuf::from(path)),
-        _ => Some(dirs::home_dir()?.join(".MemoryPilot").join("memory.db")),
-    }
+    crate::layout::memory_db()
 }
 
 /// Adds the print of `value` to the known secrets file (created 0600) and

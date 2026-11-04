@@ -722,10 +722,7 @@ impl Database {
 
         let mut archive_file: Option<String> = None;
         if apply && !rows.is_empty() {
-            let dir = dirs::home_dir()
-                .ok_or("No home")?
-                .join(".MemoryPilot")
-                .join("archive");
+            let dir = crate::layout::dir(crate::layout::Area::Archive).ok_or("No home")?;
             std::fs::create_dir_all(&dir).map_err(|e| format!("archive dir: {}", e))?;
             let path = dir.join(format!(
                 "transcripts-{}.jsonl",

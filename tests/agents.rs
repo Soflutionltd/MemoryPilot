@@ -324,7 +324,7 @@ fn sync_never_fails() {
     home.write(".MemoryPilot/agents/.manifest.json", "{ not json");
     let out = home.run(&["--sync-agents"]);
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
-    assert!(home.read(".MemoryPilot/agents-sync.log").contains("sync:"));
+    assert!(home.read(".MemoryPilot/logs/agents-sync.log").contains("sync:"));
 }
 
 #[test]
@@ -509,7 +509,7 @@ fn failed_claude_call_is_retried_at_next_sync() {
     home.run(&["--setup-agents", "--tools", "claude"]);
     home.write(".MemoryPilot/agents/plugins/kit/.claude-plugin/plugin.json", r#"{"name":"kit"}"#);
     home.run(&["--sync-agents"]);
-    assert!(home.read(".MemoryPilot/agents-sync.log").contains("claude command not found"));
+    assert!(home.read(".MemoryPilot/logs/agents-sync.log").contains("claude command not found"));
     assert_eq!(home.manifest()["inputs"], "", "empty print: next session retries");
     fake_claude(&home);
     home.run(&["--sync-agents"]);

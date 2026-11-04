@@ -92,7 +92,7 @@ impl Database {
         }
 
         // 2. Auto-scan ~/.MemoryPilot/GLOBAL_PROMPT.md
-        let home_prompt = dirs::home_dir().map(|h| h.join(DB_DIR).join(PROMPT_FILE));
+        let home_prompt = crate::layout::path(crate::layout::Area::Config, PROMPT_FILE);
         if let Some(path) = &home_prompt {
             if let Some(content) = get_cached_prompt(path) {
                 if !prompts.iter().any(|p| p == &content) {

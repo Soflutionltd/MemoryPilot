@@ -2,7 +2,7 @@
 # Refactoring gate: the deterministic benchmarks must give the same results
 # before and after a change.
 #
-#   scripts/bench-gate.sh snapshot          freeze a copy of ~/.MemoryPilot/memory.db
+#   scripts/bench-gate.sh snapshot          freeze a copy of ~/.MemoryPilot/data/memory.db
 #   scripts/bench-gate.sh run BINARY NAME   run the benchmarks into $WORK/NAME
 #   python3 scripts/bench_gate.py $WORK CANDIDATE BASE1 BASE2
 #
@@ -22,8 +22,10 @@ mkdir -p "$WORK"
 case "${1:-}" in
 snapshot)
 	mkdir -p "$WORK/snapshot"
-	sqlite3 "$HOME/.MemoryPilot/memory.db" ".backup $WORK/snapshot/memory.db"
-	cp "$HOME/.MemoryPilot/memory.db.ann.usearch" "$HOME/.MemoryPilot/memory.db.ann.usearch.keys.json" "$WORK/snapshot/" 2>/dev/null
+	DATA="$HOME/.MemoryPilot/data"
+	[ -e "$DATA/memory.db" ] || DATA="$HOME/.MemoryPilot"
+	sqlite3 "$DATA/memory.db" ".backup $WORK/snapshot/memory.db"
+	cp "$DATA/memory.db.ann.usearch" "$DATA/memory.db.ann.usearch.keys.json" "$WORK/snapshot/" 2>/dev/null
 	echo "snapshot in $WORK/snapshot"
 	;;
 run)

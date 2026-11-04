@@ -1,7 +1,7 @@
 #!/bin/zsh
 # MemoryPilot remote access (iPhone, claude.ai web, Windows) through a
 # Cloudflare named tunnel. The server only listens on 127.0.0.1 and every
-# request needs the token from ~/.MemoryPilot/http.token.
+# request needs the token from ~/.MemoryPilot/config/http.token.
 #
 #   scripts/remote-access.sh server            # LaunchAgent: MemoryPilot --http 7437
 #   cloudflared tunnel login                   # once, in the browser (your Cloudflare account)
@@ -15,6 +15,10 @@ LA="$HOME/Library/LaunchAgents"
 SERVER_PLIST="$LA/com.soflution.memorypilot-http.plist"
 TUNNEL_PLIST="$LA/com.soflution.memorypilot-tunnel.plist"
 TUNNEL_NAME="memorypilot"
+# config/ since --migrate-layout, the root before it.
+MP="$HOME/.MemoryPilot"
+CONF="$MP/config"
+[ -d "$CONF" ] || CONF="$MP"
 mkdir -p "$LA" "$HOME/.MemoryPilot/logs"
 
 case "$1" in
@@ -51,7 +55,7 @@ ingress:
     service: http://127.0.0.1:$PORT
   - service: http_status:404
 EOF
-  echo "$HOST" > "$HOME/.MemoryPilot/remote.host"
+  echo "$HOST" > "$CONF/remote.host"
   CF=$(command -v cloudflared)
   cat > "$TUNNEL_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -71,8 +75,8 @@ EOF
   curl -s "https://$HOST/health" | head -5
   ;;
 url)
-  HOST=$(cat "$HOME/.MemoryPilot/remote.host" 2>/dev/null || echo "<hostname>")
-  echo "https://$HOST/mcp/$(cat "$HOME/.MemoryPilot/http.token")"
+  HOST=$(cat "$CONF/remote.host" 2>/dev/null || echo "<hostname>")
+  echo "https://$HOST/mcp/$(cat "$CONF/http.token")"
   ;;
 stop)
   launchctl bootout gui/$(id -u) "$TUNNEL_PLIST" 2>/dev/null || true

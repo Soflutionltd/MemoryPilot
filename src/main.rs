@@ -8,6 +8,7 @@ mod conversations_cli;
 mod hooks;
 #[cfg(feature = "http")]
 mod http;
+mod migrate_layout;
 mod plugins;
 mod protocol;
 mod tools;
@@ -80,6 +81,9 @@ fn main() {
     }
     if args.iter().any(|a| a == "--uninstall-agents") {
         std::process::exit(agents::uninstall_agents(&args));
+    }
+    if args.iter().any(|a| a == "--migrate-layout") {
+        std::process::exit(migrate_layout::run(&args));
     }
     if args.iter().any(|a| a == "--update-plugins") {
         std::process::exit(plugins::update_plugins(&args));
@@ -181,10 +185,7 @@ fn main() {
             eprintln!("✗ no key on stdin");
             std::process::exit(1);
         }
-        let db_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".MemoryPilot")
-            .join("memory.db");
+        let db_path = memorypilot_core::layout::memory_db().unwrap_or_default();
         match db::restore_vault_key(encoded.trim(), &db_path) {
             Ok((opened, total)) => println!("✓ Clé remise dans le Trousseau : elle ouvre {}/{} identifiants.", opened, total),
             Err(e) => {
@@ -1209,6 +1210,7 @@ fn print_help() {
     println!("  MemoryPilot --setup-agents [--tools claude,cursor,...] [--dry-run]  Create ~/.MemoryPilot/agents (your rules and skills) and wire it into your tools");
     println!("  MemoryPilot --sync-agents    Wire new skills, regenerate rule copies (no write when nothing changed, never fails)");
     println!("  MemoryPilot --uninstall-agents [--tools ...]  Unwire what --setup-agents added; your rules and skills stay");
+    println!("  MemoryPilot --migrate-layout [--apply]  Sort ~/.MemoryPilot into data/, state/, config/, logs/, backups/, archive/ (links left at the old paths; refuses while a database is open)");
     println!("  MemoryPilot --update-plugins [NAME] [--apply]  Show the upstream diff of vendor plugins (agents/plugins/*/plugin.source.json); --apply installs the reviewed copy, previous one kept in plugins/.backups");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
@@ -1256,7 +1258,7 @@ fn print_help() {
     println!("  kg_timeline         Chronological story of an entity");
     println!("  kg_stats            Knowledge graph overview");
     println!();
-    println!("STORAGE:    ~/.MemoryPilot/memory.db");
+    println!("STORAGE:    ~/.MemoryPilot/data/memory.db");
     println!("SEARCH:     Hybrid BM25 + vector RRF + KG boost + watcher context");
     println!(
         "EMBEDDINGS: {} (ONNX Runtime, 100+ languages)",

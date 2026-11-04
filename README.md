@@ -336,7 +336,7 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 - **`archive_transcripts`**: old raw transcripts move to `~/.MemoryPilot/archive/*.jsonl` and out of the live index.
 - **`find_conflicts`**: report of same-project memories that contradict each other.
 - **`rate_skill`**: usage feedback on learned skills; reliable ones rank first, failing ones are demoted.
-- **Remote access**: `--http` now requires a token (`~/.MemoryPilot/http.token`), as `Authorization: Bearer` or `/mcp/<token>`. `scripts/remote-access.sh` sets up a LaunchAgent and a Cloudflare tunnel so claude.ai, the iPhone app or another PC can use the same memory.
+- **Remote access**: `--http` now requires a token (`~/.MemoryPilot/config/http.token`), as `Authorization: Bearer` or `/mcp/<token>`. `scripts/remote-access.sh` sets up a LaunchAgent and a Cloudflare tunnel so claude.ai, the iPhone app or another PC can use the same memory.
 
 ## Install
 
@@ -370,11 +370,11 @@ If no pre-built binary is available for your platform, it falls back to `cargo b
 A running server (stdio or `--http`) looks for a new release 2 minutes after it starts, then every 6 hours. Apart from the first model download, this is the only network call MemoryPilot makes on its own: two small HTTPS requests to `github.com` for the release manifest and its signature, carrying no identifier, then the archive when there is a new version. When there is one:
 
 1. The manifest must carry a valid minisign signature from the key compiled into the binary, and the archive must match the SHA-256 the manifest lists. On macOS the new binary must also be signed by Developer ID team `TB8CC687M3`, and on every platform it must answer `--version` with the expected version.
-2. The database is copied (`VACUUM INTO`) to `~/.MemoryPilot/backups/memory-before-v<version>.db` (mode 600, the two latest copies kept), and the new binary opens a second copy with its schema upgrades (`--self-test`). Any failure stops the update and nothing is replaced.
+2. The database is copied (`VACUUM INTO`) to `~/.MemoryPilot/backups/memory/memory-before-v<version>.db` (mode 600, the three latest copies kept), and the new binary opens a second copy with its schema upgrades (`--self-test`). Any failure stops the update and nothing is replaced.
 3. The binary is replaced atomically; the previous one stays next to it as `MemoryPilot.old`. Each running server switches to the new version in place as soon as it is idle (a second without a request over stdio, a few seconds over HTTP): the IDE keeps its connection, there is nothing to restart.
 4. If the new version fails to start three times, the previous binary is put back and that version is skipped. The database is not rolled back automatically, because other servers may have it open: the copy from step 2 is there to restore by hand.
 
-Releases roll out progressively: first to a share of installations (chosen from a random id kept in `~/.MemoryPilot/update/install-id`, never sent), then to everyone after a delay, and a rollout can be paused. `MemoryPilot update` installs the latest release now, rollout and skipped versions aside; `MemoryPilot update --check` only reports it.
+Releases roll out progressively: first to a share of installations (chosen from a random id kept in `~/.MemoryPilot/state/update/install-id`, never sent), then to everyone after a delay, and a rollout can be paused. `MemoryPilot update` installs the latest release now, rollout and skipped versions aside; `MemoryPilot update --check` only reports it.
 
 Not updated automatically: Homebrew installs (`brew upgrade memorypilot`), binaries inside a cargo `target/` directory, debug builds, platforms without a release binary (Intel Macs, Windows), and any server started with `MEMORYPILOT_AUTO_UPDATE=0`. A binary installed with `cargo install` moves to the signed release binary at its first update. Installations of v4.11.0 or older do not have the updater yet: update them once by hand (`install.sh` again, or `brew upgrade`).
 
@@ -523,7 +523,7 @@ Installs three hooks in every agent found (`./install.sh` runs it for you) (exis
 
 - **Session end** (`SessionEnd`, Cursor `sessionEnd`) runs `MemoryPilot --hook session-end --agent <agent>`: the same incremental ingest, for the lines the last stop did not cover.
 
-State: `~/.MemoryPilot/cursor-hooks-state.json`. Log: `~/.MemoryPilot/cursor-hooks.log`. Set `MEMORYPILOT_DB=/path/copy.db` to test against a copy.
+State: `~/.MemoryPilot/state/cursor-hooks-state.json`. Log: `~/.MemoryPilot/logs/cursor-hooks.log`. Set `MEMORYPILOT_DB=/path/copy.db` to test against a copy.
 
 #### Rules and skills for your agents
 
@@ -557,7 +557,7 @@ MemoryPilot --uninstall-agents [--tools codex]  # unwire, your files stay
 
 - Only detected tools are offered. Interactive `./install.sh` asks which ones (Enter = all); without a terminal, or with `--yes`, only Claude Code is wired unless `--agents-tools=claude,codex` says otherwise. `./install.sh --uninstall-agents [--tools ...]` undoes.
 - Nothing is overwritten: an existing `agents/` folder is left as is, a skill name already taken in a tool is skipped and reported, a `CLAUDE.md` that is a symbolic link is not written (Claude Cowork ignores linked ones).
-- `agents/.manifest.json` records every link, line, block and generated file with its fingerprint. `--sync-agents` writes nothing while AGENTS.md and the skill list are unchanged, never fails (errors go to `~/.MemoryPilot/agents-sync.log`), and leaves hand-edited copies alone. `--uninstall-agents` removes only what the manifest lists and is still unmodified.
+- `agents/.manifest.json` records every link, line, block and generated file with its fingerprint. `--sync-agents` writes nothing while AGENTS.md and the skill list are unchanged, never fails (errors go to `~/.MemoryPilot/logs/agents-sync.log`), and leaves hand-edited copies alone. `--uninstall-agents` removes only what the manifest lists and is still unmodified.
 - Claude Desktop (chat) cannot be wired: its rules and skills live in your claude.ai account.
 - Plugins: a whole plugin goes in `agents/plugins/<name>/` (Claude Code format: `.claude-plugin/plugin.json`, `skills/`, `agents/`, `hooks/`). Claude Code installs it natively as `<name>@memorypilot` from a generated local marketplace (`plugins/.claude-plugin/marketplace.json`); a content change runs `claude plugin marketplace update` and `claude plugin update` at the next sync. When the folder also holds `cursor/` (`.cursor-plugin/plugin.json`), Cursor gets that variant linked into `~/.cursor/plugins/local/<name>`; otherwise the other tools get the plugin's skills in `~/.agents/skills/`. A failed `claude` call is retried at the next session.
 - Vendor plugins carry `plugin.source.json` (`repo`, `commit`, optional `branch`, `claude` and `cursor` folders in the repository). `MemoryPilot --update-plugins [name]` fetches the upstream head and prints the diff (full diff in `plugins/.updates/<name>.diff`); nothing changes until `--update-plugins <name> --apply`, which keeps the previous copy in `plugins/.backups/` (3 per plugin).
@@ -581,7 +581,7 @@ MemoryPilot --uninstall-agents [--tools codex]  # unwire, your files stay
 | `register_project` | Register project with filesystem path for auto-detection. |
 | `list_projects` | List projects with memory counts. |
 | `get_stats` | DB statistics: totals, by kind, by project, DB size, hygiene signals. |
-| `get_global_prompt` | Auto-discover GLOBAL_PROMPT.md from ~/.MemoryPilot/ or project root. |
+| `get_global_prompt` | Auto-discover GLOBAL_PROMPT.md from ~/.MemoryPilot/config/ or project root. |
 | `export_memories` | Export as JSON or Markdown with importance stars. |
 | `set_config` | Set config values (e.g. global_prompt_path). |
 
@@ -798,8 +798,21 @@ The cross-encoder is `jina-reranker-v2-base-multilingual`. Validated full-run re
 
 ## Storage
 
-- Database: `~/.MemoryPilot/memory.db`
-- Global prompt: `~/.MemoryPilot/GLOBAL_PROMPT.md`
+- Database: `~/.MemoryPilot/data/memory.db`
+- Global prompt: `~/.MemoryPilot/config/GLOBAL_PROMPT.md`
+
+```
+~/.MemoryPilot/
+├── data/      memory.db, conversations.db (+ WAL, vector index, query cache)
+├── state/     hook state, session-start injections (read by McpHub), update state
+├── config/    http.token, credentials.key, known-secrets.sha256, GLOBAL_PROMPT.md
+├── logs/      every log
+├── backups/   memory/ (copies before an update, three kept) and your own
+├── archive/   archived transcripts, v1 files, old copies
+└── agents/    rules, skills, plugins
+```
+
+An older layout (everything at the root) keeps working. `MemoryPilot --migrate-layout` shows the plan, `--apply` sorts the files (it refuses while another process holds a database open, copies `memory.db` to `backups/memory/memory-before-layout.db` first and leaves symbolic links at the old paths read by older binaries and McpHub).
 - Model cache: `~/.cache/fastembed/` (Hugging Face layout, downloaded on first run; `FASTEMBED_CACHE_PATH` overrides). Externalized ONNX weights live in `memorypilot-external/` inside it.
 
 ## License

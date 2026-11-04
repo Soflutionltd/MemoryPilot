@@ -20,12 +20,11 @@ const MIN_ASSISTANT_CHARS: usize = 40;
 /// "I'm checking X" notes, which the lexical lanes cover.
 const EMBED_ASSISTANT_CHARS: usize = 280;
 pub fn default_path() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("MEMORYPILOT_CONVERSATIONS_DB") {
-        return Ok(PathBuf::from(path));
+    let path = crate::layout::conversations_db().ok_or("Cannot find home directory")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| format!("Cannot create dir: {}", error))?;
     }
-    let dir = dirs::home_dir().ok_or("Cannot find home directory")?.join(".MemoryPilot");
-    std::fs::create_dir_all(&dir).map_err(|error| format!("Cannot create dir: {}", error))?;
-    Ok(dir.join(FILE_NAME))
+    Ok(path)
 }
 
 pub struct ConversationStore {

@@ -53,21 +53,26 @@ fn open_db() -> Result<Database, String> {
     }
 }
 
-fn data_dir() -> PathBuf {
-    match std::env::var("MEMORYPILOT_DB") {
-        Ok(path) if !path.trim().is_empty() => Path::new(&path)
+/// Where a hook file lives: next to `MEMORYPILOT_DB` when it is set (tests),
+/// else in `area` of the layout (state/ or logs/), whose folder is created.
+fn hook_path(area: memorypilot_core::layout::Area, name: &str) -> PathBuf {
+    let path = match std::env::var("MEMORYPILOT_DB") {
+        Ok(db) if !db.trim().is_empty() => Path::new(&db)
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(".")),
-        _ => dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".MemoryPilot"),
+            .join(name),
+        _ => memorypilot_core::layout::path(area, name).unwrap_or_else(|| PathBuf::from(".").join(name)),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
+    path
 }
 
 fn log(message: &str) {
     use std::io::Write;
-    let path = data_dir().join(LOG_FILE);
+    let path = hook_path(memorypilot_core::layout::Area::Logs, LOG_FILE);
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -145,7 +150,7 @@ pub fn run_hook(event: &str, args: &[String]) {
     }
     let output = match event {
         "session-start" | "sessionStart" | "SessionStart" => {
-            if !claim_session_start(&data_dir().join(SESSION_MARKS_DIR), &payload) {
+            if !claim_session_start(&hook_path(memorypilot_core::layout::Area::State, SESSION_MARKS_DIR), &payload) {
                 println!("{}", json!({}));
                 return;
             }
@@ -282,7 +287,7 @@ fn session_start_context(payload: &Value) -> Option<String> {
 /// Notes that `workspace` just got the recall. Best effort: a lost trace
 /// only means McpHub recalls once more.
 fn record_injection(workspace: &str) {
-    let path = data_dir().join(INJECTIONS_FILE);
+    let path = hook_path(memorypilot_core::layout::Area::State, INJECTIONS_FILE);
     let now = chrono::Utc::now();
     let mut traces = match read_json_or(&path, json!({})) {
         Value::Object(map) => map,
@@ -322,7 +327,7 @@ impl IngestLock {
     fn acquire(transcript: &str) -> Option<IngestLock> {
         let digest = sha2::Sha256::digest(transcript.as_bytes());
         let name: String = digest.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-        let path = data_dir().join(format!("ingest-{}.lock", name));
+        let path = hook_path(memorypilot_core::layout::Area::State, &format!("ingest-{}.lock", name));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(INGEST_LOCK_WAIT_SECS);
         loop {
             if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
@@ -373,7 +378,7 @@ fn state_key(transcript: &str) -> String {
 }
 
 fn load_state() -> HashMap<String, usize> {
-    std::fs::read_to_string(data_dir().join(STATE_FILE))
+    std::fs::read_to_string(hook_path(memorypilot_core::layout::Area::State, STATE_FILE))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -381,7 +386,7 @@ fn load_state() -> HashMap<String, usize> {
 
 fn save_state(state: &HashMap<String, usize>) {
     if let Ok(serialized) = serde_json::to_string_pretty(state) {
-        let path = data_dir().join(STATE_FILE);
+        let path = hook_path(memorypilot_core::layout::Area::State, STATE_FILE);
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, serialized).is_ok() {
             let _ = std::fs::rename(tmp, path);

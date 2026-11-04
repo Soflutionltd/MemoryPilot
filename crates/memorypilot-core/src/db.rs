@@ -114,8 +114,6 @@ pub use episodic::{
 pub use consolidate::AUTO_THRESHOLD as AUTO_CONSOLIDATE_THRESHOLD;
 pub use benchmark_longmemeval::LongMemEvalOptions;
 
-const DB_DIR: &str = ".MemoryPilot";
-const DB_FILE: &str = "memory.db";
 const PROMPT_FILE: &str = "GLOBAL_PROMPT.md";
 const DEDUP_THRESHOLD: f64 = 0.85;
 /// `config` key holding the label of the encoder that produced the

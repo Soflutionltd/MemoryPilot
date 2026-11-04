@@ -1262,12 +1262,12 @@ fn print_summary(paths: &Paths, manifest: &Manifest, report: &Report, created: b
 
 fn sync_log(message: &str) {
     use std::io::Write;
-    let Some(home) = dirs::home_dir() else { return };
-    let dir = home.join(".MemoryPilot");
-    if !dir.is_dir() {
-        return;
+    let Some(root) = memorypilot_core::layout::root().filter(|r| r.is_dir()) else { return };
+    let path = memorypilot_core::layout::path_in(&root, memorypilot_core::layout::Area::Logs, SYNC_LOG);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(SYNC_LOG)) {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{} {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), message);
     }
 }

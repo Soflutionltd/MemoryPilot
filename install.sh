@@ -414,7 +414,7 @@ fi
 printf "\n━━━━━━━━━━━━━━━━━━━━━\n"
 printf "${BOLD}Summary${NC}\n\n"
 printf "  Binary: ${GREEN}$BINARY_PATH${NC}\n"
-printf "  DB:     ~/.MemoryPilot/memory.db\n\n"
+printf "  DB:     ~/.MemoryPilot/data/memory.db\n\n"
 
 if [ ${#configured[@]} -gt 0 ]; then
     printf "  ${GREEN}Configured:${NC}\n"

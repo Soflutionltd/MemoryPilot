@@ -93,10 +93,7 @@ impl Database {
             gc_score: f64,
         }
 
-        let db_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(DB_DIR)
-            .join(DB_FILE);
+        let db_path = crate::layout::memory_db().unwrap_or_default();
         let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
         let mut expired_removed = 0;
@@ -513,10 +510,7 @@ impl Database {
         ).unwrap_or(0);
 
         // DB size
-        let db_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(DB_DIR)
-            .join(DB_FILE);
+        let db_path = crate::layout::memory_db().unwrap_or_default();
         let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
         // Capsule count
@@ -727,10 +721,7 @@ impl Database {
                 }
             }
         }
-        let db_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(DB_DIR)
-            .join(DB_FILE);
+        let db_path = crate::layout::memory_db().unwrap_or_default();
         let size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
         let size_str = if size < 1024 {
             format!("{} B", size)

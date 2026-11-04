@@ -20,10 +20,7 @@ fn load_or_create_token() -> Result<String, String> {
         }
         return Err("MEMORYPILOT_HTTP_TOKEN must be at least 24 characters".into());
     }
-    let path = dirs::home_dir()
-        .ok_or("No home")?
-        .join(".MemoryPilot")
-        .join("http.token");
+    let path = memorypilot_core::layout::path(memorypilot_core::layout::Area::Config, "http.token").ok_or("No home")?;
     if let Ok(t) = std::fs::read_to_string(&path) {
         if t.trim().len() >= 24 {
             return Ok(t.trim().to_string());
