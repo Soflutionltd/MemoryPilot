@@ -313,7 +313,11 @@ pub fn update_plugins(args: &[String]) -> i32 {
     };
     let root = home.join(".MemoryPilot/agents/plugins");
     let apply = args.iter().any(|a| a == "--apply");
-    let only: Option<&String> = args.iter().find(|a| !a.starts_with("--"));
+    let only: Option<&String> = args
+        .iter()
+        .position(|a| a == "--update-plugins")
+        .and_then(|i| args.get(i + 1))
+        .filter(|a| !a.starts_with("--"));
     let plugins: Vec<Plugin> = list(&root).into_iter().filter(|p| only.is_none_or(|n| *n == p.name)).collect();
     if plugins.is_empty() {
         eprintln!("No plugin{} in {}", only.map(|n| format!(" named {}", n)).unwrap_or_default(), root.display());
