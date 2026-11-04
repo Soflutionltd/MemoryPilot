@@ -160,6 +160,16 @@ pub fn run(args: &[String]) -> i32 {
             restart(service);
             return 1;
         }
+        // VACUUM INTO follows the umask (0644): the copy holds every memory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)) {
+                eprintln!("✗ {}: {}: nothing moved", target.display(), e);
+                restart(service);
+                return 1;
+            }
+        }
         println!("▸ backup: {}", shown(&root, &target));
     }
 
