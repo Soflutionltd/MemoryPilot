@@ -126,7 +126,7 @@ fn fresh_install_creates_an_empty_folder() {
     let agents = home.p(".MemoryPilot/agents");
     assert_eq!(
         files_under(&agents),
-        vec![".manifest.json", "rules/", "rules/AGENTS.md", "skills/", "vendor/"]
+        vec![".manifest.json", "catalog.json", "rules/", "rules/AGENTS.md", "skills/", "vendor/"]
     );
     let rules = home.read(".MemoryPilot/agents/rules/AGENTS.md");
     let trimmed = rules.trim();
@@ -134,7 +134,7 @@ fn fresh_install_creates_an_empty_folder() {
     assert!(out.contains("rules/AGENTS.md") && out.contains("SKILL.md") && out.contains("Wired: none"), "{}", out);
     assert!(out.contains("Claude Desktop"), "{}", out);
     // Nothing detected: nothing else written in HOME.
-    assert_eq!(files_under(&home.0), vec![".MemoryPilot/", ".MemoryPilot/agents/", ".MemoryPilot/agents/.manifest.json", ".MemoryPilot/agents/rules/", ".MemoryPilot/agents/rules/AGENTS.md", ".MemoryPilot/agents/skills/", ".MemoryPilot/agents/vendor/", "bin/"]);
+    assert_eq!(files_under(&home.0), vec![".MemoryPilot/", ".MemoryPilot/agents/", ".MemoryPilot/agents/.manifest.json", ".MemoryPilot/agents/catalog.json", ".MemoryPilot/agents/rules/", ".MemoryPilot/agents/rules/AGENTS.md", ".MemoryPilot/agents/skills/", ".MemoryPilot/agents/vendor/", "bin/"]);
 }
 
 #[test]
@@ -572,4 +572,26 @@ fn renamed_plugin_replaces_the_old_one() {
     let calls = claude_calls(&home);
     assert!(calls.contains(&"plugin uninstall kit@memorypilot --scope user".to_string()), "{:?}", calls);
     assert_eq!(calls.last().unwrap(), "plugin install kit2@memorypilot --scope user");
+}
+
+#[test]
+fn catalog_lists_items_with_their_targets() {
+    let home = Home::new("catalog");
+    home.mkdirs(&[".claude"]);
+    home.write(".MemoryPilot/agents/rules/AGENTS.md", "# Rules\n");
+    home.add_skill("mine");
+    home.write(".MemoryPilot/agents/vendor/theirs/SKILL.md", "---\nname: theirs\n---\n");
+    home.write(".mcphub/config.json", r#"{"servers":{"gh":{"command":"npx","args":["-y","@modelcontextprotocol/server-github@2025.4.8"],"env":{"GITHUB_TOKEN":"ghp_secret_value"}}}}"#);
+    home.run(&["--setup-agents", "--tools", "claude"]);
+    let text = home.read(".MemoryPilot/agents/catalog.json");
+    assert!(!text.contains("ghp_secret_value"), "never copies MCP environment");
+    let catalog: Value = serde_json::from_str(&text).unwrap();
+    let item = |name: &str| catalog["items"].as_array().unwrap().iter().find(|i| i["name"] == name).cloned().unwrap();
+    assert_eq!(item("AGENTS.md")["type"], "rule");
+    let mine = item("mine");
+    assert_eq!((mine["origin"].as_str(), mine["targets"]["claude_code"].as_bool(), mine["status"].as_str()), (Some("perso"), Some(true), Some("ok")));
+    let theirs = item("theirs");
+    assert_eq!((theirs["origin"].as_str(), theirs["status"].as_str()), (Some("vendor"), Some("not_deployed")));
+    let gh = item("gh");
+    assert_eq!((gh["type"].as_str(), gh["version"].as_str(), gh["source"].as_str()), (Some("mcp"), Some("2025.4.8"), Some("@modelcontextprotocol/server-github")));
 }

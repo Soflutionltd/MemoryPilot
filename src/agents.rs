@@ -316,6 +316,12 @@ fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Rewrites `agents/catalog.json` when its content changes (see catalog.rs).
+fn write_catalog(paths: &Paths, tools: &[String]) -> Result<bool, String> {
+    let ctx = crate::catalog::Ctx { home: &paths.home, agents: &paths.agents, claude: &paths.claude, tools };
+    write_if_changed(&paths.agents.join("catalog.json"), &ctx.render())
+}
+
 fn save_manifest(paths: &Paths, manifest: &Manifest) -> Result<bool, String> {
     let rendered = serde_json::to_string_pretty(manifest).map_err(|e| e.to_string())? + "\n";
     write_if_changed(&paths.manifest(), &rendered)
@@ -1204,6 +1210,9 @@ pub fn setup_agents(args: &[String]) -> i32 {
         if let Err(e) = save_manifest(&paths, &new_manifest) {
             ctx.fail(e);
         }
+        if let Err(e) = write_catalog(&paths, &tools) {
+            ctx.fail(e);
+        }
     }
     print_summary(&paths, &new_manifest, &ctx.report, created, dry_run);
     0
@@ -1284,6 +1293,11 @@ pub fn sync_agents() {
             return;
         }
     };
+    // The catalog also follows content edits and deployments, which the
+    // fingerprint does not cover: it is refreshed at every sync.
+    if let Err(e) = write_catalog(&paths, &manifest.tools) {
+        sync_log(&format!("sync error: catalog: {}", e));
+    }
     let inputs = inputs_fingerprint(&paths, &manifest.tools);
     if inputs == manifest.inputs {
         return;
@@ -1293,8 +1307,12 @@ pub fn sync_agents() {
     // After an error (a `claude plugin` command that failed, a locked file),
     // an empty print makes the next session try again.
     let inputs = if ctx.report.errors.is_empty() { inputs } else { String::new() };
+    let tools = manifest.tools.clone();
     let updated = Manifest { inputs, entries, ..manifest };
     if let Err(e) = save_manifest(&paths, &updated) {
+        ctx.fail(e);
+    }
+    if let Err(e) = write_catalog(&paths, &tools) {
         ctx.fail(e);
     }
     for line in &ctx.report.done {

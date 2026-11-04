@@ -4,6 +4,7 @@
 /// (c) SOFLUTION LTD — Apache 2.0 License
 mod agent_skills;
 mod agents;
+mod catalog;
 mod conversations_cli;
 mod hooks;
 #[cfg(feature = "http")]

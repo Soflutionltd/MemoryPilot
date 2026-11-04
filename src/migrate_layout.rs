@@ -10,6 +10,7 @@
 //! 3. moves each entry, leaving a symbolic link at the old path when older
 //!    binaries or McpHub still read it there;
 //! 4. checks the moved database with `PRAGMA quick_check`.
+//!
 //! Nothing is deleted.
 
 use memorypilot_core::layout::{self, Area, Move};
