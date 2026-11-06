@@ -631,6 +631,9 @@ fn catalog_lists_items_with_their_targets() {
     home.write(".claude/skills/packaged/SKILL.md", "---\nname: packaged\n---\n");
     home.write(".claude/skills/synced/bucket/cached/SKILL.md", "---\nname: cached\n---\n");
     home.write(".agents/.skill-lock.json", r#"{"skills":{"packaged":{"source":"someone/skills"}}}"#);
+    home.write("lib/node_modules/some-pkg/skills/linked/SKILL.md", "---\nname: linked\n---\n");
+    home.mkdirs(&[".cursor/skills"]);
+    std::os::unix::fs::symlink(home.p("lib/node_modules/some-pkg/skills/linked"), home.p(".cursor/skills/linked")).unwrap();
     home.run(&["--setup-agents", "--tools", "claude"]);
     let text = home.read(".MemoryPilot/agents/catalog.json");
     assert!(!text.contains("ghp_secret_value"), "never copies MCP environment");
@@ -640,6 +643,9 @@ fn catalog_lists_items_with_their_targets() {
     let packaged = item("packaged");
     assert_eq!((packaged["origin"].as_str(), packaged["managed_by"].as_str(), packaged["source"].as_str()), (Some("external"), Some("npx skills"), Some("someone/skills")));
     assert_eq!(packaged["path"].as_str(), home.p(".claude/skills/packaged").to_str());
+    let linked = item("linked");
+    assert_eq!((linked["origin"].as_str(), linked["managed_by"].as_str(), linked["source"].as_str()), (Some("external"), Some("npm"), Some("some-pkg")));
+    assert_eq!((linked["targets"]["claude_code"].as_bool(), linked["path"].as_str()), (Some(false), home.p(".cursor/skills/linked").to_str()));
     assert!(catalog["items"].as_array().unwrap().iter().all(|i| i["name"] != "cached"), "the claude.ai cache is not listed");
     assert_eq!(item("mine")["origin"], "perso", "a linked skill stays perso, not external");
     let mine = item("mine");

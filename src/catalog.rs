@@ -4,8 +4,9 @@
 //!
 //! - `type`: `rule`, `skill`, `plugin` or `mcp`;
 //! - `origin`: `perso` (written here), `vendor` (imported, kept as is) or
-//!   `external` (a real folder of `~/.claude/skills`, left to the tool that
-//!   installed it: `managed_by` says which, `npx skills` from its lock file);
+//!   `external` (in `~/.claude/skills` or `~/.cursor/skills` but not from here,
+//!   left to the tool that installed it: `managed_by` is `npx skills` from its
+//!   lock file, or `npm` for a link into a package);
 //! - `version`, `source`, `url`: for vendor items, where they come from;
 //! - `targets`: `claude_code`, `cursor`, `claude_app` (true when deployed);
 //! - `cursor_via` (plugins): `claude_code` when Cursor imports the Claude Code
@@ -178,21 +179,37 @@ impl Ctx<'_> {
             .collect()
     }
 
-    /// Real folders of `~/.claude/skills`: skills installed by another tool,
-    /// listed so they are known, never copied. Their path stays absolute.
+    /// Skills of `~/.claude/skills` and `~/.cursor/skills` that do not come from
+    /// the agents folder: installed by another tool, listed so they are known,
+    /// never copied. Their path stays absolute.
     fn external_skills(&self) -> Vec<Value> {
         let lock = read_json(&self.home.join(".agents/.skill-lock.json")).unwrap_or(Value::Null);
-        sorted_dirs(&self.claude.join("skills"))
-            .into_iter()
-            .filter(|dir| dir.join("SKILL.md").is_file() && !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()))
-            .map(|dir| {
-                let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-                let source = lock["skills"][&name]["source"].as_str();
-                let targets = json!({ "claude_code": true, "cursor": self.wired("cursor"), "claude_app": false });
-                let extra = json!({ "source": source, "managed_by": source.map(|_| "npx skills") });
-                self.entry("skill", &name, "external", &dir, targets, extra)
-            })
-            .collect()
+        let agents = self.agents.canonicalize().unwrap_or_else(|_| self.agents.to_path_buf());
+        let in_claude: Vec<PathBuf> = sorted_dirs(&self.claude.join("skills"));
+        let in_cursor: Vec<PathBuf> = sorted_dirs(&self.home.join(".cursor/skills"));
+        let mut names: Vec<String> = Vec::new();
+        let mut out = Vec::new();
+        for dir in in_claude.iter().chain(&in_cursor) {
+            let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let target = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            if !dir.join("SKILL.md").is_file() || target.starts_with(&agents) || names.contains(&name) {
+                continue;
+            }
+            let package = target
+                .iter()
+                .skip_while(|part| *part != "node_modules")
+                .nth(1)
+                .map(|part| part.to_string_lossy().to_string());
+            let (source, managed_by) = match (lock["skills"][&name]["source"].as_str(), package) {
+                (Some(source), _) => (Some(source.to_string()), Some("npx skills")),
+                (None, Some(package)) => (Some(package), Some("npm")),
+                (None, None) => (None, None),
+            };
+            let targets = json!({ "claude_code": in_claude.contains(dir), "cursor": self.wired("cursor"), "claude_app": false });
+            out.push(self.entry("skill", &name, "external", dir, targets, json!({ "source": source, "managed_by": managed_by })));
+            names.push(name);
+        }
+        out
     }
 
     fn plugins(&self, app: bool) -> Vec<Value> {
