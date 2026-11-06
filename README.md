@@ -533,7 +533,7 @@ State: `~/.MemoryPilot/state/cursor-hooks-state.json`. Log: `~/.MemoryPilot/logs
 ~/.MemoryPilot/agents/
 ├── rules/AGENTS.md          your rules (starts as an example comment)
 ├── skills/<name>/SKILL.md   your skills (Agent Skills format)
-├── vendor/
+├── vendor/<name>/SKILL.md   imported skills, linked like yours (yours win on a name clash)
 └── plugins/<plugin>/          whole plugins (skills read over MCP)
 ```
 

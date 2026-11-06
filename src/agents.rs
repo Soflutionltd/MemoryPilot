@@ -1,7 +1,8 @@
 //! The user's own rules and skills for every coding agent.
 //!
 //! `~/.MemoryPilot/agents/` holds `rules/AGENTS.md`, `skills/<name>/SKILL.md`
-//! (Agent Skills format), `vendor/` and `plugins/<name>/` (whole plugins, see
+//! (Agent Skills format), `vendor/<name>/SKILL.md` (imported skills, linked
+//! like the own ones) and `plugins/<name>/` (whole plugins, see
 //! `plugins.rs`): Claude Code installs them as plugins of the generated
 //! `memorypilot` marketplace, Cursor links their `cursor/` variant into
 //! `~/.cursor/plugins/local/`, and without one the other tools get their skills. MemoryPilot ships none of them: it
@@ -246,20 +247,21 @@ fn display(paths: &Paths, path: &Path) -> String {
     }
 }
 
-/// Skill folders holding a `SKILL.md`, sorted.
-fn list_skills(paths: &Paths) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(paths.skills())
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|name| !name.starts_with('.'))
-                .filter(|name| paths.skills().join(name).join("SKILL.md").is_file())
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names
+/// Skills to link, as (name, folder), sorted: `skills/` then `vendor/`. A vendor
+/// skill with the name of an own skill is left out, as in `agent_skills::list`.
+fn list_skills(paths: &Paths) -> Vec<(String, PathBuf)> {
+    let mut skills: Vec<(String, PathBuf)> = Vec::new();
+    for folder in [paths.skills(), paths.agents.join("vendor")] {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            let dir = folder.join(&name);
+            if !name.starts_with('.') && dir.join("SKILL.md").is_file() && !skills.iter().any(|(known, _)| *known == name) {
+                skills.push((name, dir));
+            }
+        }
+    }
+    skills.sort();
+    skills
 }
 
 fn inputs_fingerprint(paths: &Paths, tools: &[String]) -> String {
@@ -280,7 +282,7 @@ fn inputs_fingerprint(paths: &Paths, tools: &[String]) -> String {
         tools.join(","),
         CURSOR_RULE_FROM_AGENTS_MD,
         rules,
-        list_skills(paths).join("/"),
+        list_skills(paths).iter().map(|(_, dir)| dir.display().to_string()).collect::<Vec<_>>().join("/"),
         plugins.join("/"),
         cursor_skills.join("/"),
         paths.agents.display(),
@@ -433,12 +435,12 @@ fn desired(paths: &Paths, tools: &[String]) -> Vec<Entry> {
     let rules = std::fs::read_to_string(&rules_path).ok();
     let skills = list_skills(paths);
     let mut out = Vec::new();
-    let skill_links = |out: &mut Vec<Entry>, tool: &str, dir: PathBuf| {
-        for name in &skills {
+    let skill_links = |out: &mut Vec<Entry>, tool: &str, links: PathBuf| {
+        for (name, dir) in &skills {
             out.push(Entry::Link {
                 tool: tool.into(),
-                path: dir.join(name),
-                target: paths.skills().join(name),
+                path: links.join(name),
+                target: dir.clone(),
                 adopted: false,
             });
         }
@@ -934,8 +936,11 @@ impl Ctx<'_> {
     /// from `~/.agents/skills`, so they would make every skill appear twice.
     fn remove_legacy_cursor_links(&mut self) {
         let Some(dir) = cursor_skills_dir(self.paths) else { return };
-        let Ok(skills) = self.paths.skills().canonicalize() else { return };
-        let relinked = list_skills(self.paths);
+        let relinked: Vec<PathBuf> = list_skills(self.paths)
+            .into_iter()
+            .filter(|(_, skill)| skill.starts_with(self.paths.skills()))
+            .filter_map(|(_, skill)| skill.canonicalize().ok())
+            .collect();
         let Ok(entries) = std::fs::read_dir(&dir) else { return };
         // Only links to a skill MemoryPilot links again in ~/.agents/skills:
         // anything else (vendor, plugins, other folders) is left for Cursor.
@@ -943,12 +948,7 @@ impl Ctx<'_> {
             .flatten()
             .map(|e| e.path())
             .filter(|p| is_symlink(p))
-            .filter(|p| {
-                p.canonicalize().is_ok_and(|target| {
-                    target.parent() == Some(skills.as_path())
-                        && target.file_name().is_some_and(|n| relinked.iter().any(|r| n == r.as_str()))
-                })
-            })
+            .filter(|p| p.canonicalize().is_ok_and(|target| relinked.contains(&target)))
             .collect();
         links.sort();
         for link in links {

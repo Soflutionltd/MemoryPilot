@@ -560,6 +560,28 @@ fn cursor_reads_the_claude_links_when_both_are_wired() {
 }
 
 #[test]
+fn vendor_skills_are_linked_unless_an_own_skill_has_the_name() {
+    let home = Home::new("vendor-links");
+    home.mkdirs(&[".claude", ".cursor"]);
+    home.add_skill("mine");
+    home.write(".MemoryPilot/agents/vendor/theirs/SKILL.md", "---\nname: theirs\n---\n");
+    home.write(".MemoryPilot/agents/vendor/mine/SKILL.md", "---\nname: mine\n---\n");
+    home.run(&["--setup-agents", "--tools", "claude,cursor"]);
+    assert!(is_link_to(&home.p(".claude/skills/theirs"), &home.p(".MemoryPilot/agents/vendor/theirs")));
+    assert!(is_link_to(&home.p(".claude/skills/mine"), &home.p(".MemoryPilot/agents/skills/mine")), "own skill wins");
+    let catalog: Value = serde_json::from_str(&home.read(".MemoryPilot/agents/catalog.json")).unwrap();
+    let theirs = catalog["items"].as_array().unwrap().iter().find(|i| i["name"] == "theirs").cloned().unwrap();
+    assert_eq!((theirs["targets"]["cursor"].as_bool(), theirs["status"].as_str()), (Some(true), Some("ok")));
+    // A new vendor skill is wired by the next sync, its removal too.
+    home.write(".MemoryPilot/agents/vendor/later/SKILL.md", "---\nname: later\n---\n");
+    home.run(&["--sync-agents"]);
+    assert!(is_link_to(&home.p(".claude/skills/later"), &home.p(".MemoryPilot/agents/vendor/later")));
+    std::fs::remove_dir_all(home.p(".MemoryPilot/agents/vendor/later")).unwrap();
+    home.run(&["--sync-agents"]);
+    assert!(std::fs::symlink_metadata(home.p(".claude/skills/later")).is_err());
+}
+
+#[test]
 fn cursor_cleanup_spares_other_tools_and_linked_folders() {
     // ~/.cursor/skills is itself a link into the agents folder: nothing is removed.
     let home = Home::new("cursor-linked");
@@ -615,7 +637,7 @@ fn catalog_lists_items_with_their_targets() {
     let mine = item("mine");
     assert_eq!((mine["origin"].as_str(), mine["targets"]["claude_code"].as_bool(), mine["status"].as_str()), (Some("perso"), Some(true), Some("ok")));
     let theirs = item("theirs");
-    assert_eq!((theirs["origin"].as_str(), theirs["status"].as_str()), (Some("vendor"), Some("not_deployed")));
+    assert_eq!((theirs["origin"].as_str(), theirs["status"].as_str()), (Some("vendor"), Some("ok")));
     let gh = item("gh");
     assert_eq!((gh["type"].as_str(), gh["version"].as_str(), gh["source"].as_str()), (Some("mcp"), Some("2025.4.8"), Some("@modelcontextprotocol/server-github")));
 }
