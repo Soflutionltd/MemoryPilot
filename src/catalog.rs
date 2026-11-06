@@ -3,7 +3,9 @@
 //! it changes). One entry per rule, skill, plugin and MCP server:
 //!
 //! - `type`: `rule`, `skill`, `plugin` or `mcp`;
-//! - `origin`: `perso` (written here) or `vendor` (imported, kept as is);
+//! - `origin`: `perso` (written here), `vendor` (imported, kept as is) or
+//!   `external` (a real folder of `~/.claude/skills`, left to the tool that
+//!   installed it: `managed_by` says which, `npx skills` from its lock file);
 //! - `version`, `source`, `url`: for vendor items, where they come from;
 //! - `targets`: `claude_code`, `cursor`, `claude_app` (true when deployed);
 //! - `cursor_via` (plugins): `claude_code` when Cursor imports the Claude Code
@@ -176,6 +178,23 @@ impl Ctx<'_> {
             .collect()
     }
 
+    /// Real folders of `~/.claude/skills`: skills installed by another tool,
+    /// listed so they are known, never copied. Their path stays absolute.
+    fn external_skills(&self) -> Vec<Value> {
+        let lock = read_json(&self.home.join(".agents/.skill-lock.json")).unwrap_or(Value::Null);
+        sorted_dirs(&self.claude.join("skills"))
+            .into_iter()
+            .filter(|dir| dir.join("SKILL.md").is_file() && !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()))
+            .map(|dir| {
+                let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let source = lock["skills"][&name]["source"].as_str();
+                let targets = json!({ "claude_code": true, "cursor": self.wired("cursor"), "claude_app": false });
+                let extra = json!({ "source": source, "managed_by": source.map(|_| "npx skills") });
+                self.entry("skill", &name, "external", &dir, targets, extra)
+            })
+            .collect()
+    }
+
     fn plugins(&self, app: bool) -> Vec<Value> {
         let installed = read_json(&self.claude.join("plugins/installed_plugins.json")).unwrap_or(Value::Null);
         crate::plugins::list(&self.agents.join("plugins"))
@@ -260,6 +279,7 @@ impl Ctx<'_> {
         let mut items: Vec<Value> = self.rule().into_iter().collect();
         items.extend(self.skills("skills", "perso", app));
         items.extend(self.skills("vendor", "vendor", app));
+        items.extend(self.external_skills());
         items.extend(self.plugins(app));
         items.extend(self.mcp_servers());
         let doc = json!({
