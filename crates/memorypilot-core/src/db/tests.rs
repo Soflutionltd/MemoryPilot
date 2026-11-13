@@ -11,6 +11,7 @@ fn cleanup_db_files(path: &PathBuf) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    let _ = std::fs::remove_file(path.with_file_name("reveal-audit.log"));
 }
 
 /// Regression: auto-compaction used to hold `LAST_COMPACT` across

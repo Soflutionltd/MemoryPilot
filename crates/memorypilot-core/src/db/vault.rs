@@ -18,6 +18,7 @@
 //! next to the database. If no key can be obtained, nothing is sealed
 //! (never lose data because of a missing key).
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
@@ -401,8 +402,21 @@ fn ask_user(_message: &str) -> Result<bool, String> {
     Err("no confirmation dialog on this system: set MEMORYPILOT_REVEAL_CONFIRM=none to allow reveals with audit only".into())
 }
 
-fn audit(memory: &Memory, reason: &str, outcome: &str) {
-    let Some(dir) = crate::layout::dir(crate::layout::Area::Logs) else {
+/// Where the audit of `db_path` goes: `logs/` for the user's own database,
+/// next to the file for any other one (tests, `--db`, `MEMORYPILOT_DB`), so
+/// a temporary database never writes into the real audit trail.
+fn audit_dir(db_path: Option<&str>) -> Option<PathBuf> {
+    let db_path = Path::new(db_path.filter(|path| !path.is_empty())?);
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let own = crate::layout::path(crate::layout::Area::Data, "memory.db");
+    if own.is_some_and(|own| resolved(&own) == resolved(db_path)) {
+        return crate::layout::dir(crate::layout::Area::Logs);
+    }
+    db_path.parent().map(Path::to_path_buf)
+}
+
+fn audit(db_path: Option<&str>, memory: &Memory, reason: &str, outcome: &str) {
+    let Some(dir) = audit_dir(db_path) else {
         return;
     };
     if std::fs::create_dir_all(&dir).is_err() {
@@ -447,7 +461,7 @@ impl Database {
     }
 
     /// The value of a credential, after the user said yes. Every request is
-    /// written to ~/.MemoryPilot/logs/reveal-audit.log, without the value.
+    /// written to reveal-audit.log (see `audit_dir`), without the value.
     /// The value comes from 1Password when the credential points there, else
     /// from the local encrypted copy; the source is returned with it.
     pub fn reveal_secret(&self, id: &str, reason: &str, confirm: RevealConfirm) -> Result<(Memory, String, &'static str), String> {
@@ -460,7 +474,7 @@ impl Database {
             return Err(format!("{} is a {}, not a credential: get_memory returns it in full", id, memory.kind));
         }
         if REMOTE.load(Ordering::Relaxed) && !reveal_enabled() {
-            audit(&memory, reason, "refused_remote");
+            audit(self.conn.path(), &memory, reason, "refused_remote");
             return Err("Reveals are off on the HTTP server (MEMORYPILOT_HTTP_SECRETS=on allows them)".into());
         }
         if confirm == RevealConfirm::Dialog {
@@ -474,11 +488,11 @@ impl Database {
             match ask_user(&message) {
                 Ok(true) => {}
                 Ok(false) => {
-                    audit(&memory, reason, "refused");
+                    audit(self.conn.path(), &memory, reason, "refused");
                     return Err("The user did not confirm (refused or no answer within 55 s)".into());
                 }
                 Err(error) => {
-                    audit(&memory, reason, "no_dialog");
+                    audit(self.conn.path(), &memory, reason, "no_dialog");
                     return Err(error);
                 }
             }
@@ -494,7 +508,7 @@ impl Database {
                 "memorypilot",
             ),
         };
-        audit(&memory, reason, if confirm == RevealConfirm::Dialog { "revealed" } else { "revealed_unconfirmed" });
+        audit(self.conn.path(), &memory, reason, if confirm == RevealConfirm::Dialog { "revealed" } else { "revealed_unconfirmed" });
         Ok((memory, value, source))
     }
 }
@@ -1543,6 +1557,24 @@ pub(crate) fn seal_file(path: &std::path::Path) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the test suite appended 560 lines to the user's real
+    /// reveal-audit.log, because the audit ignored which database was open.
+    #[test]
+    fn audit_of_another_database_stays_next_to_it() {
+        let dir = std::env::temp_dir().join(format!("mp-audit-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db_path = dir.join("memory.db");
+        std::fs::write(&db_path, b"").expect("db file");
+
+        assert_eq!(audit_dir(db_path.to_str()), Some(dir.clone()));
+        assert_eq!(audit_dir(None), None, "an in-memory database has no audit trail");
+        assert_eq!(audit_dir(Some("")), None);
+
+        let own = crate::layout::path(crate::layout::Area::Data, "memory.db").expect("layout");
+        assert_eq!(audit_dir(own.to_str()), crate::layout::dir(crate::layout::Area::Logs));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn credential(content: &str, metadata: Option<serde_json::Value>) -> Memory {
         Memory {
