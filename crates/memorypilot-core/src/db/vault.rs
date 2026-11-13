@@ -375,8 +375,67 @@ impl RevealConfirm {
 
 const DIALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The words of the confirmation dialog.
+struct DialogTexts {
+    asks: &'static str,
+    project: &'static str,
+    no_project: &'static str,
+    reason: &'static str,
+    deny: &'static str,
+    reveal: &'static str,
+}
+
+const DIALOG_ENGLISH: DialogTexts = DialogTexts {
+    asks: "An agent asks for the value of this secret:",
+    project: "Project:",
+    no_project: "none",
+    reason: "Reason:",
+    deny: "Deny",
+    reveal: "Reveal",
+};
+
+const DIALOG_FRENCH: DialogTexts = DialogTexts {
+    asks: "Un agent demande la valeur de ce secret :",
+    project: "Projet :",
+    no_project: "aucun",
+    reason: "Motif :",
+    deny: "Refuser",
+    reveal: "Révéler",
+};
+
+/// English, unless `locale` (`fr_FR.UTF-8`, `fr-CA`...) is one the dialog is
+/// translated into.
+fn dialog_texts(locale: &str) -> &'static DialogTexts {
+    if locale.trim().to_lowercase().starts_with("fr") {
+        &DIALOG_FRENCH
+    } else {
+        &DIALOG_ENGLISH
+    }
+}
+
+/// The user's locale: `LC_ALL`, `LC_MESSAGES`, `LANG`, then the macOS setting
+/// (a server started by a desktop app has none of the variables).
+fn user_locale() -> String {
+    let from_environment = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|variable| std::env::var(variable).ok())
+        .find(|value| !value.trim().is_empty() && value != "C" && value != "POSIX");
+    if let Some(locale) = from_environment {
+        return locale;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("/usr/bin/defaults");
+        command.args(["read", "-g", "AppleLocale"]);
+        if let Some(locale) = crate::connectors::run_with_timeout(command, None, std::time::Duration::from_secs(2)) {
+            return locale;
+        }
+    }
+    String::new()
+}
+
 #[cfg(target_os = "macos")]
-fn ask_user(message: &str) -> Result<bool, String> {
+fn ask_user(message: &str, texts: &DialogTexts) -> Result<bool, String> {
     let osascript = std::path::Path::new("/usr/bin/osascript");
     if !osascript.exists() {
         return Err("osascript not found: no way to ask for confirmation".into());
@@ -387,18 +446,20 @@ fn ask_user(message: &str) -> Result<bool, String> {
         "-e",
         "on run argv",
         "-e",
-        "display dialog (item 1 of argv) with title \"MemoryPilot\" buttons {\"Refuser\", \"Révéler\"} default button \"Refuser\" cancel button \"Refuser\" with icon caution giving up after 55",
+        "display dialog (item 1 of argv) with title \"MemoryPilot\" buttons {(item 2 of argv), (item 3 of argv)} default button 1 cancel button 1 with icon caution giving up after 55",
         "-e",
         "end run",
         "--",
         message,
+        texts.deny,
+        texts.reveal,
     ]);
     let answer = crate::connectors::run_with_timeout(command, None, DIALOG_TIMEOUT).unwrap_or_default();
-    Ok(answer.contains("button returned:Révéler") && !answer.contains("gave up:true"))
+    Ok(answer.contains(&format!("button returned:{}", texts.reveal)) && !answer.contains("gave up:true"))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn ask_user(_message: &str) -> Result<bool, String> {
+fn ask_user(_message: &str, _texts: &DialogTexts) -> Result<bool, String> {
     Err("no confirmation dialog on this system: set MEMORYPILOT_REVEAL_CONFIRM=none to allow reveals with audit only".into())
 }
 
@@ -479,13 +540,17 @@ impl Database {
         }
         if confirm == RevealConfirm::Dialog {
             let label = memory.content.trim_start_matches(SEAL_PREFIX);
+            let texts = dialog_texts(&user_locale());
             let message = format!(
-                "Un agent demande la valeur de ce secret :\n\n{}\n\nProjet : {}\nMotif : {}",
+                "{}\n\n{}\n\n{} {}\n{} {}",
+                texts.asks,
                 label.chars().take(200).collect::<String>(),
-                memory.project.as_deref().unwrap_or("aucun"),
+                texts.project,
+                memory.project.as_deref().unwrap_or(texts.no_project),
+                texts.reason,
                 reason.chars().take(300).collect::<String>(),
             );
-            match ask_user(&message) {
+            match ask_user(&message, texts) {
                 Ok(true) => {}
                 Ok(false) => {
                     audit(self.conn.path(), &memory, reason, "refused");
@@ -1387,7 +1452,8 @@ impl Database {
     pub fn sync_to_onepassword(&self, apply: bool) -> Result<OnePasswordSync, String> {
         use crate::onepassword as op;
         let key = key().ok_or("no encryption key available: credentials cannot be read")?;
-        let items = op::vault_items()?;
+        let vault = op::vault()?;
+        let items = op::vault_items(&vault)?;
         let mut report = OnePasswordSync {
             key: if op::find_title(&items, op::KEY_ITEM_TITLE).is_some() { "present" } else { "to_create" },
             ..Default::default()
@@ -1400,10 +1466,10 @@ impl Database {
                 "fields": [
                     { "id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": B64.encode(key) },
                     { "id": "notesPlain", "type": "STRING", "purpose": "NOTES", "label": "notesPlain",
-                      "value": format!("Clé XChaCha20-Poly1305 (base64) des identifiants MemoryPilot. Sur un nouveau Mac, la remettre dans le Trousseau : service {}, compte {}.", KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) }
+                      "value": format!("XChaCha20-Poly1305 key (base64) of the MemoryPilot credentials. On a new Mac, put it back in the Keychain: service {}, account {}.", KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) }
                 ]
             });
-            op::create_item(&template)?;
+            op::create_item(&vault, &template)?;
             report.key = "created";
         }
         let ids: Vec<String> = {
@@ -1431,7 +1497,7 @@ impl Database {
             };
             let secret = find_secret_value(&clear);
             let label = memory.content.trim_start_matches(SEAL_PREFIX).to_string();
-            let known = secret.as_deref().and_then(|value| op::find_value(&items, value, &clear));
+            let known = secret.as_deref().and_then(|value| op::find_value(&vault, &items, value, &clear));
             let reference = match known {
                 Some(reference) => {
                     report.linked.push((id.clone(), reference.clone()));
@@ -1448,8 +1514,8 @@ impl Database {
                         label.chars().take(70).collect::<String>()
                     );
                     let (template, field) = op::item_template(&title, memory.project.as_deref(), &clear, secret.as_deref());
-                    match op::create_item(&template) {
-                        Ok(item_id) => op::reference(&item_id, field),
+                    match op::create_item(&vault, &template) {
+                        Ok(item_id) => op::reference(&vault, &item_id, field),
                         Err(error) => {
                             report.created.pop();
                             report.failed.push((id, error));
@@ -1557,6 +1623,15 @@ pub(crate) fn seal_file(path: &std::path::Path) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_is_english_unless_the_locale_is_translated() {
+        assert_eq!(dialog_texts("fr_FR.UTF-8").reveal, "Révéler");
+        assert_eq!(dialog_texts("fr-CA").deny, "Refuser");
+        for locale in ["en_US.UTF-8", "de_DE", "ja_JP", "", "C"] {
+            assert_eq!(dialog_texts(locale).reveal, "Reveal", "{locale}");
+        }
+    }
 
     /// Regression: the test suite appended 560 lines to the user's real
     /// reveal-audit.log, because the audit ignored which database was open.
@@ -1739,13 +1814,13 @@ mod tests {
     fn secret_value_detection_ignores_mere_mentions() {
         for prose in [
             "Secrets : jamais dans git, valeur de référence dans 1Password via op-sof (coffre Soflution).",
-            "Clé Anthropic : op://Soflution/yquxzdeotwopqmgf5iyzpoqgry/credential",
+            "Clé Anthropic : op://Team/abcdefghijklmnopqrstuvwxyz/credential",
             "Le catalogue d'outils pèse ~90k tokens par tour, coût 0,05 $ par run.",
             "Mot de passe oublié : flux de réinitialisation par e-mail.",
             "Le mot de passe actuel est exigé avant de reprendre une place.",
             "Secrets Cloudflare posés sur le projet docix (RESEND_API_KEY, POWENS_DOMAIN).",
             "Mews démo: login antoine@example.fr. MDP stocké 1Password.",
-            "Team ID = TB8CC687M3, Bundle ID = com.soflution.prive, commit 6052ff30",
+            "Team ID = ABCDE12345, Bundle ID = com.example.prive, commit 6052ff30",
             "Docix MCP déployé (commit b9c6836), projet Supabase lpspvwjybttpueaydwmp.",
             // Technical notes the detector used to seal (2026-10-23).
             "Modèle multilingual-e5-small via fastembed, cible x86_64-unknown-linux-musl ou wasm32-unknown-unknown.",

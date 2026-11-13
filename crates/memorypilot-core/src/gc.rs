@@ -351,7 +351,7 @@ mod tests {
         for content in [
             "Docix : secrets Cloudflare pour la prod, référence 1Password via op-sof, jamais de secret dans git.",
             "Le catalogue MCP coûte ~90k tokens par tour.",
-            "Clé Anthropic du banc : op://Soflution/yquxzdeotwopqmgf5iyzpoqgry/credential",
+            "Clé Anthropic du banc : op://Team/abcdefghijklmnopqrstuvwxyz/credential",
             "Base sauvegardée dans ~/.MemoryPilot/memory.db.bak-20261025-1444-prebuild avant le build.",
             "Binaire copié depuis /Users/me/Cursor/App/MemoryPilot/target/release/MemoryPilot2 (~ 40 Mo).",
         ] {
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn identifiers_are_important_facts() {
-        assert_eq!(auto_classify("Sociomator iOS : App ID 6758438203, Bundle ID com.soflution.pubflow").0, 5);
+        assert_eq!(auto_classify("MonApp iOS : App ID 1234567890, Bundle ID com.example.monapp").0, 5);
     }
 }
 

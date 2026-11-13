@@ -476,7 +476,7 @@ mod tests {
         "Emoji test 🚀🔥 and  double  spaces\tand\ttabs\nnewline",
         "MAJUSCULES ET Ponctuation !!! ??? ... « guillemets » “quotes” — tiret",
         "Query: quelle est la couleur primaire du design system ?",
-        "Document: [Soflution_Design_System] Couleur primaire: Fuchsia (#d946ef)",
+        "Document: [MonApp_Design_System] Couleur primaire: Fuchsia (#d946ef)",
         "12345678901234567890 3.14159 1e-9 -42 0xDEADBEEF",
         "",
         "   ",

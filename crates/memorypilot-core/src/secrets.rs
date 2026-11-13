@@ -1098,7 +1098,7 @@ pub(crate) mod tests {
         case("password: {}", "password", "Hx9!kLm2pQ".to_string());
         case("le mot de passe est {}", "password", "Soleil2024".to_string());
         case("mdp={} pour le NAS", "password", "Tr0ub4dor#3".to_string());
-        case(r#"{"user":"antoine","password":"{}"}"#, "password", "Zq8$wV3nLp".to_string());
+        case(r#"{"user":"alice","password":"{}"}"#, "password", "Zq8$wV3nLp".to_string());
         case("DATABASE_URL=postgres://admin:{}@db.example.com:5432/app", "url_password", "S3cr3tPassw0rd".to_string());
         case("Authorization: Bearer {}", "bearer", fake(40, 26));
         case("long key {} here", "generic", fake(40, 27));
@@ -1153,7 +1153,7 @@ pub(crate) mod tests {
             "![logo](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)",
             &image,
             "Account ID Cloudflare a4b52d0892a12d1c1bbd8bf93c70c3f7",
-            "App ID 6758370345, Team ID TB8CC687M3, bundle com.soflution.prive",
+            "App ID 1234567890, Team ID ABCDE12345, bundle com.example.prive",
             "Key ID 77ZLGAGK7W, Issuer ID 69a6de70-03db-47e3-e053-5b8c7c11a4d1",
             "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
             &stripe_public,

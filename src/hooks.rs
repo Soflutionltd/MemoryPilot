@@ -326,7 +326,7 @@ fn session_start_context(payload: &Value) -> Option<String> {
                 record_injection(workspace);
             }
             Some(format!(
-                "MemoryPilot (mémoire persistante d'Antoine, chargée automatiquement au démarrage) :\n{}",
+                "MemoryPilot (your persistent memory, loaded at session start):\n{}",
                 truncate_chars(&text, MAX_CONTEXT_CHARS)
             ))
         }
@@ -370,7 +370,7 @@ fn pick_prompt_memories<'a>(results: &'a [SearchResult], project: Option<&str>, 
 }
 
 fn render_prompt_memories(picked: &[&SearchResult]) -> String {
-    let mut text = String::from("MemoryPilot : mémoires liées à ce message (texte entier, get_memory(id) pour les métadonnées) :");
+    let mut text = String::from("MemoryPilot: memories related to this message (full text; get_memory(id) for the metadata):");
     for hit in picked {
         let memory = &hit.memory;
         text.push_str(&format!(

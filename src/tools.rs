@@ -308,7 +308,7 @@ fn all_tool_definitions() -> Value {
                     "tags": { "type": ["array","null"], "items": { "type": "string" } },
                     "importance": { "type": ["integer","null"], "minimum": 1, "maximum": 5 },
                     "expires_at": { "type": ["string","null"] },
-                    "location": { "type": ["string","null"], "description": "Where the value of a credential lives, e.g. \"1Password, Soflution Admin\" or an op:// reference" }
+                    "location": { "type": ["string","null"], "description": "Where the value of a credential lives, e.g. \"1Password, Team vault, item Admin\" or an op:// reference" }
                 },
                 "required": ["id"]
             }

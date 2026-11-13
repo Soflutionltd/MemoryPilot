@@ -1,6 +1,12 @@
-//! 1Password through the `op` CLI (`op-sof`, the Soflution service account,
-//! when present). Secret values only travel on stdin/stdout of `op`, never
-//! on a command line.
+//! 1Password through its command-line tool. Secret values only travel on its
+//! stdin/stdout, never on a command line.
+//!
+//! Which vault MemoryPilot may use, and which command to run, are the user's:
+//! `~/.MemoryPilot/config/onepassword.json` (`{"vault": "...", "cli": "..."}`)
+//! or the `MEMORYPILOT_OP_VAULT` / `MEMORYPILOT_OP_CLI` variables. `cli` names
+//! another binary on the PATH, such as a wrapper that signs in a service
+//! account; without it the standard one is used. Nothing is assumed about
+//! the vault.
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -9,19 +15,43 @@ use std::time::Duration;
 
 use crate::connectors::{find_binary, run_with_timeout};
 
-pub const VAULT: &str = "Soflution";
+const SETTINGS_FILE: &str = "onepassword.json";
+const DEFAULT_CLI: &str = "op";
 pub const IMPORT_TAG: &str = "memorypilot-import";
 pub const KEY_ITEM_TITLE: &str = "MemoryPilot vault key";
 const LIST_TIMEOUT: Duration = Duration::from_secs(240);
 const ITEM_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `op-sof` (no Touch ID prompt) when installed, else `op`.
+/// One setting: its environment variable, else the key of `onepassword.json`.
+fn setting(variable: &str, key: &str) -> Option<String> {
+    let from_file = || {
+        let path = crate::layout::path(crate::layout::Area::Config, SETTINGS_FILE)?;
+        let settings: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        settings[key].as_str().map(String::from)
+    };
+    std::env::var(variable)
+        .ok()
+        .or_else(from_file)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The vault MemoryPilot reads and creates items in.
+pub fn vault() -> Result<String, String> {
+    setting("MEMORYPILOT_OP_VAULT", "vault").ok_or_else(|| {
+        "No 1Password vault chosen: set MEMORYPILOT_OP_VAULT, or \"vault\" in ~/.MemoryPilot/config/onepassword.json".to_string()
+    })
+}
+
+/// The configured command when it is on the PATH, else the standard one.
 fn binary() -> Option<PathBuf> {
-    find_binary("op-sof").or_else(|| find_binary("op"))
+    setting("MEMORYPILOT_OP_CLI", "cli")
+        .and_then(|cli| find_binary(&cli))
+        .or_else(|| find_binary(DEFAULT_CLI))
 }
 
 fn op(args: &[&str], stdin: Option<&str>, timeout: Duration) -> Result<String, String> {
-    let binary = binary().ok_or("1Password CLI not found (op-sof or op)")?;
+    let binary = binary().ok_or("1Password CLI not found (the standard one, or the \"cli\" of onepassword.json)")?;
     let mut command = Command::new(binary);
     command.args(args);
     run_with_timeout(command, stdin, timeout)
@@ -29,14 +59,14 @@ fn op(args: &[&str], stdin: Option<&str>, timeout: Duration) -> Result<String, S
 }
 
 /// Every item of the vault, fields included (kept in memory, never printed).
-pub fn vault_items() -> Result<Vec<Value>, String> {
+pub fn vault_items(vault: &str) -> Result<Vec<Value>, String> {
     let list = op(
-        &["item", "list", "--vault", VAULT, "--format", "json"],
+        &["item", "list", "--vault", vault, "--format", "json"],
         None,
         LIST_TIMEOUT,
     )?;
     let full = op(
-        &["item", "get", "--vault", VAULT, "--format", "json", "-"],
+        &["item", "get", "--vault", vault, "--format", "json", "-"],
         Some(&list),
         LIST_TIMEOUT,
     )?;
@@ -62,12 +92,12 @@ fn describes(item: &Value, text: &str) -> bool {
 
 /// Reference to the first concealed field holding `value` in an item about
 /// the account `text` describes.
-pub fn find_value(items: &[Value], value: &str, text: &str) -> Option<String> {
+pub fn find_value(vault: &str, items: &[Value], value: &str, text: &str) -> Option<String> {
     items.iter().filter(|item| describes(item, text)).find_map(|item| {
         let id = item["id"].as_str()?;
         item["fields"].as_array()?.iter().find_map(|field| {
             (field["type"] == "CONCEALED" && field["value"].as_str() == Some(value))
-                .then(|| field["id"].as_str().map(|field_id| reference(id, field_id)))
+                .then(|| field["id"].as_str().map(|field_id| reference(vault, id, field_id)))
                 .flatten()
         })
     })
@@ -81,8 +111,8 @@ pub fn find_title(items: &[Value], title: &str) -> Option<String> {
         .map(String::from)
 }
 
-pub fn reference(item_id: &str, field: &str) -> String {
-    format!("op://{}/{}/{}", VAULT, item_id, field)
+pub fn reference(vault: &str, item_id: &str, field: &str) -> String {
+    format!("op://{}/{}/{}", vault, item_id, field)
 }
 
 fn first_email(text: &str) -> Option<&str> {
@@ -144,9 +174,9 @@ pub fn item_template(
 }
 
 /// Creates the item and returns its id.
-pub fn create_item(template: &Value) -> Result<String, String> {
+pub fn create_item(vault: &str, template: &Value) -> Result<String, String> {
     let created = op(
-        &["item", "create", "--vault", VAULT, "--format", "json", "-"],
+        &["item", "create", "--vault", vault, "--format", "json", "-"],
         Some(&template.to_string()),
         ITEM_TIMEOUT,
     )?;
@@ -204,20 +234,21 @@ mod tests {
             ]}),
         ];
         assert_eq!(
-            find_value(&items, "Hx9!kLm2pQ", "Clé API démo : Hx9!kLm2pQ").as_deref(),
-            Some("op://Soflution/b2/credential")
+            find_value("Team", &items, "Hx9!kLm2pQ", "Clé API démo : Hx9!kLm2pQ").as_deref(),
+            Some("op://Team/b2/credential")
         );
-        assert_eq!(find_value(&items, "missing", "Clé API : missing"), None);
-        assert_eq!(find_value(&items, "Hx9!kLm2pQ", "Admin RoomPilot : Hx9!kLm2pQ"), None, "same password, other account");
+        assert_eq!(find_value("Team", &items, "missing", "Clé API : missing"), None);
+        assert_eq!(find_value("Team", &items, "Hx9!kLm2pQ", "Admin MonApp : Hx9!kLm2pQ"), None, "same password, other account");
 
-        let site = vec![json!({ "id": "c3", "title": "wpdebugtoolkit", "urls": [{ "href": "https://www.roompilot.app/login" }], "fields": [
+        let site = vec![json!({ "id": "c3", "title": "wpdebugtoolkit", "urls": [{ "href": "https://www.example.com/login" }], "fields": [
             { "id": "password", "type": "CONCEALED", "value": "Hx9!kLm2pQ" }
         ]})];
         assert_eq!(
-            find_value(&site, "Hx9!kLm2pQ", "Admin roompilot.app : Hx9!kLm2pQ").as_deref(),
-            Some("op://Soflution/c3/password"),
+            find_value("Team", &site, "Hx9!kLm2pQ", "Admin example.com : Hx9!kLm2pQ").as_deref(),
+            Some("op://Team/c3/password"),
             "matched by URL host"
         );
+        assert_eq!(reference("My vault", "c3", "password"), "op://My vault/c3/password");
         assert_eq!(find_title(&items, "API démo").as_deref(), Some("b2"));
     }
 }

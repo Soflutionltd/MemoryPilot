@@ -1205,7 +1205,7 @@ fn print_help() {
     );
     println!("  MemoryPilot --seal-backup FILE...  Encrypt credentials inside old backup files");
     println!("  MemoryPilot --reseal-recovered [--apply]  Re-encrypt with the current key credentials recovered in clear (JSON id → text on stdin), each checked against its label");
-    println!("  MemoryPilot --sync-1password [--apply]  Point every credential to 1Password (Soflution vault), creating missing items; back up the vault key");
+    println!("  MemoryPilot --sync-1password [--apply]  Point every credential to 1Password (the vault of ~/.MemoryPilot/config/onepassword.json or MEMORYPILOT_OP_VAULT), creating missing items; back up the vault key");
     println!("  MemoryPilot --repair-credentials [--apply]  Re-mask leaking labels, reclassify credentials holding no secret");
     println!("  MemoryPilot --redact-conversations [--apply]  Mask secrets already in the conversation index (counts only without --apply)");
     println!("  MemoryPilot --add-known-secret  Read one secret value on stdin, keep only its SHA-256 print so it is masked everywhere");
