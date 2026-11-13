@@ -40,6 +40,10 @@ const MAX_CONTEXT_CHARS: usize = 8000;
 const MAX_PROMPT_CONTEXT_CHARS: usize = 4000;
 const MAX_PROMPT_MEMORY_CHARS: usize = 1200;
 const MAX_PROMPT_MEMORIES: usize = 3;
+/// Memories injected per session, all prompts together: past it the hook
+/// stops searching. Bounds what the recall adds to a long conversation
+/// (10 x 1,200 characters, about 3,000 tokens at most).
+const MAX_SESSION_MEMORIES: usize = 10;
 /// A hit is injected when it scores at least this share of the top hit.
 /// Only the cross-encoder rerank (the default search mode) spreads the
 /// scores enough for this to select: without it the fused ranks are flat
@@ -388,6 +392,11 @@ fn prompt_seen_path(session: &str) -> PathBuf {
     hook_path(memorypilot_core::layout::Area::State, PROMPT_SEEN_DIR).join(format!("{}.json", name))
 }
 
+/// How many more memories this session may get, `already` being injected.
+fn session_budget_left(already: usize) -> usize {
+    MAX_SESSION_MEMORIES.saturating_sub(already)
+}
+
 fn load_seen(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -399,6 +408,12 @@ fn load_seen(path: &Path) -> Vec<String> {
 /// in the prompt, nothing the ranker trusts, or all of it already injected.
 fn prompt_context(payload: &Value) -> Option<String> {
     let query = prompt_query(&str_field(payload, "prompt")?)?;
+    let seen_path = conversation_id(payload).map(|session| prompt_seen_path(&session));
+    let mut seen = seen_path.as_deref().map(load_seen).unwrap_or_default();
+    let budget = session_budget_left(seen.len());
+    if budget == 0 {
+        return None;
+    }
     let db = match open_db() {
         Ok(db) => db,
         Err(error) => {
@@ -414,13 +429,12 @@ fn prompt_context(payload: &Value) -> Option<String> {
             return None;
         }
     };
-    let seen_path = conversation_id(payload).map(|session| prompt_seen_path(&session));
-    let mut seen = seen_path.as_deref().map(load_seen).unwrap_or_default();
     // The ranker skips the cross-encoder when its top hit is already sure:
     // the scores are then flat fused ranks, which vouch for that hit only.
     let reranked = confidence.cross_score.is_some();
     let candidates = if reranked { &results[..] } else { &results[..results.len().min(1)] };
-    let picked = if confidence.abstain { Vec::new() } else { pick_prompt_memories(candidates, project.as_deref(), &seen) };
+    let mut picked = if confidence.abstain { Vec::new() } else { pick_prompt_memories(candidates, project.as_deref(), &seen) };
+    picked.truncate(budget);
     // One line per searched prompt, without its text: what the gate decided.
     log(&format!(
         "user-prompt: project={} confidence={} cosine={:.2} margin={:.2} hits={} injected={}",
@@ -1094,6 +1108,10 @@ mod tests {
         assert_eq!(ids(pick_prompt_memories(&results, Some("monapp"), &["a".into(), "d".into()])), ["f", "g"], "already injected ones are skipped");
         assert_eq!(ids(pick_prompt_memories(&results, None, &[])), ["d"], "no project detected: global only");
         assert!(pick_prompt_memories(&[], Some("monapp"), &[]).is_empty());
+        assert_eq!(session_budget_left(0), MAX_SESSION_MEMORIES);
+        assert_eq!(session_budget_left(MAX_SESSION_MEMORIES - 1), 1);
+        assert_eq!(session_budget_left(MAX_SESSION_MEMORIES), 0);
+        assert_eq!(session_budget_left(MAX_SESSION_MEMORIES + 5), 0, "a session past the cap gets nothing more");
 
         let text = render_prompt_memories(&pick_prompt_memories(&results, Some("monapp"), &[]));
         assert!(text.contains("[decision · MonApp · 2026-11-02 · id:a]\ncontenu de a"));
