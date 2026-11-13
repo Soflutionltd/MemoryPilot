@@ -87,18 +87,30 @@ fn declared_name(skill_md: &Path) -> Option<String> {
         .filter(|name| valid_name(name))
 }
 
+/// The repository's own name, for a skill sitting at its root: the last
+/// segment of its URL, without `.git`.
+fn repository_name(repo: &str) -> Option<String> {
+    let last = repo.trim_end_matches('/').rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    valid_name(name).then(|| name.to_string())
+}
+
 /// Skill folders of a cloned repository: `(name, folder relative to the clone)`.
-/// The name is the one `SKILL.md` declares, else the folder's.
-fn find_skills(clone: &Path) -> Vec<(String, PathBuf)> {
+/// The name is the one `SKILL.md` declares, else the folder's (`root_name`
+/// for a skill at the root, whose folder is only the clone's).
+fn find_skills(clone: &Path, root_name: Option<&str>) -> Vec<(String, PathBuf)> {
     let mut found = Vec::new();
     let mut stack = vec![(clone.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         let skill_md = dir.join("SKILL.md");
         if skill_md.is_file() {
-            let folder_name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let name = declared_name(&skill_md).unwrap_or(folder_name);
             let relative = dir.strip_prefix(clone).unwrap_or(Path::new("")).to_path_buf();
-            if valid_name(&name) {
+            let folder_name = if relative.as_os_str().is_empty() {
+                root_name.map(String::from)
+            } else {
+                dir.file_name().map(|n| n.to_string_lossy().to_string())
+            };
+            if let Some(name) = declared_name(&skill_md).or(folder_name).filter(|name| valid_name(name)) {
                 found.push((name, relative));
             }
             continue;
@@ -169,7 +181,8 @@ impl From<String> for StageError {
 fn stage(root: &Path, repo: &str, branch: Option<&str>, skill: Option<&str>, path: Option<&str>) -> Result<Staged, StageError> {
     let work = root.join(UPDATES_DIR);
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {}", work.display(), e))?;
-    let clone = work.join(format!("clone-{}", std::process::id()));
+    // A dot name can never be a skill's: the clone cannot collide with a staged one.
+    let clone = work.join(format!(".clone-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&clone);
     let clone_text = clone.to_string_lossy().to_string();
     let mut args = vec!["clone", "--quiet", "--depth", "1"];
@@ -179,7 +192,7 @@ fn stage(root: &Path, repo: &str, branch: Option<&str>, skill: Option<&str>, pat
     args.extend(["--", repo, clone_text.as_str()]);
     let staged = run("git", &args, None).map_err(StageError::from).and_then(|_| {
         let commit = run("git", &["rev-parse", "HEAD"], Some(&clone))?.trim().to_string();
-        let (name, relative) = locate(&clone, skill, path)?;
+        let (name, relative) = locate(&clone, repository_name(repo).as_deref(), skill, path)?;
         let dir = work.join(&name);
         let _ = std::fs::remove_dir_all(&dir);
         let links = copy_skill(&clone.join(&relative), &dir)?;
@@ -199,12 +212,19 @@ fn stage(root: &Path, repo: &str, branch: Option<&str>, skill: Option<&str>, pat
 }
 
 /// The skill folder to take in a clone, and the name it is stored under.
-fn locate(clone: &Path, skill: Option<&str>, path: Option<&str>) -> Result<(String, PathBuf), StageError> {
+fn locate(clone: &Path, root_name: Option<&str>, skill: Option<&str>, path: Option<&str>) -> Result<(String, PathBuf), StageError> {
     if let Some(path) = path {
         let relative = PathBuf::from(path.trim_matches('/'));
         let stays_inside = relative.components().all(|part| matches!(part, std::path::Component::Normal(_) | std::path::Component::CurDir));
         if !stays_inside {
             return Err(format!("--path {} must stay inside the repository", path).into());
+        }
+        let mut walked = clone.to_path_buf();
+        for part in relative.components() {
+            walked.push(part);
+            if std::fs::symlink_metadata(&walked).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!("--path {} goes through a symbolic link of the repository", path).into());
+            }
         }
         let skill_md = clone.join(&relative).join("SKILL.md");
         if !skill_md.is_file() {
@@ -219,13 +239,13 @@ fn locate(clone: &Path, skill: Option<&str>, path: Option<&str>) -> Result<(Stri
             .ok_or_else(|| "cannot name this skill: pass --skill NAME".to_string())?;
         return Ok((name, relative));
     }
-    let skills = find_skills(clone);
+    let skills = find_skills(clone, root_name);
     let Some(wanted) = skill else {
         let mut names: Vec<String> = skills.iter().map(|(name, _)| name.clone()).collect();
         names.dedup();
         return match names.len() {
-            0 => Err("no SKILL.md found in the repository".to_string().into()),
-            1 => locate(clone, Some(&names[0]), None),
+            0 => Err("no SKILL.md found in the repository (a skill at its root that declares no name needs --path . --skill NAME)".to_string().into()),
+            1 => locate(clone, root_name, Some(&names[0]), None),
             _ => Err(StageError::Choose(names)),
         };
     };
@@ -274,9 +294,12 @@ fn backup(root: &Path, name: &str) -> Result<PathBuf, String> {
 
 /// Replaces `vendor/<name>` by the staged copy. Returns the source applied
 /// and where the previous copy went, when there was one.
-fn apply_staged(root: &Path, name: &str) -> Result<(Source, Option<PathBuf>), String> {
+fn apply_staged(root: &Path, name: &str, expected_repo: Option<&str>) -> Result<(Source, Option<PathBuf>), String> {
     let staged = root.join(UPDATES_DIR).join(name);
     let source = read_source(&staged).ok_or_else(|| format!("nothing staged for {}: run the command without --apply first and read what it shows", name))?;
+    if let Some(expected) = expected_repo.filter(|expected| *expected != source.repo) {
+        return Err(format!("the staged copy of {} comes from {}, not from {}: stage it again from the repository you mean", name, source.repo, expected));
+    }
     if !staged.join("SKILL.md").is_file() {
         return Err(format!("the staged copy of {} has no SKILL.md", name));
     }
@@ -403,7 +426,7 @@ pub fn add_skill(args: &[String]) -> i32 {
             eprintln!("{}: a skill of yours has this name in agents/skills, it would hide the imported one", name);
             return 1;
         }
-        return match apply_staged(&root, &name) {
+        return match apply_staged(&root, &name, Some(&repo)) {
             Ok((source, kept)) => {
                 println!(
                     "{}: commit {} applied{}",
@@ -478,7 +501,7 @@ pub fn update_skills(args: &[String]) -> i32 {
             if !root.join(UPDATES_DIR).join(&name).is_dir() {
                 continue;
             }
-            match apply_staged(&root, &name) {
+            match apply_staged(&root, &name, Some(&source.repo)) {
                 Ok((applied, kept)) => println!(
                     "{}: commit {} applied{}",
                     name,
@@ -597,13 +620,16 @@ mod tests {
         assert_eq!(staged.source.path, "skills/alpha");
         assert!(staged.dir.join("references/guide.md").is_file());
         assert!(!root.join("alpha").exists(), "nothing stored before --apply");
-        assert!(!root.join(UPDATES_DIR).join(format!("clone-{}", std::process::id())).exists(), "the clone is removed");
+        assert!(!root.join(UPDATES_DIR).join(format!(".clone-{}", std::process::id())).exists(), "the clone is removed");
 
-        let (applied, kept) = apply_staged(&root, "alpha").expect("apply");
+        let other_repo = apply_staged(&root, "alpha", Some("https://example.com/other/repo.git")).unwrap_err();
+        assert!(other_repo.contains("comes from"), "{other_repo}");
+        assert!(!root.join("alpha").exists(), "a copy staged from another repository is not installed");
+        let (applied, kept) = apply_staged(&root, "alpha", Some(&url)).expect("apply");
         assert_eq!(applied, staged.source);
         assert!(kept.is_none());
         assert_eq!(read_source(&root.join("alpha")), Some(staged.source.clone()));
-        assert!(apply_staged(&root, "alpha").is_err(), "nothing staged any more");
+        assert!(apply_staged(&root, "alpha", None).is_err(), "nothing staged any more");
 
         // The same skill shipped twice is one skill; two different ones need --path.
         write(&repo.0.join(".claude/skills/alpha/SKILL.md"), "---\nname: alpha\ndescription: First.\n---\nAlpha v1\n");
@@ -630,7 +656,7 @@ mod tests {
         assert_ne!(update.source.commit, staged.source.commit);
         assert!(std::fs::read_to_string(root.join("alpha/SKILL.md")).unwrap().contains("Alpha v1"));
         assert!(report(&root, &update, "apply"), "a change is reported");
-        let (_, kept) = apply_staged(&root, "alpha").expect("apply update");
+        let (_, kept) = apply_staged(&root, "alpha", Some(&url)).expect("apply update");
         let kept = kept.expect("previous copy kept");
         assert!(std::fs::read_to_string(kept.join("SKILL.md")).unwrap().contains("Alpha v1"));
         assert!(std::fs::read_to_string(root.join("alpha/SKILL.md")).unwrap().contains("Alpha v2"));
@@ -639,6 +665,29 @@ mod tests {
         let again = stage(&root, &url, None, Some("alpha"), None).expect("again");
         assert!(!report(&root, &again, "apply"));
         assert!(!root.join(UPDATES_DIR).join("alpha").exists());
+    }
+
+    #[test]
+    fn a_skill_at_the_root_takes_the_repository_name() {
+        assert_eq!(repository_name("https://github.com/owner/my-skill.git").as_deref(), Some("my-skill"));
+        assert_eq!(repository_name("git@github.com:owner/my_skill.git").as_deref(), Some("my_skill"));
+        assert_eq!(repository_name("/tmp/some dir/"), None);
+
+        let parent = temp_dir("root-skill");
+        let repo = parent.0.join("solo-skill");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet", "--initial-branch", "main"]);
+        write(&repo.join("SKILL.md"), "---\ndescription: No name declared.\n---\nSolo\n");
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "--quiet", "-m", "init"]);
+        let agents = temp_dir("agents");
+        let root = agents.0.join("vendor");
+
+        let staged = stage(&root, &repo.to_string_lossy(), None, None, None).expect("stage");
+        assert_eq!(staged.name, "solo-skill", "not the clone folder's name");
+        assert_eq!(staged.source.path, ".");
+        assert!(staged.dir.join("SKILL.md").is_file(), "the staged copy is not the removed clone");
+        assert!(!staged.dir.join(".git").exists());
     }
 
     #[test]
@@ -655,6 +704,16 @@ mod tests {
 
         #[cfg(unix)]
         {
+            // A folder of the repository that is a link to somewhere else on the machine.
+            let outside = temp_dir("outside");
+            write(&outside.0.join("SKILL.md"), "---\nname: stolen\n---\nprivate\n");
+            std::os::unix::fs::symlink(&outside.0, repo.0.join("linked")).unwrap();
+            git(&repo.0, &["add", "-A"]);
+            git(&repo.0, &["commit", "--quiet", "-m", "linked folder"]);
+            let through_link = stage(&root, &url, None, Some("stolen"), Some("linked")).unwrap_err();
+            assert!(matches!(&through_link, StageError::Other(message) if message.contains("symbolic link")), "{through_link:?}");
+            assert!(!root.join(UPDATES_DIR).join("stolen").exists());
+
             std::os::unix::fs::symlink("/etc/hosts", repo.0.join("skills/alpha/hosts-link")).unwrap();
             git(&repo.0, &["add", "-A"]);
             git(&repo.0, &["commit", "--quiet", "-m", "link"]);

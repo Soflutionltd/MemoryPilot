@@ -43,15 +43,20 @@ pub fn vault() -> Result<String, String> {
     })
 }
 
-/// The configured command when it is on the PATH, else the standard one.
-fn binary() -> Option<PathBuf> {
-    setting("MEMORYPILOT_OP_CLI", "cli")
-        .and_then(|cli| find_binary(&cli))
-        .or_else(|| find_binary(DEFAULT_CLI))
+/// The configured command, else the standard one. A configured command that
+/// is not on the PATH is an error: falling back to the standard one would
+/// sign in with another account than the one the user chose.
+fn binary() -> Result<PathBuf, String> {
+    match setting("MEMORYPILOT_OP_CLI", "cli") {
+        Some(cli) => find_binary(&cli).ok_or_else(|| {
+            format!("1Password command '{}' (MEMORYPILOT_OP_CLI or \"cli\" of onepassword.json) is not on the PATH", cli)
+        }),
+        None => find_binary(DEFAULT_CLI).ok_or_else(|| "1Password CLI not found on the PATH".to_string()),
+    }
 }
 
 fn op(args: &[&str], stdin: Option<&str>, timeout: Duration) -> Result<String, String> {
-    let binary = binary().ok_or("1Password CLI not found (the standard one, or the \"cli\" of onepassword.json)")?;
+    let binary = binary()?;
     let mut command = Command::new(binary);
     command.args(args);
     run_with_timeout(command, stdin, timeout)
