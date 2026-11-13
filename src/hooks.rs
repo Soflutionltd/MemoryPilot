@@ -43,7 +43,7 @@ const MAX_PROMPT_MEMORIES: usize = 3;
 /// A hit is injected when it scores at least this share of the top hit.
 /// Only the cross-encoder rerank (the default search mode) spreads the
 /// scores enough for this to select: without it the fused ranks are flat
-/// (0.04, 0.03, 0.03) and the first hits in scope would all pass.
+/// (0.04, 0.03, 0.03), so only the top hit is a candidate then.
 const PROMPT_RELATIVE_SCORE: f64 = 0.6;
 /// Shorter prompts ("ok", "vas-y") carry no topic to search for.
 const PROMPT_MIN_WORDS: usize = 4;
@@ -71,6 +71,8 @@ const SESSION_MARK_TTL_SECS: u64 = 24 * 3600;
 /// Stop and SessionEnd can fire together: ingests of one transcript queue up.
 const INGEST_LOCK_WAIT_SECS: u64 = 120;
 const INGEST_LOCK_STALE_SECS: u64 = 600;
+/// A pid lock file found empty is being written by its owner for this long.
+const LOCK_PID_GRACE_SECS: u64 = 5;
 
 fn open_db() -> Result<Database, String> {
     match std::env::var("MEMORYPILOT_DB") {
@@ -414,7 +416,11 @@ fn prompt_context(payload: &Value) -> Option<String> {
     };
     let seen_path = conversation_id(payload).map(|session| prompt_seen_path(&session));
     let mut seen = seen_path.as_deref().map(load_seen).unwrap_or_default();
-    let picked = if confidence.abstain { Vec::new() } else { pick_prompt_memories(&results, project.as_deref(), &seen) };
+    // The ranker skips the cross-encoder when its top hit is already sure:
+    // the scores are then flat fused ranks, which vouch for that hit only.
+    let reranked = confidence.cross_score.is_some();
+    let candidates = if reranked { &results[..] } else { &results[..results.len().min(1)] };
+    let picked = if confidence.abstain { Vec::new() } else { pick_prompt_memories(candidates, project.as_deref(), &seen) };
     // One line per searched prompt, without its text: what the gate decided.
     log(&format!(
         "user-prompt: project={} confidence={} cosine={:.2} margin={:.2} hits={} injected={}",
@@ -500,13 +506,32 @@ impl IngestLock {
         hook_path(memorypilot_core::layout::Area::State, &format!("ingest-{}.lock", name))
     }
 
-    /// The lock, or `None` at once when a live run holds it.
+    /// The lock, or `None` at once when a live run holds it. The file holds
+    /// the owner's pid: a run that exited or was killed without dropping the
+    /// lock is replaced at once, a long one is never taken for stale.
     fn try_acquire(key: &str) -> Option<IngestLock> {
-        let path = Self::path(key);
-        if age_secs(&path).is_some_and(|age| age > INGEST_LOCK_STALE_SECS) {
+        Self::try_acquire_at(Self::path(key))
+    }
+
+    fn try_acquire_at(path: PathBuf) -> Option<IngestLock> {
+        use std::io::Write;
+        for _ in 0..2 {
+            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                let _ = write!(file, "{}", std::process::id());
+                return Some(IngestLock(path));
+            }
+            let owner = std::fs::read_to_string(&path).ok().and_then(|raw| raw.trim().parse::<u32>().ok());
+            let held = match owner {
+                Some(pid) => crate::update::process_alive(pid),
+                // Created, pid not written yet: the owner is starting.
+                None => age_secs(&path).is_some_and(|age| age < LOCK_PID_GRACE_SECS),
+            };
+            if held {
+                return None;
+            }
             let _ = std::fs::remove_file(&path);
         }
-        std::fs::OpenOptions::new().write(true).create_new(true).open(&path).ok().map(|_| IngestLock(path))
+        None
     }
 
     fn acquire(transcript: &str) -> Option<IngestLock> {
@@ -530,7 +555,11 @@ impl IngestLock {
 
 impl Drop for IngestLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // A pid lock taken over by another run is no longer ours to remove.
+        let owner = std::fs::read_to_string(&self.0).ok().and_then(|raw| raw.trim().parse::<u32>().ok());
+        if owner.is_none_or(|pid| pid == std::process::id()) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 }
 
@@ -1010,6 +1039,28 @@ mod tests {
             score,
             sources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn index_lock_is_held_by_a_live_owner_only() {
+        let path = std::env::temp_dir().join(format!("mp-index-lock-{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let lock = IngestLock::try_acquire_at(path.clone()).expect("free lock");
+        assert_eq!(std::fs::read_to_string(&path).expect("pid"), std::process::id().to_string());
+        assert!(IngestLock::try_acquire_at(path.clone()).is_none(), "held by this live process");
+        drop(lock);
+        assert!(!path.exists(), "released on drop");
+
+        // An owner that exited without dropping the lock (process::exit, kill).
+        std::fs::write(&path, u32::MAX.to_string()).expect("dead owner");
+        let lock = IngestLock::try_acquire_at(path.clone()).expect("a dead owner's lock is replaced at once");
+
+        // Taken over by another run meanwhile: not ours to remove any more.
+        std::fs::write(&path, "1").expect("other owner");
+        drop(lock);
+        assert!(path.exists(), "another owner's lock is left alone");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

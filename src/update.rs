@@ -815,7 +815,7 @@ fn remove_boot_markers(dir: &Path, version: &str) {
 }
 
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     let Some(pid) = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw) else {
         return false;
     };
@@ -826,7 +826,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
+pub(crate) fn process_alive(_pid: u32) -> bool {
     true
 }
 
