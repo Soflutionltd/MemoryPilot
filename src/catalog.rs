@@ -170,7 +170,10 @@ impl Ctx<'_> {
                     "claude_app": app,
                 });
                 let extra = if origin == "vendor" {
-                    json!({ "source": "import manuel (voir vendor/README.md)" })
+                    match crate::vendor_skills::read_source(&dir) {
+                        Some(source) => json!({ "source": source.repo, "version": source.commit.chars().take(7).collect::<String>() }),
+                        None => json!({ "source": "import manuel (voir vendor/README.md)" }),
+                    }
                 } else {
                     json!({})
                 };

@@ -89,7 +89,7 @@ pub fn read_source(dir: &Path) -> Option<Source> {
 }
 
 /// Files under `dir`, relative and sorted, skipping `skip` (top-level names).
-fn files(dir: &Path, skip: &[&str]) -> Vec<PathBuf> {
+pub(crate) fn files(dir: &Path, skip: &[&str]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -204,7 +204,7 @@ pub fn plugin_installed(claude_dir: &Path, name: &str) -> bool {
 
 // ─── Vendor updates ──────────────────────────────────────────────────────
 
-fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
+pub(crate) fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
     let mut command = std::process::Command::new(cmd);
     command.args(args).stdin(std::process::Stdio::null());
     if let Some(cwd) = cwd {
@@ -258,7 +258,7 @@ fn stage(root: &Path, folder: &str, source: &Source) -> Result<(PathBuf, Source)
 
 /// Unified diff between the stored and the staged plugin (`git diff --no-index`
 /// exits 1 when they differ, which is not an error here).
-fn diff(old: &Path, new: &Path, stat: bool) -> Result<String, String> {
+pub(crate) fn diff(old: &Path, new: &Path, stat: bool) -> Result<String, String> {
     let mut args = vec!["diff", "--no-index", "--no-color"];
     if stat {
         args.push("--stat=120");

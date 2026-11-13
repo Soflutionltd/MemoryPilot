@@ -574,6 +574,19 @@ MemoryPilot --uninstall-agents [--tools codex]  # unwire, your files stay
 - Vendor plugins carry `plugin.source.json` (`repo`, `commit`, optional `branch`, `claude` and `cursor` folders in the repository). `MemoryPilot --update-plugins [name]` fetches the upstream head and prints the diff (full diff in `plugins/.updates/<name>.diff`); nothing changes until `--update-plugins <name> --apply`, which keeps the previous copy in `plugins/.backups/` (3 per plugin).
 - Over MCP, `list_agent_skills` returns every skill (name, description, origin: `perso`, `vendor` or `plugin:<name>`) and `get_agent_skill(name, file?)` returns its `SKILL.md` and the list of its other files, or one of them such as `references/guide.md` (never a path outside the skill folder). The server `instructions` carry the skill names, so a client that does not read the folder (Claude app, remote access) still knows they exist. Plugin skills (`agents/plugins/<plugin>/skills/<name>/SKILL.md`) are named `<plugin>:<name>`.
 
+#### Third-party skills, reviewed before they are installed
+
+```bash
+MemoryPilot --add-skill vercel-labs/skills@find-skills          # fetch for review, install nothing
+MemoryPilot --add-skill vercel-labs/skills@find-skills --apply  # install the copy you just reviewed
+MemoryPilot --update-skills                                     # what changed upstream, for every imported skill
+MemoryPilot --update-skills find-skills --apply                 # install a reviewed update
+```
+
+`--add-skill` takes `owner/repo` (GitHub), `owner/repo@skill`, or any Git URL, with `--skill NAME`, `--path DIR` and `--branch B` when the repository needs them. A repository holding several skills lists them. The first run only stages the skill in `~/.MemoryPilot/agents/vendor/.updates/<name>/` and prints its files (anything that is not plain text is flagged), or the diff with the copy you already have. Nothing a skill ships is run, and symbolic links are left out. `--apply` then moves that exact copy to `agents/vendor/<name>/`, keeps the previous one in `agents/vendor/.backups/` (3 kept), and syncs every wired tool, so the skill reaches Claude Code, Cursor and the others the same way your own skills do.
+
+`skill.source.json` next to `SKILL.md` records the repository, the commit and the folder; `--update-skills` follows it. A skill copied by hand has no such file: `--add-skill owner/repo@name` adopts it, showing the diff with upstream first. A skill of yours with the same name in `agents/skills/` always wins, and `--apply` refuses to add a vendor skill it would hide.
+
 ## Knowledge Graph
 
 | Tool | Description |

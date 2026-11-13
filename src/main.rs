@@ -14,6 +14,7 @@ mod plugins;
 mod protocol;
 mod tools;
 mod update;
+mod vendor_skills;
 mod watcher;
 
 use memorypilot_core::{
@@ -92,6 +93,12 @@ fn main() {
     }
     if args.iter().any(|a| a == "--update-plugins") {
         std::process::exit(plugins::update_plugins(&args));
+    }
+    if args.iter().any(|a| a == "--add-skill") {
+        std::process::exit(vendor_skills::add_skill(&args));
+    }
+    if args.iter().any(|a| a == "--update-skills") {
+        std::process::exit(vendor_skills::update_skills(&args));
     }
     if args.iter().any(|a| a == "--index-conversations") {
         conversations_cli::run_index(&args);
@@ -1218,6 +1225,8 @@ fn print_help() {
     println!("  MemoryPilot --uninstall-agents [--tools ...]  Unwire what --setup-agents added; your rules and skills stay");
     println!("  MemoryPilot --migrate-layout [--apply]  Sort ~/.MemoryPilot into data/, state/, config/, logs/, backups/, archive/ (links left at the old paths; refuses while a database is open)");
     println!("  MemoryPilot --update-plugins [NAME] [--apply]  Show the upstream diff of vendor plugins (agents/plugins/*/plugin.source.json); --apply installs the reviewed copy, previous one kept in plugins/.backups");
+    println!("  MemoryPilot --add-skill <owner/repo[@skill]> [--apply]  Fetch a third-party skill into agents/vendor for review (nothing installed); --apply installs the copy just reviewed, for every wired tool");
+    println!("  MemoryPilot --update-skills [NAME] [--apply]  Show the upstream diff of vendor skills (agents/vendor/*/skill.source.json); --apply installs the reviewed copies, previous ones kept");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");
