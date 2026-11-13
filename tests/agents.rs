@@ -155,7 +155,7 @@ fn reruns_create_no_duplicates() {
     home.add_skill("alpha");
     for _ in 0..2 {
         home.run(&["--setup-agents"]);
-        home.run(&["--install-hooks"]);
+        home.run(&["--install-hooks", "--with-ingest"]);
     }
     let rules = home.rules().display().to_string();
     let import = format!("@{}", rules);
@@ -180,7 +180,7 @@ fn reruns_create_no_duplicates() {
     paths.dedup();
     assert_eq!(paths.len(), total, "duplicate manifest entries");
 
-    // Hooks: one MemoryPilot command per event, SessionEnd included.
+    // Hooks with --with-ingest: one MemoryPilot command per event, SessionEnd included.
     let ours = |cmd: &str| cmd.contains("MemoryPilot") && cmd.contains("--hook");
     for file in [".claude/settings.json", ".codex/hooks.json"] {
         let config: Value = serde_json::from_str(&home.read(file)).unwrap();
@@ -206,6 +206,36 @@ fn reruns_create_no_duplicates() {
             .count();
         assert_eq!(count, 1, "cursor {}", event);
     }
+
+    // The default install takes the distilling hooks back out and indexes
+    // the conversation at session end instead.
+    home.run(&["--install-hooks"]);
+    let commands = |file: &str, event: &str| -> Vec<String> {
+        let config: Value = serde_json::from_str(&home.read(file)).unwrap();
+        let entries = config["hooks"][event].as_array().cloned().unwrap_or_default();
+        entries
+            .iter()
+            .flat_map(|entry| match entry["hooks"].as_array() {
+                Some(inner) => inner.clone(),
+                None => vec![entry.clone()],
+            })
+            .filter_map(|h| h["command"].as_str().map(String::from))
+            .filter(|cmd| ours(cmd))
+            .collect()
+    };
+    let hook = |cmd: &str| cmd.split("--hook ").nth(1).unwrap_or_default().to_string();
+    let hooks_of = |file: &str, event: &str| commands(file, event).iter().map(|cmd| hook(cmd)).collect::<Vec<_>>();
+    assert_eq!(hooks_of(".claude/settings.json", "SessionStart"), ["session-start --agent claude"]);
+    assert_eq!(hooks_of(".claude/settings.json", "UserPromptSubmit"), ["user-prompt --agent claude"]);
+    assert_eq!(hooks_of(".claude/settings.json", "SessionEnd"), ["session-index --agent claude"]);
+    assert!(hooks_of(".claude/settings.json", "Stop").is_empty());
+    assert_eq!(hooks_of(".codex/hooks.json", "SessionStart"), ["session-start --agent codex"]);
+    for event in ["UserPromptSubmit", "Stop", "SessionEnd"] {
+        assert!(hooks_of(".codex/hooks.json", event).is_empty(), "codex {}", event);
+    }
+    assert_eq!(hooks_of(".cursor/hooks.json", "sessionStart"), ["session-start --agent cursor"]);
+    assert_eq!(hooks_of(".cursor/hooks.json", "sessionEnd"), ["session-index --agent cursor"]);
+    assert!(hooks_of(".cursor/hooks.json", "stop").is_empty());
 }
 
 #[test]

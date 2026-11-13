@@ -66,11 +66,15 @@ fn main() {
         hooks::run_ingest(&args);
         return;
     }
+    if args.iter().any(|a| a == "--hook-index") {
+        hooks::run_index();
+        return;
+    }
     if args
         .iter()
         .any(|a| a == "--install-hooks" || a == "--install-cursor-hooks")
     {
-        hooks::install_hooks();
+        hooks::install_hooks(&args);
         return;
     }
     if args.iter().any(|a| a == "--setup-agents") {
@@ -1206,7 +1210,8 @@ fn print_help() {
     println!("  MemoryPilot --redact-conversations [--apply]  Mask secrets already in the conversation index (counts only without --apply)");
     println!("  MemoryPilot --add-known-secret  Read one secret value on stdin, keep only its SHA-256 print so it is masked everywhere");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
-    println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, stop/session-end auto-ingest");
+    println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, per-prompt recall (Claude Code), conversation index at session end");
+    println!("  MemoryPilot --install-hooks --with-ingest  Also distill each turn into memories (stop/session-end auto-ingest)");
     println!("  MemoryPilot --hook session-start|stop|session-end  (called by the agents, JSON on stdin)");
     println!("  MemoryPilot --setup-agents [--tools claude,cursor,...] [--dry-run]  Create ~/.MemoryPilot/agents (your rules and skills) and wire it into your tools");
     println!("  MemoryPilot --sync-agents    Wire new skills, regenerate rule copies (no write when nothing changed, never fails)");

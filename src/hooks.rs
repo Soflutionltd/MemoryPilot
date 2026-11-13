@@ -4,20 +4,30 @@
 //! answers `{"additional_context": "<compact recall>"}` so every new Cursor
 //! conversation starts with the project's memories already loaded.
 //!
+//! `MemoryPilot --hook user-prompt` (Claude Code `UserPromptSubmit`) :
+//! searches the store with the prompt the user just sent and injects the few
+//! memories that answer it, in full, unless the ranker abstains. A memory
+//! is injected once per session.
+//!
+//! `MemoryPilot --hook session-index` : the session is over; brings the
+//! conversation index up to date in a detached `--hook-index` child, so
+//! `find_conversation` sees it. Nothing is distilled into memories.
+//!
 //! `MemoryPilot --hook stop` : answers `{}` immediately, then hands the
 //! transcript to a detached `MemoryPilot --hook-ingest` child that distills
 //! only the lines added since the previous turn (anti-pollution, see
-//! `ingest_session_transcript`).
+//! `ingest_session_transcript`). Opt-in: `--install-hooks --with-ingest`.
 //!
 //! `MemoryPilot --hook session-end` : the session is over; ingests the lines
-//! the last `stop` did not cover (same incremental ingest).
+//! the last `stop` did not cover (same incremental ingest), then indexes.
 //!
-//! `MemoryPilot --install-hooks` : merges the entries into Cursor, Claude Code
-//! and Codex settings, keeping any hook the user already has.
+//! `MemoryPilot --install-hooks [--with-ingest]` : merges the entries into
+//! Cursor, Claude Code and Codex settings, keeping any hook the user already
+//! has. Without `--with-ingest` the distilling hooks are removed.
 //!
 //! Hooks must never break Cursor: every failure path prints `{}` and exits 0.
 
-use crate::db::{Database, MemoryScope, RecallMode};
+use crate::db::{Database, MemoryScope, RecallMode, SearchResult};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::collections::HashMap;
@@ -26,6 +36,22 @@ use std::path::{Path, PathBuf};
 
 /// Hard cap on the context injected at session start (~2k tokens).
 const MAX_CONTEXT_CHARS: usize = 8000;
+/// Hard cap on the memories injected for one prompt (~1k tokens).
+const MAX_PROMPT_CONTEXT_CHARS: usize = 4000;
+const MAX_PROMPT_MEMORY_CHARS: usize = 1200;
+const MAX_PROMPT_MEMORIES: usize = 3;
+/// A hit is injected when it scores at least this share of the top hit.
+/// Only the cross-encoder rerank (the default search mode) spreads the
+/// scores enough for this to select: without it the fused ranks are flat
+/// (0.04, 0.03, 0.03) and the first hits in scope would all pass.
+const PROMPT_RELATIVE_SCORE: f64 = 0.6;
+/// Shorter prompts ("ok", "vas-y") carry no topic to search for.
+const PROMPT_MIN_WORDS: usize = 4;
+const PROMPT_QUERY_CHARS: usize = 600;
+const PROMPT_SEARCH_LIMIT: usize = 12;
+/// One file per session: ids of the memories already injected in it.
+const PROMPT_SEEN_DIR: &str = "prompt-injections";
+const INDEX_LOCK_KEY: &str = "index-conversations";
 /// Hard cap on the text sent to the distiller per turn.
 const MAX_INGEST_BYTES: usize = 400_000;
 const STATE_FILE: &str = "cursor-hooks-state.json";
@@ -168,8 +194,29 @@ pub fn run_hook(event: &str, args: &[String]) {
                 None => json!({}),
             }
         }
-        "stop" | "Stop" | "session-end" | "sessionEnd" | "SessionEnd" => {
+        "user-prompt" | "userPromptSubmit" | "UserPromptSubmit" => {
+            // Cursor has no per-prompt context injection.
+            match (agent != "cursor").then(|| prompt_context(&payload)).flatten() {
+                Some(context) => json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": context
+                    }
+                }),
+                None => json!({}),
+            }
+        }
+        "stop" | "Stop" => {
             spawn_ingest(&payload);
+            json!({})
+        }
+        "session-end" | "sessionEnd" | "SessionEnd" => {
+            spawn_ingest(&payload);
+            spawn_detached(&["--hook-index"], "session-end: index");
+            json!({})
+        }
+        "session-index" => {
+            spawn_detached(&["--hook-index"], "session-index");
             json!({})
         }
         other => {
@@ -284,6 +331,129 @@ fn session_start_context(payload: &Value) -> Option<String> {
     }
 }
 
+/// The search query for a prompt, or `None` when it carries no topic:
+/// a slash command, or fewer than `PROMPT_MIN_WORDS` words.
+fn prompt_query(prompt: &str) -> Option<String> {
+    let prompt = prompt.trim();
+    if prompt.starts_with('/') || prompt.split_whitespace().count() < PROMPT_MIN_WORDS {
+        return None;
+    }
+    Some(prompt.chars().take(PROMPT_QUERY_CHARS).collect())
+}
+
+/// The hits worth injecting, best first: of the opened project or global,
+/// not yet injected in this session, close enough to the top hit. Sealed
+/// credentials and raw transcripts never go in.
+fn pick_prompt_memories<'a>(results: &'a [SearchResult], project: Option<&str>, seen: &[String]) -> Vec<&'a SearchResult> {
+    let Some(top_score) = results.first().map(|hit| hit.score) else {
+        return Vec::new();
+    };
+    let in_scope = |hit: &SearchResult| match (hit.memory.project.as_deref(), project) {
+        (None, _) => true,
+        (Some(of_memory), Some(opened)) => of_memory.eq_ignore_ascii_case(opened),
+        (Some(_), None) => false,
+    };
+    results
+        .iter()
+        .filter(|hit| hit.score >= top_score * PROMPT_RELATIVE_SCORE)
+        .filter(|hit| in_scope(hit))
+        .filter(|hit| !matches!(hit.memory.kind.as_str(), "credential" | "transcript"))
+        .filter(|hit| !seen.contains(&hit.memory.id))
+        .take(MAX_PROMPT_MEMORIES)
+        .collect()
+}
+
+fn render_prompt_memories(picked: &[&SearchResult]) -> String {
+    let mut text = String::from("MemoryPilot : mémoires liées à ce message (texte entier, get_memory(id) pour les métadonnées) :");
+    for hit in picked {
+        let memory = &hit.memory;
+        text.push_str(&format!(
+            "\n\n[{} · {} · {} · id:{}]\n{}",
+            memory.kind,
+            memory.project.as_deref().unwrap_or("global"),
+            memory.updated_at.chars().take(10).collect::<String>(),
+            memory.id.chars().take(8).collect::<String>(),
+            truncate_chars(memory.content.trim(), MAX_PROMPT_MEMORY_CHARS),
+        ));
+    }
+    truncate_chars(&text, MAX_PROMPT_CONTEXT_CHARS)
+}
+
+/// Where the ids injected in `session` are kept.
+fn prompt_seen_path(session: &str) -> PathBuf {
+    let digest = sha2::Sha256::digest(session.as_bytes());
+    let name: String = digest.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+    hook_path(memorypilot_core::layout::Area::State, PROMPT_SEEN_DIR).join(format!("{}.json", name))
+}
+
+fn load_seen(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Memories that answer the prompt the user just sent, or `None`: no topic
+/// in the prompt, nothing the ranker trusts, or all of it already injected.
+fn prompt_context(payload: &Value) -> Option<String> {
+    let query = prompt_query(&str_field(payload, "prompt")?)?;
+    let db = match open_db() {
+        Ok(db) => db,
+        Err(error) => {
+            log(&format!("user-prompt: db open failed: {}", error));
+            return None;
+        }
+    };
+    let project = first_workspace_root(payload).and_then(|dir| db.detect_project(&dir).ok().flatten());
+    let (results, confidence) = match db.search_at(chrono::Utc::now(), &query, PROMPT_SEARCH_LIMIT, None, None, None, None) {
+        Ok(found) => found,
+        Err(error) => {
+            log(&format!("user-prompt: search failed: {}", error));
+            return None;
+        }
+    };
+    let seen_path = conversation_id(payload).map(|session| prompt_seen_path(&session));
+    let mut seen = seen_path.as_deref().map(load_seen).unwrap_or_default();
+    let picked = if confidence.abstain { Vec::new() } else { pick_prompt_memories(&results, project.as_deref(), &seen) };
+    // One line per searched prompt, without its text: what the gate decided.
+    log(&format!(
+        "user-prompt: project={} confidence={} cosine={:.2} margin={:.2} hits={} injected={}",
+        project.as_deref().unwrap_or("-"),
+        confidence.level,
+        confidence.top_cosine,
+        confidence.margin,
+        results.len(),
+        picked.len()
+    ));
+    if picked.is_empty() {
+        return None;
+    }
+    if let Some(path) = seen_path {
+        seen.extend(picked.iter().map(|hit| hit.memory.id.clone()));
+        if let Some(dir) = path.parent() {
+            if std::fs::create_dir_all(dir).is_ok() {
+                sweep_old_marks(dir);
+            }
+        }
+        if let Err(error) = std::fs::write(&path, serde_json::to_string(&seen).unwrap_or_default()) {
+            log(&format!("user-prompt: cannot record injected ids: {}", error));
+        }
+    }
+    Some(render_prompt_memories(&picked))
+}
+
+/// Entry point for `--hook-index`: full catch-up of the conversation index,
+/// one run at a time (a run already in progress covers this session too, or
+/// the next session end does).
+pub fn run_index() {
+    let Some(_lock) = IngestLock::try_acquire(INDEX_LOCK_KEY) else {
+        log("index: another run in progress, skipped");
+        return;
+    };
+    memorypilot_core::secrets::ensure_known_secrets();
+    crate::conversations_cli::run_index(&[]);
+}
+
 /// Notes that `workspace` just got the recall. Best effort: a lost trace
 /// only means McpHub recalls once more.
 fn record_injection(workspace: &str) {
@@ -324,10 +494,23 @@ fn spawn_ingest(payload: &Value) {
 struct IngestLock(PathBuf);
 
 impl IngestLock {
-    fn acquire(transcript: &str) -> Option<IngestLock> {
-        let digest = sha2::Sha256::digest(transcript.as_bytes());
+    fn path(key: &str) -> PathBuf {
+        let digest = sha2::Sha256::digest(key.as_bytes());
         let name: String = digest.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-        let path = hook_path(memorypilot_core::layout::Area::State, &format!("ingest-{}.lock", name));
+        hook_path(memorypilot_core::layout::Area::State, &format!("ingest-{}.lock", name))
+    }
+
+    /// The lock, or `None` at once when a live run holds it.
+    fn try_acquire(key: &str) -> Option<IngestLock> {
+        let path = Self::path(key);
+        if age_secs(&path).is_some_and(|age| age > INGEST_LOCK_STALE_SECS) {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path).ok().map(|_| IngestLock(path))
+    }
+
+    fn acquire(transcript: &str) -> Option<IngestLock> {
+        let path = Self::path(transcript);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(INGEST_LOCK_WAIT_SECS);
         loop {
             if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
@@ -662,29 +845,56 @@ fn ensure_object<'a>(value: &'a mut Value, key: &str) -> &'a mut serde_json::Map
     value[key].as_object_mut().expect("object")
 }
 
+/// The hooks one agent gets: `(event, --hook argument, matcher, timeout)`.
+/// Every event MemoryPilot ever installed is listed, with `None` for the
+/// ones this agent does not get, so a reinstall also removes them.
+/// The distilling hooks (`stop`, `session-end`) come only with `with_ingest`.
+/// The conversation index reads Cursor and Claude Code sessions, not Codex.
+fn wanted_hooks(agent: &str, with_ingest: bool) -> Vec<(&'static str, Option<&'static str>, &'static str, u64)> {
+    let indexed = agent != "codex";
+    let session_end = match (with_ingest, indexed) {
+        (true, _) => Some("session-end"),
+        (false, true) => Some("session-index"),
+        (false, false) => None,
+    };
+    let stop = with_ingest.then_some("stop");
+    if agent == "cursor" {
+        return vec![
+            ("sessionStart", Some("session-start"), "", 20),
+            ("stop", stop, "", 10),
+            ("sessionEnd", session_end, "", 10),
+        ];
+    }
+    vec![
+        ("SessionStart", Some("session-start"), "startup|resume|clear|compact", 20),
+        ("UserPromptSubmit", (agent == "claude").then_some("user-prompt"), "", 10),
+        ("Stop", stop, "*", 10),
+        ("SessionEnd", session_end, "*", 10),
+    ]
+}
+
 /// Cursor format: `hooks.<event> = [{command, timeout}]`.
-fn install_cursor(exe: &str, home: &Path) -> Result<PathBuf, String> {
+fn install_cursor(exe: &str, home: &Path, with_ingest: bool) -> Result<PathBuf, String> {
     let path = home.join(".cursor").join("hooks.json");
     let mut config = read_json_or(&path, json!({ "version": 1, "hooks": {} }));
     if config.get("version").is_none() {
         config["version"] = json!(1);
     }
     let hooks = ensure_object(&mut config, "hooks");
-    for (event, arg, timeout) in [
-        ("sessionStart", "session-start", 20),
-        ("stop", "stop", 10),
-        ("sessionEnd", "session-end", 10),
-    ] {
-        let list = hooks.entry(event).or_insert_with(|| json!([]));
-        if !list.is_array() {
-            *list = json!([]);
+    for (event, arg, _, timeout) in wanted_hooks("cursor", with_ingest) {
+        let mut entries: Vec<Value> = hooks.get(event).and_then(|list| list.as_array()).cloned().unwrap_or_default();
+        entries.retain(|h| !is_memorypilot_command(h.get("command").and_then(|c| c.as_str())));
+        if let Some(arg) = arg {
+            entries.push(json!({
+                "command": format!("\"{}\" --hook {} --agent cursor", exe, arg),
+                "timeout": timeout
+            }));
         }
-        let arr = list.as_array_mut().expect("array");
-        arr.retain(|h| !is_memorypilot_command(h.get("command").and_then(|c| c.as_str())));
-        arr.push(json!({
-            "command": format!("\"{}\" --hook {} --agent cursor", exe, arg),
-            "timeout": timeout
-        }));
+        if entries.is_empty() {
+            hooks.remove(event);
+        } else {
+            hooks.insert(event.into(), Value::Array(entries));
+        }
     }
     write_json_with_backup(&path, &config)?;
     Ok(path)
@@ -692,22 +902,14 @@ fn install_cursor(exe: &str, home: &Path) -> Result<PathBuf, String> {
 
 /// Claude Code and Codex format: `hooks.<Event> = [{matcher, hooks:[{type,
 /// command, timeout}]}]`. Other settings and hooks are preserved.
-fn install_matcher_style(exe: &str, path: &Path, agent: &str) -> Result<PathBuf, String> {
+fn install_matcher_style(exe: &str, path: &Path, agent: &str, with_ingest: bool) -> Result<PathBuf, String> {
     let mut config = read_json_or(path, json!({}));
     if !config.is_object() {
         config = json!({});
     }
     let hooks = ensure_object(&mut config, "hooks");
-    for (event, arg, matcher, timeout) in [
-        ("SessionStart", "session-start", "startup|resume|clear|compact", 20),
-        ("Stop", "stop", "*", 10),
-        ("SessionEnd", "session-end", "*", 10),
-    ] {
-        let list = hooks.entry(event).or_insert_with(|| json!([]));
-        if !list.is_array() {
-            *list = json!([]);
-        }
-        let groups = list.as_array_mut().expect("array");
+    for (event, arg, matcher, timeout) in wanted_hooks(agent, with_ingest) {
+        let mut groups: Vec<Value> = hooks.get(event).and_then(|list| list.as_array()).cloned().unwrap_or_default();
         // Drop our previous entries, then groups left empty.
         for group in groups.iter_mut() {
             if let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
@@ -720,22 +922,35 @@ fn install_matcher_style(exe: &str, path: &Path, agent: &str) -> Result<PathBuf,
                 .map(|h| !h.is_empty())
                 .unwrap_or(true)
         });
-        groups.push(json!({
-            "matcher": matcher,
-            "hooks": [{
-                "type": "command",
-                "command": format!("\"{}\" --hook {} --agent {}", exe, arg, agent),
-                "timeout": timeout
-            }]
-        }));
+        if let Some(arg) = arg {
+            let mut group = json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("\"{}\" --hook {} --agent {}", exe, arg, agent),
+                    "timeout": timeout
+                }]
+            });
+            // UserPromptSubmit takes no matcher.
+            if !matcher.is_empty() {
+                group["matcher"] = json!(matcher);
+            }
+            groups.push(group);
+        }
+        if groups.is_empty() {
+            hooks.remove(event);
+        } else {
+            hooks.insert(event.into(), Value::Array(groups));
+        }
     }
     write_json_with_backup(path, &config)?;
     Ok(path.to_path_buf())
 }
 
-/// Entry point for `--install-hooks` (alias `--install-cursor-hooks`):
-/// Cursor always, Claude Code and Codex when their config folder exists.
-pub fn install_hooks() {
+/// Entry point for `--install-hooks [--with-ingest]` (alias
+/// `--install-cursor-hooks`): Cursor always, Claude Code and Codex when their
+/// config folder exists.
+pub fn install_hooks(args: &[String]) {
+    let with_ingest = args.iter().any(|a| a == "--with-ingest");
     let exe = match std::env::current_exe().and_then(|p| p.canonicalize()) {
         Ok(exe) => exe.to_string_lossy().to_string(),
         Err(error) => {
@@ -747,14 +962,14 @@ pub fn install_hooks() {
         eprintln!("Cannot find home directory");
         std::process::exit(1);
     };
-    let mut results = vec![("Cursor", install_cursor(&exe, &home))];
+    let mut results = vec![("Cursor", install_cursor(&exe, &home, with_ingest))];
     if home.join(".claude").is_dir() {
         let path = home.join(".claude").join("settings.json");
-        results.push(("Claude Code", install_matcher_style(&exe, &path, "claude")));
+        results.push(("Claude Code", install_matcher_style(&exe, &path, "claude", with_ingest)));
     }
     if home.join(".codex").is_dir() {
         let path = home.join(".codex").join("hooks.json");
-        results.push(("Codex", install_matcher_style(&exe, &path, "codex")));
+        results.push(("Codex", install_matcher_style(&exe, &path, "codex", with_ingest)));
     }
     let mut failed = false;
     for (agent, result) in results {
@@ -774,6 +989,104 @@ pub fn install_hooks() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hit(id: &str, kind: &str, project: Option<&str>, score: f64) -> SearchResult {
+        SearchResult {
+            memory: crate::db::Memory {
+                id: id.into(),
+                content: format!("contenu de {id}"),
+                kind: kind.into(),
+                project: project.map(String::from),
+                tags: Vec::new(),
+                source: "test".into(),
+                importance: 3,
+                expires_at: None,
+                created_at: "2026-11-01T10:00:00+00:00".into(),
+                updated_at: "2026-11-02T10:00:00+00:00".into(),
+                metadata: None,
+                last_accessed_at: None,
+                access_count: 0,
+            },
+            score,
+            sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prompt_without_a_topic_is_not_searched() {
+        assert_eq!(prompt_query("ok vas-y"), None);
+        assert_eq!(prompt_query("   "), None);
+        assert_eq!(prompt_query("/code-review ultra sur la branche courante"), None);
+        assert_eq!(
+            prompt_query("  comment est déployé le site en production ?  ").as_deref(),
+            Some("comment est déployé le site en production ?")
+        );
+        let long = "mot ".repeat(1000);
+        assert_eq!(prompt_query(&long).expect("query").chars().count(), PROMPT_QUERY_CHARS);
+    }
+
+    #[test]
+    fn prompt_memories_stay_in_scope_and_are_injected_once() {
+        let results = vec![
+            hit("a", "decision", Some("MonApp"), 1.0),
+            hit("b", "fact", Some("autre-projet"), 0.95),
+            hit("c", "credential", Some("monapp"), 0.9),
+            hit("d", "preference", None, 0.8),
+            hit("e", "transcript", None, 0.75),
+            hit("f", "fact", Some("monapp"), 0.7),
+            hit("g", "fact", Some("monapp"), 0.65),
+            hit("h", "fact", Some("monapp"), 0.3),
+        ];
+        let ids = |picked: Vec<&SearchResult>| picked.iter().map(|hit| hit.memory.id.clone()).collect::<Vec<_>>();
+
+        assert_eq!(ids(pick_prompt_memories(&results, Some("monapp"), &[])), ["a", "d", "f"], "project or global, three at most");
+        assert_eq!(ids(pick_prompt_memories(&results, Some("monapp"), &["a".into(), "d".into()])), ["f", "g"], "already injected ones are skipped");
+        assert_eq!(ids(pick_prompt_memories(&results, None, &[])), ["d"], "no project detected: global only");
+        assert!(pick_prompt_memories(&[], Some("monapp"), &[]).is_empty());
+
+        let text = render_prompt_memories(&pick_prompt_memories(&results, Some("monapp"), &[]));
+        assert!(text.contains("[decision · MonApp · 2026-11-02 · id:a]\ncontenu de a"));
+        assert!(text.contains("[preference · global · 2026-11-02 · id:d]"));
+    }
+
+    #[test]
+    fn install_drops_the_distilling_hooks_unless_asked() {
+        let dir = std::env::temp_dir().join(format!("mp-install-hooks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("settings.json");
+        let commands = |path: &Path, event: &str| -> Vec<String> {
+            read_json_or(path, json!({}))["hooks"][event]
+                .as_array()
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+                        .filter_map(|h| h["command"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        std::fs::write(&path, r#"{"hooks":{"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"other-tool --notify"}]}]}}"#).expect("write");
+        install_matcher_style("/bin/MemoryPilot", &path, "claude", true).expect("install with ingest");
+        assert_eq!(commands(&path, "Stop"), ["other-tool --notify", "\"/bin/MemoryPilot\" --hook stop --agent claude"]);
+        assert_eq!(commands(&path, "SessionEnd"), ["\"/bin/MemoryPilot\" --hook session-end --agent claude"]);
+
+        install_matcher_style("/bin/MemoryPilot", &path, "claude", false).expect("install");
+        assert_eq!(commands(&path, "Stop"), ["other-tool --notify"], "ours is removed, the user's stays");
+        assert_eq!(commands(&path, "SessionEnd"), ["\"/bin/MemoryPilot\" --hook session-index --agent claude"]);
+        assert_eq!(commands(&path, "UserPromptSubmit"), ["\"/bin/MemoryPilot\" --hook user-prompt --agent claude"]);
+        assert_eq!(commands(&path, "SessionStart").len(), 1);
+        let config = read_json_or(&path, json!({}));
+        assert!(config["hooks"]["UserPromptSubmit"][0].get("matcher").is_none());
+
+        let codex = dir.join("hooks.json");
+        install_matcher_style("/bin/MemoryPilot", &codex, "codex", false).expect("codex");
+        let config = read_json_or(&codex, json!({}));
+        let events: Vec<&String> = config["hooks"].as_object().expect("hooks").keys().collect();
+        assert_eq!(events, ["SessionStart"], "Codex sessions are not indexed and get no per-prompt recall");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn chunk_ranges_cover_every_line_in_order() {

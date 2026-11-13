@@ -193,7 +193,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
 | MCP tools | 41 tools | 29 tools | **65 tools** | N/A | Limited MCP server |
-| Hooks / event capture | SessionStart auto-recall + Stop auto-ingest for **Cursor, Claude Code and Codex** (incremental, distilled, agent narration filtered, secrets redacted) + file watcher | No | **12 named hooks** (Claude Code, Cursor, Codex, Copilot CLI…) | No | No |
+| Hooks / event capture | SessionStart auto-recall for **Cursor, Claude Code and Codex**, per-prompt recall (Claude Code), conversation index at session end, opt-in Stop auto-ingest (incremental, distilled, agent narration filtered, secrets redacted) + file watcher | No | **12 named hooks** (Claude Code, Cursor, Codex, Copilot CLI…) | No | No |
 | Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |
 | Language | Rust (single binary, zero deps) | Python (pip install) | TypeScript / Node (npm install) | SaaS | Python + Neo4j |
 | Startup | 1-2 ms (`open_at`) / synchronous warm via `open_at_warm` | ~5 ms | Node boot + iii-engine init | N/A (cloud) | Heavy (Neo4j boot) |
@@ -509,21 +509,31 @@ MemoryPilot --backfill-force
 MemoryPilot --install-hooks
 ```
 
-Installs three hooks in every agent found (`./install.sh` runs it for you) (existing settings and hooks are kept, a `.bak` is written):
+Installs the hooks in every agent found (`./install.sh` runs it for you) (existing settings and hooks are kept, a `.bak` is written):
 
-| Agent | File | Session start output |
-|---|---|---|
-| Cursor | `~/.cursor/hooks.json` | `additional_context` |
-| Claude Code | `~/.claude/settings.json` | `hookSpecificOutput.additionalContext` |
-| Codex | `~/.codex/hooks.json` | `hookSpecificOutput.additionalContext` |
+| Agent | File | Hooks | Context output |
+|---|---|---|---|
+| Cursor | `~/.cursor/hooks.json` | session start, session end | `additional_context` |
+| Claude Code | `~/.claude/settings.json` | session start, user prompt, session end | `hookSpecificOutput.additionalContext` |
+| Codex | `~/.codex/hooks.json` | session start | `hookSpecificOutput.additionalContext` |
 
 - **Session start** runs `MemoryPilot --hook session-start --agent <agent>` and injects the compact recall of the opened project.
 - **Session start** also runs `MemoryPilot --sync-agents` in the background (see below). When Cursor runs both its own hook and the Claude Code one, a session is served once.
+- **User prompt** (Claude Code `UserPromptSubmit`) runs `MemoryPilot --hook user-prompt --agent claude`: the prompt the user just sent is searched in the store, and up to 3 memories that answer it are injected in full (4,000 characters at most). Only hits scoring at least 60% of the top hit are kept. Nothing is injected when the ranker abstains (`confidence.abstain`), for a slash command or a prompt of fewer than 4 words, for memories of another project, for credentials and raw transcripts, or for a memory already injected in the session. The search is the default one, cross-encoder rerank included: about 1 to 1.6 s per searched prompt on an M-series Mac (the models load in each hook process), nothing for a prompt that is not searched.
+- **Session end** (`SessionEnd`, Cursor `sessionEnd`) runs `MemoryPilot --hook session-index --agent <agent>`: the conversation index is brought up to date in a detached process, so `find_conversation` sees the session that just ended. Nothing is distilled into memories.
+
+```bash
+MemoryPilot --install-hooks --with-ingest
+```
+
+Opt-in: also distills every turn into memories.
+
 - **Stop** runs `MemoryPilot --hook stop --agent <agent>`, answers `{}` immediately and distills, in a detached process, only the transcript lines added since the previous turn. From user messages only what the user typed is kept (Cursor `<user_query>`, Claude Code meta lines skipped), agent narration ("Checking…", "Let me…", "Je vais…") is filtered out, and obvious secrets (API keys, JWTs, IBANs) are redacted before storage.
+- **Session end** then runs `MemoryPilot --hook session-end --agent <agent>`: the same incremental ingest, for the lines the last stop did not cover, followed by the conversation index.
 
-- **Session end** (`SessionEnd`, Cursor `sessionEnd`) runs `MemoryPilot --hook session-end --agent <agent>`: the same incremental ingest, for the lines the last stop did not cover.
+Running `--install-hooks` without `--with-ingest` removes the distilling hooks a previous install added.
 
-State: `~/.MemoryPilot/state/cursor-hooks-state.json`. Log: `~/.MemoryPilot/logs/cursor-hooks.log`. Set `MEMORYPILOT_DB=/path/copy.db` to test against a copy.
+State: `~/.MemoryPilot/state/cursor-hooks-state.json`, `~/.MemoryPilot/state/prompt-injections/`. Log: `~/.MemoryPilot/logs/cursor-hooks.log`. Set `MEMORYPILOT_DB=/path/copy.db` to test against a copy.
 
 #### Rules and skills for your agents
 
