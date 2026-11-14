@@ -17,6 +17,10 @@
 //!   reads credentials or tells the agent to hide something: that update is
 //!   held back, the stored copy stays, and the user is told once.
 //!
+//! `"trusted": ["name"]` in the same file lifts the check, not the delay,
+//! for the skills and plugins named: the user's call, for an author whose
+//! every release ships scripts.
+//!
 //! Every replaced copy is kept (`.backups/`): `--rollback-update NAME` puts
 //! it back and that upstream version is not installed again.
 //!
@@ -62,6 +66,9 @@ const DESCRIPTIVE_KEYS: [&str; 10] = ["name", "description", "license", "version
 pub struct Settings {
     pub auto: bool,
     pub delay_days: u64,
+    /// Folders of skills and plugins installed after the delay alone,
+    /// without the check: the user vouches for their author.
+    pub trusted: Vec<String>,
 }
 
 fn parse_settings(file: Option<&str>, variable: Option<&str>) -> Settings {
@@ -74,6 +81,7 @@ fn parse_settings(file: Option<&str>, variable: Option<&str>) -> Settings {
     Settings {
         auto: from_variable.unwrap_or_else(|| file["auto"].as_bool().unwrap_or(false)),
         delay_days: file["delay_days"].as_u64().unwrap_or(DEFAULT_DELAY_DAYS),
+        trusted: file["trusted"].as_array().into_iter().flatten().filter_map(|name| name.as_str().map(String::from)).collect(),
     }
 }
 
@@ -548,9 +556,15 @@ fn check_skills(vendor: &Path, state: &mut State, now: u64, out: &mut Outcome) {
 }
 
 /// Installs the staged skills that waited long enough and pass the check.
-fn apply_skills(vendor: &Path, state: &mut State, now: u64, delay_secs: u64, out: &mut Outcome) {
+fn apply_skills(vendor: &Path, state: &mut State, now: u64, settings: &Settings, out: &mut Outcome) {
+    let delay_secs = settings.delay_days * DAY_SECS;
     for (name, source) in sourced_skills(vendor) {
         let Some(item) = state.items.get_mut(&skill_key(&name)) else { continue };
+        let trusted = settings.trusted.contains(&name);
+        if trusted && item.candidate.is_some() {
+            // Held before it was trusted: the check no longer applies to it.
+            item.held = None;
+        }
         let Some(candidate) = ready(item, now, delay_secs) else { continue };
         let staged = vendor.join(AUTO_DIR).join(&name);
         if !staged.is_dir() || fingerprint(&staged, &[skills::SOURCE_FILE]) != candidate {
@@ -558,7 +572,7 @@ fn apply_skills(vendor: &Path, state: &mut State, now: u64, delay_secs: u64, out
             continue;
         }
         let stored = vendor.join(&name);
-        let findings = inspect(Some(&stored), &staged, &[skills::SOURCE_FILE]);
+        let findings = if trusted { Vec::new() } else { inspect(Some(&stored), &staged, &[skills::SOURCE_FILE]) };
         if !findings.is_empty() {
             let patch = vendor.join(AUTO_DIR).join(format!("{}.diff", name));
             let _ = std::fs::write(patch, plugins::diff(&stored, &staged, false).unwrap_or_default());
@@ -582,7 +596,8 @@ fn apply_skills(vendor: &Path, state: &mut State, now: u64, delay_secs: u64, out
 }
 
 /// The same two steps for the vendor plugins, named by their folder.
-fn update_plugins(root: &Path, state: &mut State, now: u64, delay_secs: u64, out: &mut Outcome) {
+fn update_plugins(root: &Path, state: &mut State, now: u64, settings: &Settings, out: &mut Outcome) {
+    let delay_secs = settings.delay_days * DAY_SECS;
     let skip = [plugins::SOURCE_FILE];
     for plugin in plugins::list(root) {
         let Some(source) = plugins::read_source(&plugin.dir) else { continue };
@@ -609,12 +624,16 @@ fn update_plugins(root: &Path, state: &mut State, now: u64, delay_secs: u64, out
             Ok(_) => {}
             Err(error) => log(&format!("{}: {}", folder, error)),
         }
+        let trusted = settings.trusted.contains(&folder);
+        if trusted && item.candidate.is_some() {
+            item.held = None;
+        }
         let Some(candidate) = ready(item, now, delay_secs) else { continue };
         if !staged.is_dir() || fingerprint(&staged, &skip) != candidate {
             look_again(item);
             continue;
         }
-        let findings = inspect(Some(&plugin.dir), &staged, &skip);
+        let findings = if trusted { Vec::new() } else { inspect(Some(&plugin.dir), &staged, &skip) };
         if !findings.is_empty() {
             let patch = root.join(AUTO_DIR).join(format!("{}.diff", folder));
             let _ = std::fs::write(patch, plugins::diff(&plugin.dir, &staged, false).unwrap_or_default());
@@ -659,7 +678,7 @@ pub fn run_once() -> i32 {
     // Nobody is there to type a password: Git must fail, not wait.
     std::env::set_var("GIT_TERMINAL_PROMPT", "0");
     let now = now_secs();
-    let delay_secs = settings().delay_days * DAY_SECS;
+    let settings = settings();
     let mut state = load_state();
     // Written first: a run that fails is not launched again by every session.
     state.last_run = now;
@@ -667,8 +686,8 @@ pub fn run_once() -> i32 {
     let mut out = Outcome::default();
     let vendor = agents.join("vendor");
     check_skills(&vendor, &mut state, now, &mut out);
-    apply_skills(&vendor, &mut state, now, delay_secs, &mut out);
-    update_plugins(&agents.join("plugins"), &mut state, now, delay_secs, &mut out);
+    apply_skills(&vendor, &mut state, now, &settings, &mut out);
+    update_plugins(&agents.join("plugins"), &mut state, now, &settings, &mut out);
     save_state(&state);
     if !out.updated.is_empty() {
         crate::agents::sync_agents();
@@ -824,8 +843,12 @@ mod tests {
     fn pass(vendor: &Path, state: &mut State, now: u64) -> Outcome {
         let mut out = Outcome::default();
         check_skills(vendor, state, now, &mut out);
-        apply_skills(vendor, state, now, 3 * DAY_SECS, &mut out);
+        apply_skills(vendor, state, now, &three_days(&[]), &mut out);
         out
+    }
+
+    fn three_days(trusted: &[&str]) -> Settings {
+        Settings { auto: true, delay_days: 3, trusted: trusted.iter().map(|name| name.to_string()).collect() }
     }
 
     fn stored(vendor: &Path) -> String {
@@ -834,10 +857,13 @@ mod tests {
 
     #[test]
     fn automatic_updates_are_off_unless_asked() {
-        assert_eq!(parse_settings(None, None), Settings { auto: false, delay_days: 3 });
-        assert_eq!(parse_settings(Some(r#"{"auto": true, "delay_days": 7}"#), None), Settings { auto: true, delay_days: 7 });
-        assert_eq!(parse_settings(Some(r#"{"auto": true}"#), Some("0")), Settings { auto: false, delay_days: 3 });
-        assert_eq!(parse_settings(Some("not json"), Some("1")), Settings { auto: true, delay_days: 3 });
+        assert_eq!(parse_settings(None, None), Settings { auto: false, delay_days: 3, trusted: vec![] });
+        assert_eq!(
+            parse_settings(Some(r#"{"auto": true, "delay_days": 7, "trusted": ["kit", 3]}"#), None),
+            Settings { auto: true, delay_days: 7, trusted: vec!["kit".into()] }
+        );
+        assert_eq!(parse_settings(Some(r#"{"auto": true}"#), Some("0")), Settings { auto: false, delay_days: 3, trusted: vec![] });
+        assert_eq!(parse_settings(Some("not json"), Some("1")), Settings { auto: true, delay_days: 3, trusted: vec![] });
         assert!(!parse_settings(Some(r#"{"auto": "yes"}"#), Some("maybe")).auto);
     }
 
@@ -1034,32 +1060,48 @@ mod tests {
         std::fs::rename(&staged, root.join("kit")).unwrap();
         let skill = || std::fs::read_to_string(root.join("kit/skills/a/SKILL.md")).unwrap();
         let mut state = State::default();
-        let mut pass = |now: u64| {
+        let mut pass_with = |now: u64, trusted: &[&str]| {
             let mut out = Outcome::default();
-            update_plugins(&root, &mut state, now, 3 * DAY_SECS, &mut out);
+            update_plugins(&root, &mut state, now, &three_days(trusted), &mut out);
             out
         };
-        assert_eq!(pass(0), Outcome::default());
+        assert_eq!(pass_with(0, &[]), Outcome::default());
 
         // Guidance and a link to a file of this machine: installed after the delay, without the link.
         let secret = temp_dir("secret");
         write(&secret.0.join("key.md"), "private\n");
         write(&repo.0.join("plugin/skills/a/SKILL.md"), "Kit v2\n");
+        // Kept copies are named after their version and the second: one version per update here.
+        write(&repo.0.join("plugin/.claude-plugin/plugin.json"), r#"{"name": "kit", "version": "1.1"}"#);
         std::os::unix::fs::symlink(secret.0.join("key.md"), repo.0.join("plugin/skills/a/notes.md")).unwrap();
         commit(&repo.0, "v2");
-        assert_eq!(pass(DAY_SECS), Outcome::default());
-        assert_eq!(pass(4 * DAY_SECS).updated, vec!["kit".to_string()]);
+        assert_eq!(pass_with(DAY_SECS, &[]), Outcome::default());
+        assert_eq!(pass_with(4 * DAY_SECS, &[]).updated, vec!["kit".to_string()]);
         assert_eq!(skill(), "Kit v2\n");
         assert!(!root.join("kit/skills/a/notes.md").exists(), "the link's target is not copied");
 
         // A hook: held back, the stored plugin untouched.
         write(&repo.0.join("plugin/hooks/hooks.json"), r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x"}]}]}}"#);
         write(&repo.0.join("plugin/skills/a/SKILL.md"), "Kit v3\n");
+        write(&repo.0.join("plugin/.claude-plugin/plugin.json"), r#"{"name": "kit", "version": "1.2"}"#);
         commit(&repo.0, "v3");
-        assert_eq!(pass(5 * DAY_SECS), Outcome::default());
-        let out = pass(8 * DAY_SECS);
+        assert_eq!(pass_with(5 * DAY_SECS, &[]), Outcome::default());
+        let out = pass_with(8 * DAY_SECS, &[]);
         assert_eq!(out.held.len(), 1, "{out:?}");
         assert!(out.held[0].name == "kit" && out.held[0].reason.contains("defines hooks"), "{out:?}");
         assert_eq!(skill(), "Kit v2\n");
+
+        // The user vouches for this plugin: the check is lifted, the held version goes in.
+        assert_eq!(pass_with(9 * DAY_SECS, &["other"]), Outcome::default(), "trusting another one changes nothing");
+        assert_eq!(pass_with(9 * DAY_SECS, &["kit"]).updated, vec!["kit".to_string()]);
+        assert_eq!(skill(), "Kit v3\n");
+        assert!(root.join("kit/hooks/hooks.json").is_file());
+        // The delay still stands for it.
+        write(&repo.0.join("plugin/skills/a/SKILL.md"), "Kit v4\n");
+        write(&repo.0.join("plugin/.claude-plugin/plugin.json"), r#"{"name": "kit", "version": "1.3"}"#);
+        commit(&repo.0, "v4");
+        assert_eq!(pass_with(10 * DAY_SECS, &["kit"]), Outcome::default());
+        assert_eq!(pass_with(12 * DAY_SECS, &["kit"]), Outcome::default());
+        assert_eq!(pass_with(13 * DAY_SECS, &["kit"]).updated, vec!["kit".to_string()]);
     }
 }

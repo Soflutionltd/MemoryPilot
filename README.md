@@ -604,6 +604,8 @@ Nobody reads a diff, so three rules do:
 
 The background run stages in `.updates-auto/`, apart from `.updates/`, which only ever holds a copy you asked to read. The next session start says in one line what was updated and what was held back, once; the model is given the names of your folders only, the reasons (which quote upstream file names) are shown to you. To read a held version, run `--update-skills NAME` or `--update-plugins NAME`, then `--apply` it if it is fine. Every replaced copy is kept in `.backups/`.
 
+To lift the check, not the delay, for an author you vouch for (a plugin whose every release ships scripts), name its folder: `{"auto": true, "trusted": ["name"]}`. Its updates then install after the delay with nothing read by anyone, so name only what you would run unread anyway.
+
 What the check cannot do: it reads for what can run and for known tricks, it does not understand prose. A harmful instruction written as ordinary guidance passes it, and so does a command spelled in a way it does not know. The delay is the guard for those cases, not the check. A plugin that ships scripts is held at each release that changes them, by design.
 
 ## Knowledge Graph
