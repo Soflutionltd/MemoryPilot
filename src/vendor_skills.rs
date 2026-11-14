@@ -18,12 +18,12 @@
 //! Nothing a skill ships is ever run: files are copied, symbolic links are
 //! left out, and the copy is only read by the agents once the user applied it.
 
-use crate::plugins::{diff, files, run};
+use crate::plugins::{diff, files, run, run_network, through_link};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const SOURCE_FILE: &str = "skill.source.json";
-const UPDATES_DIR: &str = ".updates";
+pub(crate) const UPDATES_DIR: &str = ".updates";
 const BACKUPS_DIR: &str = ".backups";
 /// Previous copies kept in `vendor/.backups/<name>/` after an update.
 const BACKUPS_KEPT: usize = 3;
@@ -152,17 +152,17 @@ fn copy_skill(from: &Path, to: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// What `stage` fetched.
 #[derive(Debug)]
-struct Staged {
-    name: String,
-    dir: PathBuf,
-    source: Source,
+pub(crate) struct Staged {
+    pub(crate) name: String,
+    pub(crate) dir: PathBuf,
+    pub(crate) source: Source,
     /// Symbolic links of the upstream folder, not copied.
-    links: Vec<PathBuf>,
+    pub(crate) links: Vec<PathBuf>,
 }
 
 /// Why nothing was staged.
 #[derive(Debug, PartialEq)]
-enum StageError {
+pub(crate) enum StageError {
     /// The repository holds several skills and none was asked for.
     Choose(Vec<String>),
     Other(String),
@@ -174,41 +174,69 @@ impl From<String> for StageError {
     }
 }
 
-/// Fetches the upstream head of `repo` and builds `vendor/.updates/<name>/`:
-/// the skill as it would be stored, with its `skill.source.json`. The skill
-/// is the folder `path` when given, else the one named `skill`, else the
-/// only one of the repository.
-fn stage(root: &Path, repo: &str, branch: Option<&str>, skill: Option<&str>, path: Option<&str>) -> Result<Staged, StageError> {
+/// A shallow clone of the upstream head of `repo` in `vendor/.updates/`,
+/// removed on drop.
+pub(crate) struct Checkout {
+    dir: PathBuf,
+    pub(crate) commit: String,
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+pub(crate) fn fetch(root: &Path, repo: &str, branch: Option<&str>) -> Result<Checkout, String> {
     let work = root.join(UPDATES_DIR);
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {}", work.display(), e))?;
     // A dot name can never be a skill's: the clone cannot collide with a staged one.
-    let clone = work.join(format!(".clone-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&clone);
-    let clone_text = clone.to_string_lossy().to_string();
+    let mut clone = Checkout { dir: work.join(format!(".clone-{}", std::process::id())), commit: String::new() };
+    let _ = std::fs::remove_dir_all(&clone.dir);
+    let clone_text = clone.dir.to_string_lossy().to_string();
     let mut args = vec!["clone", "--quiet", "--depth", "1"];
     if let Some(branch) = branch {
         args.extend(["--branch", branch]);
     }
     args.extend(["--", repo, clone_text.as_str()]);
-    let staged = run("git", &args, None).map_err(StageError::from).and_then(|_| {
-        let commit = run("git", &["rev-parse", "HEAD"], Some(&clone))?.trim().to_string();
-        let (name, relative) = locate(&clone, repository_name(repo).as_deref(), skill, path)?;
-        let dir = work.join(&name);
-        let _ = std::fs::remove_dir_all(&dir);
-        let links = copy_skill(&clone.join(&relative), &dir)?;
-        let relative_text = relative.to_string_lossy().to_string();
-        let source = Source {
-            repo: repo.to_string(),
-            commit,
-            branch: branch.map(String::from),
-            path: if relative_text.is_empty() { ".".into() } else { relative_text },
-        };
-        let text = serde_json::to_string_pretty(&source).map_err(|e| e.to_string())? + "\n";
-        std::fs::write(dir.join(SOURCE_FILE), text).map_err(|e| e.to_string())?;
-        Ok(Staged { name, dir, source, links })
-    });
-    let _ = std::fs::remove_dir_all(&clone);
-    staged
+    run_network(&args)?;
+    clone.commit = run("git", &["rev-parse", "HEAD"], Some(&clone.dir))?.trim().to_string();
+    Ok(clone)
+}
+
+/// Builds `vendor/<work>/<name>/` from a clone: the skill as it would be
+/// stored, with its `skill.source.json`. `work` is `.updates` for a copy the
+/// user is about to read. The skill is the folder `path` when given, else
+/// the one named `skill`, else the only one of the repository.
+pub(crate) fn stage_from(
+    root: &Path,
+    work: &str,
+    clone: &Checkout,
+    repo: &str,
+    branch: Option<&str>,
+    skill: Option<&str>,
+    path: Option<&str>,
+) -> Result<Staged, StageError> {
+    let (name, relative) = locate(&clone.dir, repository_name(repo).as_deref(), skill, path)?;
+    let dir = root.join(work).join(&name);
+    let _ = std::fs::remove_dir_all(&dir);
+    let links = copy_skill(&clone.dir.join(&relative), &dir)?;
+    let relative_text = relative.to_string_lossy().to_string();
+    let source = Source {
+        repo: repo.to_string(),
+        commit: clone.commit.clone(),
+        branch: branch.map(String::from),
+        path: if relative_text.is_empty() { ".".into() } else { relative_text },
+    };
+    let text = serde_json::to_string_pretty(&source).map_err(|e| e.to_string())? + "\n";
+    std::fs::write(dir.join(SOURCE_FILE), text).map_err(|e| e.to_string())?;
+    Ok(Staged { name, dir, source, links })
+}
+
+/// Fetches the upstream head of `repo` and stages one of its skills.
+fn stage(root: &Path, repo: &str, branch: Option<&str>, skill: Option<&str>, path: Option<&str>) -> Result<Staged, StageError> {
+    let clone = fetch(root, repo, branch)?;
+    stage_from(root, UPDATES_DIR, &clone, repo, branch, skill, path)
 }
 
 /// The skill folder to take in a clone, and the name it is stored under.
@@ -219,12 +247,8 @@ fn locate(clone: &Path, root_name: Option<&str>, skill: Option<&str>, path: Opti
         if !stays_inside {
             return Err(format!("--path {} must stay inside the repository", path).into());
         }
-        let mut walked = clone.to_path_buf();
-        for part in relative.components() {
-            walked.push(part);
-            if std::fs::symlink_metadata(&walked).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Err(format!("--path {} goes through a symbolic link of the repository", path).into());
-            }
+        if through_link(clone, &relative) {
+            return Err(format!("--path {} goes through a symbolic link of the repository", path).into());
         }
         let skill_md = clone.join(&relative).join("SKILL.md");
         if !skill_md.is_file() {
@@ -266,7 +290,7 @@ fn locate(clone: &Path, root_name: Option<&str>, skill: Option<&str>, path: Opti
 }
 
 /// True when two skill folders hold the same files (the source file aside).
-fn same_content(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_content(a: &Path, b: &Path) -> bool {
     let listed = files(a, &[SOURCE_FILE]);
     listed == files(b, &[SOURCE_FILE]) && listed.iter().all(|relative| std::fs::read(a.join(relative)).ok() == std::fs::read(b.join(relative)).ok())
 }
@@ -294,7 +318,7 @@ fn backup(root: &Path, name: &str) -> Result<PathBuf, String> {
 
 /// Replaces `vendor/<name>` by the staged copy. Returns the source applied
 /// and where the previous copy went, when there was one.
-fn apply_staged(root: &Path, name: &str, expected_repo: Option<&str>) -> Result<(Source, Option<PathBuf>), String> {
+pub(crate) fn apply_staged(root: &Path, name: &str, expected_repo: Option<&str>) -> Result<(Source, Option<PathBuf>), String> {
     let staged = root.join(UPDATES_DIR).join(name);
     let source = read_source(&staged).ok_or_else(|| format!("nothing staged for {}: run the command without --apply first and read what it shows", name))?;
     if let Some(expected) = expected_repo.filter(|expected| *expected != source.repo) {

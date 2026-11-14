@@ -13,6 +13,7 @@ mod migrate_layout;
 mod plugins;
 mod protocol;
 mod tools;
+mod auto_update;
 mod update;
 mod vendor_skills;
 mod watcher;
@@ -99,6 +100,12 @@ fn main() {
     }
     if args.iter().any(|a| a == "--update-skills") {
         std::process::exit(vendor_skills::update_skills(&args));
+    }
+    if args.iter().any(|a| a == "--auto-update") {
+        std::process::exit(hooks::alone_on_agents_updates(auto_update::run_once));
+    }
+    if args.iter().any(|a| a == "--rollback-update") {
+        std::process::exit(hooks::alone_on_agents_updates(|| auto_update::rollback_cli(&args)));
     }
     if args.iter().any(|a| a == "--index-conversations") {
         conversations_cli::run_index(&args);
@@ -1227,6 +1234,8 @@ fn print_help() {
     println!("  MemoryPilot --update-plugins [NAME] [--apply]  Show the upstream diff of vendor plugins (agents/plugins/*/plugin.source.json); --apply installs the reviewed copy, previous one kept in plugins/.backups");
     println!("  MemoryPilot --add-skill <owner/repo[@skill]> [--apply]  Fetch a third-party skill into agents/vendor for review (nothing installed); --apply installs the copy just reviewed, for every wired tool");
     println!("  MemoryPilot --update-skills [NAME] [--apply]  Show the upstream diff of vendor skills (agents/vendor/*/skill.source.json); --apply installs the reviewed copies, previous ones kept");
+    println!("  MemoryPilot --auto-update    Update the adopted third-party skills and plugins without review: a version is installed once seen unchanged for 3 days and when a check finds nothing to run in it, else it is held back. Session starts launch it daily when config/agents-updates.json holds {{\"auto\": true}}");
+    println!("  MemoryPilot --rollback-update NAME  Put back the previous copy of a vendor skill or plugin; the version undone is not installed again");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");

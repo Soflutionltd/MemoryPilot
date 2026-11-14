@@ -19,10 +19,11 @@ use std::path::{Path, PathBuf};
 pub const MARKETPLACE: &str = "memorypilot";
 pub const SOURCE_FILE: &str = "plugin.source.json";
 pub const CURSOR_DIR: &str = "cursor";
-const UPDATES_DIR: &str = ".updates";
+pub(crate) const UPDATES_DIR: &str = ".updates";
 const BACKUPS_DIR: &str = ".backups";
 /// Previous versions kept in `plugins/.backups/` per plugin after an update.
 const BACKUPS_KEPT: usize = 3;
+const NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plugin {
@@ -118,8 +119,13 @@ pub(crate) fn files(dir: &Path, skip: &[&str]) -> Vec<PathBuf> {
 /// Content fingerprint of the Claude Code part of a plugin (the `cursor/`
 /// copy and the source file are left out: they never need a Claude update).
 pub fn claude_fingerprint(dir: &Path) -> String {
+    fingerprint(dir, &[CURSOR_DIR, SOURCE_FILE])
+}
+
+/// Content fingerprint of the files under `dir`, `skip` (top-level names) aside.
+pub(crate) fn fingerprint(dir: &Path, skip: &[&str]) -> String {
     let mut hasher = Sha256::new();
-    for rel in files(dir, &[CURSOR_DIR, SOURCE_FILE]) {
+    for rel in files(dir, skip) {
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update([0]);
         hasher.update(std::fs::read(dir.join(&rel)).unwrap_or_default());
@@ -217,8 +223,63 @@ pub(crate) fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<String
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// A Git command that talks to a remote: given up after `NETWORK_TIMEOUT`,
+/// so a server that stalls never keeps a background run alive.
+pub(crate) fn run_network(args: &[&str]) -> Result<String, String> {
+    use std::io::Read;
+    let label = format!("git {}", args.join(" "));
+    let mut child = std::process::Command::new("git")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {}", label, e))?;
+    let deadline = std::time::Instant::now() + NETWORK_TIMEOUT;
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("{}: {}", label, e))? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{}: no answer after {} s", label, NETWORK_TIMEOUT.as_secs()));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    // These commands print a few lines at most: read once they have exited.
+    let read = |pipe: Option<&mut dyn Read>| {
+        let mut text = String::new();
+        if let Some(pipe) = pipe {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    };
+    let stdout = read(child.stdout.as_mut().map(|pipe| pipe as &mut dyn Read));
+    let stderr = read(child.stderr.as_mut().map(|pipe| pipe as &mut dyn Read));
+    if !status.success() {
+        return Err(format!("{}: {}", label, stderr.trim()));
+    }
+    Ok(stdout)
+}
+
+/// True when `relative`, walked from `base`, is or goes through a symbolic link.
+pub(crate) fn through_link(base: &Path, relative: &Path) -> bool {
+    let mut walked = base.to_path_buf();
+    relative.components().any(|part| {
+        walked.push(part);
+        std::fs::symlink_metadata(&walked).is_ok_and(|m| m.file_type().is_symlink())
+    })
+}
+
+/// Copies a folder, leaving symbolic links out: one of an upstream
+/// repository could point at any file of the machine that clones it.
 fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     for rel in files(from, &[]) {
+        let is_link = std::fs::symlink_metadata(from.join(&rel)).map(|m| m.file_type().is_symlink()).unwrap_or(true);
+        if is_link {
+            continue;
+        }
         let dest = to.join(&rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
@@ -228,10 +289,11 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Builds `plugins/.updates/<folder>/` from the upstream head: the plugin as
-/// it would be stored, with `plugin.source.json` on the new commit.
-fn stage(root: &Path, folder: &str, source: &Source) -> Result<(PathBuf, Source), String> {
-    let work = root.join(UPDATES_DIR);
+/// Builds `plugins/<work>/<folder>/` from the upstream head: the plugin as
+/// it would be stored, with `plugin.source.json` on the new commit. `work`
+/// is `.updates` for a copy the user is about to read.
+pub(crate) fn stage(root: &Path, work: &str, folder: &str, source: &Source) -> Result<(PathBuf, Source), String> {
+    let work = root.join(work);
     let clone = work.join(format!("{}.clone", folder));
     let staged = work.join(folder);
     let _ = std::fs::remove_dir_all(&clone);
@@ -243,13 +305,21 @@ fn stage(root: &Path, folder: &str, source: &Source) -> Result<(PathBuf, Source)
         args.extend(["--branch", branch.as_str()]);
     }
     args.extend([source.repo.as_str(), clone_str.as_str()]);
-    run("git", &args, None)?;
-    let commit = run("git", &["rev-parse", "HEAD"], Some(&clone))?.trim().to_string();
-    copy_dir(&clone.join(&source.claude), &staged)?;
-    if let Some(cursor) = &source.cursor {
-        copy_dir(&clone.join(cursor), &staged.join(CURSOR_DIR))?;
-    }
+    let copied = run_network(&args).and_then(|_| {
+        let commit = run("git", &["rev-parse", "HEAD"], Some(&clone))?.trim().to_string();
+        for part in [Some(&source.claude), source.cursor.as_ref()].into_iter().flatten() {
+            if through_link(&clone, Path::new(part)) {
+                return Err(format!("{} of the repository is or goes through a symbolic link", part));
+            }
+        }
+        copy_dir(&clone.join(&source.claude), &staged)?;
+        if let Some(cursor) = &source.cursor {
+            copy_dir(&clone.join(cursor), &staged.join(CURSOR_DIR))?;
+        }
+        Ok(commit)
+    });
     let _ = std::fs::remove_dir_all(&clone);
+    let commit = copied?;
     let updated = Source { commit, ..source.clone() };
     let text = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())? + "\n";
     std::fs::write(staged.join(SOURCE_FILE), text).map_err(|e| e.to_string())?;
@@ -303,6 +373,21 @@ fn backup(root: &Path, folder: &str, dir: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// Replaces the stored plugin `dir` by the staged copy of `folder`. Returns
+/// where the previous copy went.
+pub(crate) fn apply_staged(root: &Path, folder: &str, dir: &Path) -> Result<PathBuf, String> {
+    let staged = root.join(UPDATES_DIR).join(folder);
+    let kept = backup(root, folder, dir)?;
+    match std::fs::rename(&staged, dir) {
+        Ok(()) => Ok(kept),
+        Err(e) => {
+            // Put the previous copy back: the plugin must never be left missing.
+            let restored = std::fs::rename(&kept, dir).is_ok();
+            Err(format!("{} ({})", e, if restored { "previous copy restored" } else { "previous copy left in .backups" }))
+        }
+    }
+}
+
 /// Entry point for `--update-plugins [name] [--apply]`. Without `--apply`:
 /// fetches each vendor plugin's upstream head, prints the diff summary and
 /// writes the full diff next to the staged copy. With `--apply`: replaces
@@ -336,14 +421,7 @@ pub fn update_plugins(args: &[String]) -> i32 {
                 status = 1;
                 continue;
             };
-            match backup(&root, &folder, &plugin.dir).and_then(|kept| match std::fs::rename(&staged, &plugin.dir) {
-                Ok(()) => Ok(kept),
-                Err(e) => {
-                    // Put the previous copy back: the plugin must never be left missing.
-                    let restored = std::fs::rename(&kept, &plugin.dir).is_ok();
-                    Err(format!("{} ({})", e, if restored { "previous copy restored" } else { "previous copy left in .backups" }))
-                }
-            }) {
+            match apply_staged(&root, &folder, &plugin.dir) {
                 Ok(kept) => println!(
                     "{}: {} → {} applied (commit {}), previous copy in {}",
                     plugin.name,
@@ -359,7 +437,7 @@ pub fn update_plugins(args: &[String]) -> i32 {
             }
             continue;
         }
-        match stage(&root, &folder, &source) {
+        match stage(&root, UPDATES_DIR, &folder, &source) {
             Ok((staged, upstream)) if upstream.commit == source.commit => {
                 let _ = std::fs::remove_dir_all(&staged);
                 println!("{} {}: up to date (commit {})", plugin.name, plugin.version, &source.commit[..source.commit.len().min(7)]);

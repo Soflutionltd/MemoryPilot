@@ -187,7 +187,16 @@ pub fn run_hook(event: &str, args: &[String]) {
                 return;
             }
             spawn_detached(&["--sync-agents"], "session-start: sync-agents");
-            match session_start_context(&payload) {
+            if crate::auto_update::due() {
+                spawn_detached(&["--auto-update"], "session-start: auto-update");
+            }
+            // What the background updates did since the last session, said once.
+            let (for_model, for_user) = crate::auto_update::take_report().unzip();
+            let context = match (session_start_context(&payload), for_model) {
+                (Some(context), Some(updates)) => Some(format!("{}\n\n{}", context, updates)),
+                (context, updates) => context.or(updates),
+            };
+            let mut output = match context {
                 // Cursor: top-level `additional_context`. Claude Code and
                 // Codex: `hookSpecificOutput.additionalContext`.
                 Some(context) if agent == "cursor" => json!({ "additional_context": context }),
@@ -198,7 +207,12 @@ pub fn run_hook(event: &str, args: &[String]) {
                     }
                 }),
                 None => json!({}),
+            };
+            // Claude Code shows `systemMessage` to the user, whatever the model does with its context.
+            if let Some(updates) = for_user.filter(|_| agent == "claude") {
+                output["systemMessage"] = json!(updates);
             }
+            output
         }
         "user-prompt" | "userPromptSubmit" | "UserPromptSubmit" => {
             // Cursor has no per-prompt context injection.
@@ -472,6 +486,16 @@ pub fn run_index() {
     };
     memorypilot_core::secrets::ensure_known_secrets();
     crate::conversations_cli::run_index(&[]);
+}
+
+/// Runs `action` (an update run or an undo of the third-party skills and
+/// plugins) alone: both rewrite the same state.
+pub fn alone_on_agents_updates(action: impl FnOnce() -> i32) -> i32 {
+    let Some(_lock) = IngestLock::try_acquire(crate::auto_update::LOCK_KEY) else {
+        println!("An update run is in progress: try again in a moment.");
+        return 1;
+    };
+    action()
 }
 
 /// Notes that `workspace` just got the recall. Best effort: a lost trace

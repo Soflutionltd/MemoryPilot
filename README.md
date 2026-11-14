@@ -587,6 +587,25 @@ MemoryPilot --update-skills find-skills --apply                 # install a revi
 
 `skill.source.json` next to `SKILL.md` records the repository, the commit and the folder; `--update-skills` follows it. A skill copied by hand has no such file: `--add-skill owner/repo@name` adopts it, showing the diff with upstream first. A skill of yours with the same name in `agents/skills/` always wins, and `--apply` refuses to add a vendor skill it would hide.
 
+#### Unattended updates, with a check standing in for the reader
+
+Off by default. To let the adopted skills and plugins update by themselves, write `{"auto": true}` in `~/.MemoryPilot/config/agents-updates.json` (or set `MEMORYPILOT_AGENTS_AUTO_UPDATE=1`). A session start then launches `MemoryPilot --auto-update` in the background, once a day at most; the command can also be run by hand at any time.
+
+```bash
+MemoryPilot --auto-update              # one run now
+MemoryPilot --rollback-update NAME     # put the previous copy back; that version is not installed again
+```
+
+Nobody reads a diff, so three rules do:
+
+- **Only what you adopted.** A skill or plugin is followed when it has a `skill.source.json` or `plugin.source.json`. Nothing new is ever added.
+- **A delay.** An upstream version is installed once this machine has seen it unchanged for 3 days (`"delay_days"` in the same file). The delay runs from what was observed here, not from commit dates, which their author chooses. A hijacked repository is usually put right within days; the reverted version is then the one installed.
+- **A check of what the update adds.** It is held back, and the stored copy stays, when it adds or changes a script or a binary; when a JSON, YAML or TOML file changes what it makes a tool run or reach (hooks, servers, commands, their arguments, environment and URLs; JSON keys are decoded first, a file that cannot be parsed is held); when the front matter of a Markdown file changes anything other than its description (tools, hooks, model, permission mode); or when it adds a line that downloads and runs code, sends a local file to a server, reads credentials, opens a remote shell, hides characters, or tells the agent to act behind the user's back. Symbolic links of the upstream repository are never copied.
+
+The background run stages in `.updates-auto/`, apart from `.updates/`, which only ever holds a copy you asked to read. The next session start says in one line what was updated and what was held back, once; the model is given the names of your folders only, the reasons (which quote upstream file names) are shown to you. To read a held version, run `--update-skills NAME` or `--update-plugins NAME`, then `--apply` it if it is fine. Every replaced copy is kept in `.backups/`.
+
+What the check cannot do: it reads for what can run and for known tricks, it does not understand prose. A harmful instruction written as ordinary guidance passes it, and so does a command spelled in a way it does not know. The delay is the guard for those cases, not the check. A plugin that ships scripts is held at each release that changes them, by design.
+
 ## Knowledge Graph
 
 | Tool | Description |
