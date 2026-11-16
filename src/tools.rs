@@ -298,7 +298,7 @@ fn all_tool_definitions() -> Value {
         },
         {
             "name": "update_memory",
-            "description": "Update memory content, kind, tags, importance, expiration, or where a credential's value lives.",
+            "description": "Update memory content, kind, tags, importance, expiration, project, or where a credential's value lives.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -308,6 +308,7 @@ fn all_tool_definitions() -> Value {
                     "tags": { "type": ["array","null"], "items": { "type": "string" } },
                     "importance": { "type": ["integer","null"], "minimum": 1, "maximum": 5 },
                     "expires_at": { "type": ["string","null"] },
+                    "project": { "type": ["string","null"], "description": "Move the memory to this project (\"global\" for the global scope). Omitted or null: unchanged." },
                     "location": { "type": ["string","null"], "description": "Where the value of a credential lives, e.g. \"1Password, Team vault, item Admin\" or an op:// reference" }
                 },
                 "required": ["id"]
@@ -376,11 +377,38 @@ fn all_tool_definitions() -> Value {
         },
         {
             "name": "register_project",
-            "description": "Register project with filesystem path for auto-detection.",
+            "description": "Register project with filesystem path for auto-detection. Stores the repository's origin remote (two folders with the same remote are the same project); a Git worktree is registered as its main repository; the folder a project leaves stays known as an alias. To change a name use rename_project, to fold a duplicate use merge_projects.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "name": { "type": "string" }, "path": { "type": "string" }, "description": { "type": ["string","null"] } },
                 "required": ["name", "path"]
+            }
+        },
+        {
+            "name": "merge_projects",
+            "description": "Fold project `source` into project `target`: memories, full-text index, episodes, archived originals and knowledge graph move in one transaction, then `source` is deleted and stays known as an alias of `target`. Run with dry_run first: it returns the counts per table and changes nothing. A copy of the database is taken before the real run (path in `backup`). Memories with the same text on both sides are both kept.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "Project to fold and delete" },
+                    "target": { "type": "string", "description": "Project that keeps everything" },
+                    "dry_run": { "type": "boolean", "default": false }
+                },
+                "required": ["source", "target"]
+            }
+        },
+        {
+            "name": "rename_project",
+            "description": "Rename a project and, with new_path, record the folder it now lives in (same name on both sides: only the folder changes). Covers memories, full-text index, episodes, archived originals and knowledge graph in one transaction; the old name and the old folder stay known as aliases. Refused when new_name is already a project: use merge_projects. A copy of the database is taken first (path in `backup`); dry_run returns the counts and changes nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "old_name": { "type": "string" },
+                    "new_name": { "type": "string" },
+                    "new_path": { "type": ["string","null"], "description": "Folder the project lives in now" },
+                    "dry_run": { "type": "boolean", "default": false }
+                },
+                "required": ["old_name", "new_name"]
             }
         },
         {
@@ -920,6 +948,8 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "get_project_context" => handle_project_context(db, args),
         "get_project_brain" => handle_get_project_brain(db, args),
         "register_project" => handle_register_project(db, args),
+        "merge_projects" => handle_merge_projects(db, args),
+        "rename_project" => handle_rename_project(db, args),
         "find_conversation" => crate::conversations_cli::handle_find_conversation(db, args),
         "read_conversation" => crate::conversations_cli::handle_read_conversation(args),
         "ingest_conversation" => crate::conversations_cli::handle_ingest_conversation(args),
@@ -1658,6 +1688,13 @@ fn handle_update(db: &Database, args: &Value) -> Value {
         },
         _ => None,
     };
+    if let Some(project) = args.get("project").and_then(|v| v.as_str()) {
+        match db.move_memory_to_project(id, Some(project)) {
+            Ok(Some(_)) => {}
+            Ok(None) => return tool_error(&format!("Not found: {}", id)),
+            Err(e) => return tool_error(&e),
+        }
+    }
     match db.update_memory_full(
         id,
         content,
@@ -1777,6 +1814,35 @@ fn handle_register_project(db: &Database, args: &Value) -> Value {
     let desc = args.get("description").and_then(|v| v.as_str());
     match db.register_project(name, path, desc) {
         Ok(proj) => tool_result(&serde_json::to_string_pretty(&proj).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_merge_projects(db: &Database, args: &Value) -> Value {
+    let (Some(source), Some(target)) = (
+        args.get("source").and_then(|v| v.as_str()),
+        args.get("target").and_then(|v| v.as_str()),
+    ) else {
+        return tool_error("source and target required");
+    };
+    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    match db.merge_projects(source, target, dry_run) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_rename_project(db: &Database, args: &Value) -> Value {
+    let (Some(old_name), Some(new_name)) = (
+        args.get("old_name").and_then(|v| v.as_str()),
+        args.get("new_name").and_then(|v| v.as_str()),
+    ) else {
+        return tool_error("old_name and new_name required");
+    };
+    let new_path = args.get("new_path").and_then(|v| v.as_str());
+    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    match db.rename_project(old_name, new_name, new_path, dry_run) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
         Err(e) => tool_error(&e),
     }
 }
