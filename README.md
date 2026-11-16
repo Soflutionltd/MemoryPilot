@@ -79,9 +79,11 @@ Evaluated on the 470 answerable questions of [LongMemEval-S](https://arxiv.org/a
 | Zep (cloud, 2026) | 90.2% (451/500) | gpt-5.4 as reader and as judge, median context 4,408 tokens | [getzep.com research](https://www.getzep.com/research/memory-benchmarks/), read 2026-11-16 |
 | Zep / Graphiti (2025 paper) | 63.8% / 71.2% | gpt-4o-mini / gpt-4o as reader, GPT-4o judge | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956), Table 2 |
 | Supermemory | 85.2% / 84.6% | gemini-3-pro / gpt-5 as reader, LongMemEval-S, 500 questions | [supermemory.ai research](https://supermemory.ai/research/longmembench/), read 2026-11-16 |
-| MemoryPilot | not measured | an end-to-end QA run is planned | |
+| **MemoryPilot v4.13** | **81.8%** (409/500) | claude-opus-5-5 as reader and as judge (not the official GPT-4o judge), official LongMemEval prompts, no chain of thought; context = the top 10 retrieved turns, about 2,700 tokens per question; 80.6% on the 470 answerable questions, 30/30 on abstention | This repo, `--benchmark-longmemeval --e2e`, run of 2026-11-16 |
 
 > All figures are published by their own authors, none was reproduced independently, and the two tables cannot be compared with each other. On session-level recall MemoryPilot posts the highest published local score, by a margin smaller than the gap between this metric and a plain BM25 baseline. The protocol to settle a comparison: same 470 questions, same hardware, every system run by the same script, reporting `recall_any@5`, `recall_all@5`, turn-level evidence recall and end-to-end QA accuracy with a fixed reader and judge.
+
+**MemoryPilot end to end, by question type** (same run): single-session-user 98.6%, single-session-assistant 91.1%, knowledge-update 89.7%, multi-session 78.9%, single-session-preference 70.0%, temporal-reasoning 69.9%. Retrieval on the same run: R@5 98.7%, R@10 99.4%. Of the 91 wrong answers, 3 had no gold session in the 10 turns given to the reader and 88 had at least one: the gap to the scores above is in what the reader is given and how it uses it (10 turns against 200 for Mem0, answers capped at 500 tokens, 62 of them cut), not in finding the right sessions. The figure is not comparable with the others in the table: every system uses its own reader, judge and context size.
 
 #### What a memory costs (measured, `MemoryPilot --footprint`)
 
