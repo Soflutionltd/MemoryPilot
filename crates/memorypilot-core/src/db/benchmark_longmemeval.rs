@@ -571,12 +571,35 @@ impl Database {
                                 .count();
                             covered.insert(depth.to_string(), json!(found));
                         }
+                        // Finding a session is not finding the turn that holds
+                        // the answer: counted apart, on the turns the dataset marks.
+                        let evidence: Vec<&str> = haystack.iter().filter(|turn| turn.evidence).map(|turn| turn.key.as_str()).collect();
+                        let mut evidence_found = serde_json::Map::new();
+                        for depth in &options.coverage_depths {
+                            let found = evidence.iter().filter(|key| ids.iter().take(*depth).any(|id| id == *key)).count();
+                            evidence_found.insert(depth.to_string(), json!(found));
+                        }
+                        // What widening the first ten turns would bring in.
+                        let first_ten: Vec<(&str, usize)> = ids.iter().take(10).filter_map(|id| turn_position(id)).collect();
+                        let within = |key: &&str, span: Option<usize>| -> bool {
+                            let Some((session, index)) = turn_position(key) else { return false };
+                            first_ten.iter().any(|(hit_session, hit_index)| {
+                                *hit_session == session && span.is_none_or(|span| hit_index.abs_diff(index) <= span)
+                            })
+                        };
                         coverage_rows.push(json!({
                             "question_id": entry.get("question_id").and_then(|v| v.as_str()).unwrap_or(""),
                             "question_type": question_type,
                             "gold_sessions": answer_session_ids.len(),
                             "turns_returned": ids.len(),
                             "gold_sessions_found_at": covered,
+                            "evidence_turns": evidence.len(),
+                            "evidence_turns_found_at": evidence_found,
+                            "evidence_turns_in_top10_with_neighbors": {
+                                "1": evidence.iter().filter(|key| within(key, Some(1))).count(),
+                                "2": evidence.iter().filter(|key| within(key, Some(2))).count(),
+                                "whole_session": evidence.iter().filter(|key| within(key, None)).count(),
+                            },
                         }));
                     }
                     Err(e) => eprintln!("[LongMemEval] Q{}: coverage search failed: {}", qi, e),
@@ -1027,6 +1050,8 @@ struct HaystackTurn {
     session_date: String,
     role: String,
     content: String,
+    /// The dataset marks the turns that hold the answer (`has_answer`).
+    evidence: bool,
 }
 
 /// Every non-empty turn of a question's haystack, with the same
@@ -1065,6 +1090,7 @@ fn haystack_turns(entry: &serde_json::Value) -> Vec<HaystackTurn> {
                 session_date: session_date.unwrap_or("").to_string(),
                 role: role.to_string(),
                 content: content.to_string(),
+                evidence: turn.get("has_answer").and_then(|v| v.as_bool()).unwrap_or(false),
             });
         }
     }
