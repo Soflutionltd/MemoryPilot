@@ -131,6 +131,10 @@ fn main() {
         }
         return;
     }
+    if args.iter().any(|a| a == "--archive-cursor") {
+        conversations_cli::run_archive(&args);
+        return;
+    }
     if args.iter().any(|a| a == "--redact-conversations") {
         conversations_cli::run_redact(&args);
         return;
@@ -1270,6 +1274,7 @@ fn print_help() {
     println!("  MemoryPilot --sync-1password [--apply]  Point every credential to 1Password (the vault of ~/.MemoryPilot/config/onepassword.json or MEMORYPILOT_OP_VAULT), creating missing items; back up the vault key");
     println!("  MemoryPilot --repair-credentials [--apply]  Re-mask leaking labels, reclassify credentials holding no secret");
     println!("  MemoryPilot --redact-conversations [--apply]  Mask secrets already in the conversation index (counts only without --apply)");
+    println!("  MemoryPilot --archive-cursor [--apply] [--out DIR]  One Markdown file per Cursor conversation, full text, secrets masked (counts only without --apply); --index records their projects in the index");
     println!("  MemoryPilot --add-known-secret  Read one secret value on stdin, keep only its SHA-256 print so it is masked everywhere");
     println!("  MemoryPilot --http [PORT]    Start HTTP server (default: 7437, requires --features http)");
     println!("  MemoryPilot --install-hooks  Cursor + Claude Code + Codex: session-start recall, per-prompt recall (Claude Code), conversation index at session end");

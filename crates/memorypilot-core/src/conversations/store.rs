@@ -242,6 +242,19 @@ impl ConversationStore {
         Ok(written)
     }
 
+    /// Records the project and folder the archive found for a conversation
+    /// already indexed. Returns whether the conversation is in the index.
+    pub fn set_identity(&mut self, conversation_id: &str, project: Option<&str>, workspace: Option<&str>) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE conversations SET project = COALESCE(?2, project), workspace = COALESCE(workspace, ?3) WHERE id = ?1",
+                params![conversation_id, project, workspace],
+            )
+            .map_err(|error| format!("Conversation identity: {}", error))?;
+        Ok(changed > 0)
+    }
+
     pub fn pending_embeddings(&self, limit: usize) -> Result<Vec<(i64, String)>, String> {
         let mut statement = self
             .conn

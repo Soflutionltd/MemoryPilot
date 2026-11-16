@@ -7,6 +7,7 @@
 //! said; nothing is summarised into memories, which is what polluted
 //! recall when transcripts were distilled automatically.
 
+pub mod archive;
 pub mod claude;
 pub mod cursor;
 pub mod imported;
@@ -83,9 +84,17 @@ pub fn sync(store: &mut ConversationStore, options: &SyncOptions) -> SyncReport 
         over
     };
 
-    if let Some(path) = cursor::default_store_path() {
-        if let Err(error) = sync_cursor(store, &path, &mut report, &over_budget) {
-            report.errors.push(error);
+    match cursor::default_store_path() {
+        Some(path) => {
+            if let Err(error) = sync_cursor(store, &path, &mut report, &over_budget) {
+                report.errors.push(error);
+            }
+        }
+        // Cursor's store is gone: its conversations come from their archive.
+        None => {
+            if let Some(dir) = archive::default_dir().filter(|dir| dir.is_dir()) {
+                sync_archive(store, &dir, &mut report, &over_budget);
+            }
         }
     }
     if !over_budget(&mut report) {
@@ -149,6 +158,46 @@ fn sync_cursor(
         report.origins_updated += 1;
     }
     Ok(())
+}
+
+/// Indexes the archived Cursor conversations under the ids and message
+/// keys the live store gave them, so nothing already indexed is doubled.
+pub fn sync_archive(
+    store: &mut ConversationStore,
+    dir: &std::path::Path,
+    report: &mut SyncReport,
+    over_budget: &dyn Fn(&mut SyncReport) -> bool,
+) {
+    let (conversations, errors) = archive::read_archive(dir);
+    report.errors.extend(errors);
+    for conversation in &conversations {
+        for (source, messages) in &conversation.threads {
+            if over_budget(report) {
+                return;
+            }
+            report.origins_checked += 1;
+            match store.origin_version(&source.origin_id) {
+                Ok(Some(version)) if version == source.version => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    report.errors.push(error);
+                    continue;
+                }
+            }
+            let mut seen: Vec<u64> = messages.iter().map(|message| hash_key(&message.key)).collect();
+            seen.sort_unstable();
+            match store.apply(source, source.origin_id == source.root_id, messages, &seen) {
+                Ok(written) => {
+                    report.messages_written += written;
+                    report.origins_updated += 1;
+                }
+                Err(error) => report.errors.push(error),
+            }
+        }
+        if let Err(error) = store.set_identity(&conversation.id, conversation.project.as_deref(), conversation.workspace.as_deref()) {
+            report.errors.push(error);
+        }
+    }
 }
 
 fn sync_claude(

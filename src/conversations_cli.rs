@@ -63,6 +63,78 @@ pub fn run_redact(args: &[String]) {
     }
 }
 
+/// `--archive-cursor [--apply] [--out DIR] [--store PATH]`: one Markdown
+/// file per Cursor conversation, at full length, secrets masked. Without
+/// `--apply` only counts. Cursor's store is opened immutable: Cursor must
+/// be closed, and nothing is ever written to it. No message is printed.
+///
+/// `--archive-cursor --index`: records in the conversation index the
+/// project and folder the archive holds for each conversation (run it once
+/// the archive has been checked).
+pub fn run_archive(args: &[String]) {
+    use memorypilot_core::conversations::{archive, cursor};
+    let fail = |message: String| -> ! {
+        eprintln!("✗ {}", message);
+        std::process::exit(1);
+    };
+    let out_dir = match value_after(args, "--out").map(std::path::PathBuf::from).or_else(archive::default_dir) {
+        Some(dir) => dir,
+        None => fail("Cannot find home directory".to_string()),
+    };
+    if args.iter().any(|a| a == "--index") {
+        let (conversations, errors) = archive::read_archive(&out_dir);
+        let mut store = open_store();
+        let mut updated = 0;
+        let mut absent = 0;
+        for conversation in &conversations {
+            match store.set_identity(&conversation.id, conversation.project.as_deref(), conversation.workspace.as_deref()) {
+                Ok(true) => updated += 1,
+                Ok(false) => absent += 1,
+                Err(error) => fail(error),
+            }
+        }
+        println!(
+            "{}",
+            json!({ "archived": conversations.len(), "index_updated": updated, "not_in_index": absent, "unreadable_files": errors })
+        );
+        return;
+    }
+    let store_path = match value_after(args, "--store").map(std::path::PathBuf::from).or_else(cursor::default_store_path) {
+        Some(path) => path,
+        None => fail("Cursor store not found (--store PATH)".to_string()),
+    };
+    let db = match Database::open() {
+        Ok(db) => db,
+        Err(error) => fail(error),
+    };
+    // Both sources of known values: the prints file and the credentials.
+    let known_prints = memorypilot_core::secrets::reload_known_secrets();
+    let options = archive::ArchiveOptions {
+        store: &store_path,
+        out_dir: &out_dir,
+        apply: args.iter().any(|a| a == "--apply"),
+        home: dirs::home_dir().map(|home| home.to_string_lossy().into_owned()),
+        known_project: &|folder| db.known_project_for_path(folder),
+        remote_of: &|project| db.project_remote(project),
+        slug: &|name| Database::project_slug(name),
+    };
+    match archive::archive_cursor(&options) {
+        Ok(report) => {
+            let mut value = serde_json::to_value(&report).unwrap_or_default();
+            value["known_secret_prints"] = json!(known_prints);
+            println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+            eprintln!(
+                "{} : {} conversation(s), {} sans projet, {} secret(s) masqué(s).",
+                if report.applied { "Écrit" } else { "À blanc (--apply pour écrire)" },
+                report.conversations,
+                report.without_project,
+                report.secrets_masked
+            );
+        }
+        Err(error) => fail(error),
+    }
+}
+
 /// `--find-conversation "<query>" [--limit N]`
 pub fn run_find(args: &[String]) {
     let Some(query) = value_after(args, "--find-conversation") else {

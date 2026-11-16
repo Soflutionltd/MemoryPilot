@@ -31,14 +31,19 @@ pub const MAX_NOTES_CHARS: usize = 1_500;
 
 /// What the user actually typed in a turn.
 pub fn clean_user_text(raw: &str) -> String {
+    truncate_chars(&typed_text(raw), MAX_USER_CHARS)
+}
+
+/// `clean_user_text` at full length, for the archive.
+pub fn typed_text(raw: &str) -> String {
     if let Some(inner) = between(raw, "<user_query>", "</user_query>") {
-        return truncate_chars(inner.trim(), MAX_USER_CHARS);
+        return inner.trim().to_string();
     }
     let mut text = raw.to_string();
     for tag in INJECTED_BLOCKS {
         text = strip_block(&text, tag);
     }
-    truncate_chars(text.trim(), MAX_USER_CHARS)
+    text.trim().to_string()
 }
 
 pub fn truncate_chars(text: &str, max: usize) -> String {
