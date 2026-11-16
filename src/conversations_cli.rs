@@ -68,6 +68,10 @@ pub fn run_redact(args: &[String]) {
 /// `--apply` only counts. Cursor's store is opened immutable: Cursor must
 /// be closed, and nothing is ever written to it. No message is printed.
 ///
+/// `--archive-cursor --check-secrets`: says whether every stored
+/// credential can be read (exit 4 otherwise); `--apply` refuses to write
+/// when one cannot, since its value would not be masked.
+///
 /// `--archive-cursor --index`: records in the conversation index the
 /// project and folder the archive holds for each conversation (run it once
 /// the archive has been checked).
@@ -109,10 +113,33 @@ pub fn run_archive(args: &[String]) {
     };
     // Both sources of known values: the prints file and the credentials.
     let known_prints = memorypilot_core::secrets::reload_known_secrets();
+    // A credential the vault cannot open is a value the filter does not
+    // know: it would be archived in clear. Nothing is written then.
+    let (credentials, readable) = match memorypilot_core::layout::memory_db().map(|path| memorypilot_core::db::credentials_readable(&path)) {
+        Some(Ok(counts)) => counts,
+        Some(Err(error)) => fail(error),
+        None => fail("Cannot find home directory".to_string()),
+    };
+    let apply = args.iter().any(|a| a == "--apply");
+    if args.iter().any(|a| a == "--check-secrets") {
+        println!("{}", json!({ "credentials": credentials, "readable": readable, "known_secret_prints": known_prints }));
+        std::process::exit(if readable < credentials { 4 } else { 0 });
+    }
+    if readable < credentials {
+        let message = format!(
+            "{} des {} identifiants enregistrés sont illisibles (clé du coffre hors d'atteinte : Trousseau refusé ou sans réponse) : leurs valeurs ne seraient pas masquées.",
+            credentials - readable,
+            credentials
+        );
+        if apply {
+            fail(format!("{} Rien n'est écrit.", message));
+        }
+        eprintln!("⚠ {}", message);
+    }
     let options = archive::ArchiveOptions {
         store: &store_path,
         out_dir: &out_dir,
-        apply: args.iter().any(|a| a == "--apply"),
+        apply,
         home: dirs::home_dir().map(|home| home.to_string_lossy().into_owned()),
         known_project: &|folder| db.known_project_for_path(folder),
         remote_of: &|project| db.project_remote(project),
@@ -124,6 +151,7 @@ pub fn run_archive(args: &[String]) {
             let incomplete = !report.unreadable.is_empty();
             let mut value = serde_json::to_value(&report).unwrap_or_default();
             value["known_secret_prints"] = json!(known_prints);
+            value["credentials"] = json!({ "stored": credentials, "readable": readable });
             println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
             eprintln!(
                 "{} : {} conversation(s), {} sans projet, {} secret(s) masqué(s).",

@@ -1043,3 +1043,25 @@ fn sqlite_store_meets_the_memory_store_contract() {
     }
     cleanup_db_files(&path);
 }
+
+/// The archive refuses to write when a stored credential cannot be read:
+/// its value would not be masked.
+#[test]
+fn stored_credentials_are_counted_with_those_that_can_be_read() {
+    let path = temp_db_path("credentials-readable");
+    {
+        let db = Database::open_at(&path).expect("db");
+        assert_eq!(super::credentials_readable(&path).expect("count"), (0, 0));
+        db.add_memory("Mot de passe du tableau de bord : Tr0ub4dor&3xemple", "credential", None, &[], "test", 3, None, None, &MemoryScope::default())
+            .expect("credential");
+        db.add_memory("Le tableau de bord tourne sur le port 8443.", "fact", None, &[], "test", 3, None, None, &MemoryScope::default())
+            .expect("fact");
+        assert_eq!(super::credentials_readable(&path).expect("count"), (1, 1));
+        // A sealed credential whose ciphertext is gone can no longer be read.
+        db.conn
+            .execute("UPDATE memories SET content = ?1, metadata = '{}' WHERE kind = 'credential'", params![format!("{} libellé", super::SEAL_PREFIX)])
+            .expect("break");
+        assert_eq!(super::credentials_readable(&path).expect("count"), (1, 0));
+    }
+    cleanup_db_files(&path);
+}

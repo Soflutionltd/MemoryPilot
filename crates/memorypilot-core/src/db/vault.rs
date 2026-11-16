@@ -146,6 +146,21 @@ fn existing_key() -> Option<[u8; 32]> {
 /// Clear texts of the credentials of `db_path`, through a read-only
 /// connection: used to recognise their values elsewhere, never stored.
 /// Sealed credentials are left out when the key is unavailable.
+/// How many credentials the database holds, and how many of them can be
+/// read in clear right now (all of them unless the vault key is out of
+/// reach). A filter fed with fewer than all would let the others through.
+pub fn credentials_readable(db_path: &std::path::Path) -> Result<(usize, usize), String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open {}: {}", db_path.display(), e))?;
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories WHERE kind = 'credential'", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok((total as usize, credential_clear_texts(db_path)?.len()))
+}
+
 pub(crate) fn credential_clear_texts(db_path: &std::path::Path) -> Result<Vec<String>, String> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
