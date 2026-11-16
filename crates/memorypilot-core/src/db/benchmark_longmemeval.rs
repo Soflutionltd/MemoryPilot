@@ -844,6 +844,7 @@ impl Database {
             ann_warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         db.init_schema()?;
+        db.apply_migrations()?;
         Ok(db)
     }
 
@@ -878,6 +879,7 @@ impl Database {
             ann_warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         db.init_schema()?;
+        db.apply_migrations()?;
         Ok(db)
     }
 

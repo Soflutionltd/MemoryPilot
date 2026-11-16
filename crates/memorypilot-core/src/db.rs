@@ -69,6 +69,10 @@ pub(crate) use vault::{contains_secret_value, credential_clear_texts};
 mod transcript;
 #[path = "db/lifecycle.rs"]
 mod lifecycle;
+#[path = "db/git_identity.rs"]
+mod git_identity;
+#[path = "db/migrations.rs"]
+mod migrations;
 #[path = "db/projects.rs"]
 mod projects;
 #[path = "db/scope.rs"]
@@ -97,6 +101,7 @@ pub mod store_contract;
 pub use store::{GraphStore, MemoryStore, RecallStore};
 pub use memories::{add_memory_to, update_memory_in, WriteOutcome};
 pub use knowledge::rebuild_memory_links;
+pub use migrations::SCHEMA_VERSION;
 pub use search::{hybrid_search, ANN_BYPASS_THRESHOLD};
 pub use benchmark_fr::{fr_scenarios, score_fr_queries, FrScenario};
 use ranking::RankingSignals;

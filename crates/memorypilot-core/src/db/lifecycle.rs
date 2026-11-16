@@ -32,6 +32,7 @@ impl Database {
         };
         db.init_schema()?;
         db.upgrade_schema()?;
+        db.apply_migrations()?;
         db.normalize_project_identities()?;
         // If the user just swapped the embedding model (or upgraded
         // from an older default), the stored vectors no longer share
@@ -56,6 +57,7 @@ impl Database {
         let db = Self::open_maintenance(path)?;
         db.init_schema()?;
         db.upgrade_schema()?;
+        db.apply_migrations()?;
         db.normalize_project_identities()?;
         db.migrate_fts_to_stemmed()?;
         let count: i64 = db
