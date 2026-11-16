@@ -87,8 +87,8 @@ fn footprint(db: &Database, project: &str) -> [i64; 7] {
     ]
 }
 
-/// Two memories, one episode, one archived original and one triple under
-/// `project`.
+/// Two memories, one episode, one archived original and one triple
+/// extracted from the first memory, under `project`.
 fn seed_project(db: &Database, project: &str) -> Vec<String> {
     let kept = add(db, &format!("The {project} mail client syncs folders over IMAP IDLE."), "fact", project);
     let other = add(db, &format!("Decision for {project}: drafts are saved locally before upload."), "decision", project);
@@ -102,7 +102,7 @@ fn seed_project(db: &Database, project: &str) -> Vec<String> {
             params![Uuid::new_v4().to_string(), project, format!("Work session on {project}"), now],
         )
         .expect("episode");
-    db.add_triple(project, "written_in", "rust", None, None, Some(1.0), None).expect("triple");
+    db.add_triple(project, "written_in", "rust", None, None, Some(1.0), Some(&kept)).expect("triple");
     vec![kept, other]
 }
 
@@ -154,6 +154,7 @@ fn merge_dry_run_counts_every_table_and_changes_nothing() {
         [report.memories, report.memories_fts, report.episodes, report.memories_archive, report.project_entities, report.knowledge_triples],
         [2, 2, 1, 1, 2, 1]
     );
+    assert_eq!(report.knowledge_triples_left, 0);
     assert_eq!(report.backup, None);
     assert_eq!((footprint(&db, "ratatoskr"), footprint(&db, "courly")), before);
     assert!(workspace.backups().is_empty(), "a dry run takes no backup");
@@ -193,6 +194,81 @@ fn merge_moves_the_five_tables_and_the_graph_then_deletes_the_source() {
         .query_row("SELECT COUNT(*) FROM memories WHERE project = 'ratatoskr'", [], |row| row.get(0))
         .expect("backup content");
     assert_eq!(kept, 2);
+}
+
+#[test]
+fn triples_naming_the_source_from_elsewhere_are_left_alone() {
+    let workspace = Workspace::new("merge-triples");
+    let db = workspace.open();
+    // A project called like a language: the triple below is about the language.
+    let own = add(&db, "The swift project ships the iOS share extension.", "fact", "swift");
+    db.add_triple("swift", "has_target", "share extension", None, None, Some(1.0), Some(&own)).expect("own triple");
+    db.add_triple("swift", "is_a", "programming language", None, None, Some(1.0), None).expect("general triple");
+    seed_project(&db, "courly");
+
+    let dry = db.merge_projects("swift", "courly", true).expect("dry run");
+    assert_eq!((dry.knowledge_triples, dry.knowledge_triples_left), (1, 1));
+    db.merge_projects("swift", "courly", false).expect("merge");
+
+    let subject = |predicate: &str| -> String {
+        db.conn
+            .query_row("SELECT subject FROM knowledge_triples WHERE predicate = ?1", params![predicate], |row| row.get(0))
+            .expect("triple")
+    };
+    assert_eq!(subject("has_target"), "courly");
+    assert_eq!(subject("is_a"), "swift");
+}
+
+#[test]
+fn the_backup_of_the_latest_change_survives_the_retention() {
+    let workspace = Workspace::new("backup-retention");
+    let db = workspace.open();
+    seed_project(&db, "p0");
+    seed_project(&db, "courly");
+    // More renames than copies are kept, then a merge: its label sorts
+    // before "rename", its copy must still be the one that stays.
+    for step in 0..11 {
+        db.rename_project(&format!("p{step}"), &format!("p{}", step + 1), None, false).expect("rename");
+    }
+    let report = db.merge_projects("p11", "courly", false).expect("merge");
+
+    let backup = PathBuf::from(report.backup.expect("backup path"));
+    assert!(backup.is_file(), "the copy taken before the merge was pruned");
+    let mut kept = workspace.backups();
+    kept.sort();
+    assert_eq!(kept.len(), 10);
+    assert_eq!(kept.last(), Some(&backup));
+    assert!(kept.iter().all(|path| !path.to_string_lossy().contains("rename-p0-into-p1-") && !path.to_string_lossy().contains("rename-p1-into-p2-")), "the oldest copies go first");
+}
+
+#[test]
+fn vectors_carrying_the_project_name_are_queued_for_a_new_embedding() {
+    let workspace = Workspace::new("merge-reembed");
+    let db = workspace.open();
+    let chunk = add(&db, "user: the sync still drops the second folder after a reconnect.", "transcript", "ratatoskr");
+    add(&db, "Folders are synced one account at a time.", "fact", "ratatoskr");
+
+    let report = db.merge_projects("ratatoskr", "courly", false).expect("merge");
+
+    assert_eq!(report.reembed_queued, 1, "only the transcript is embedded under a [project; date] header");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE id = ?1 AND project = 'courly'", &chunk), 1);
+}
+
+#[test]
+fn the_remote_of_a_merged_project_still_leads_to_the_target() {
+    let workspace = Workspace::new("merge-remote");
+    let db = workspace.open();
+    let old_repository = workspace.repository("App/ratatoskr", "git@github.com:Acme/ratatoskr.git");
+    let new_repository = workspace.repository("App/courly", "git@github.com:Acme/courly.git");
+    db.register_project("ratatoskr", &old_repository.to_string_lossy(), None).expect("register");
+    db.register_project("courly", &new_repository.to_string_lossy(), None).expect("register");
+    add(&db, "The outbox retries a send three times.", "fact", "ratatoskr");
+    db.merge_projects("ratatoskr", "courly", false).expect("merge");
+    // A fresh clone of the old repository, in a folder named after neither.
+    let clone = workspace.repository("Elsewhere/mail-archive", "https://github.com/acme/ratatoskr");
+
+    assert_eq!(db.detect_project(&clone.to_string_lossy()).expect("detect").as_deref(), Some("courly"));
+    assert_eq!(db.list_projects().expect("projects").len(), 1);
 }
 
 #[test]
@@ -334,6 +410,15 @@ fn a_single_memory_moves_with_its_index_row_and_project_entity() {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM memory_entities WHERE memory_id = ?1 AND entity_kind = 'project'", &id), 0);
     assert_eq!(count(&db, "SELECT COUNT(*) FROM memories_fts WHERE project = '' AND rowid = (SELECT rowid FROM memories WHERE id = ?1)", &id), 1);
     assert!(db.move_memory_to_project("missing-id", Some("courly")).expect("move").is_none());
+
+    // An empty or unusable name never sends a memory to the global scope.
+    let back = db.move_memory_to_project(&id, Some("courly")).expect("move").expect("memory");
+    assert_eq!(back.project.as_deref(), Some("courly"));
+    for name in ["", "   ", "!!!", "none", "null"] {
+        let error = db.move_memory_to_project(&id, Some(name)).expect_err("must refuse");
+        assert!(error.contains("Invalid project name"), "{error}");
+    }
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE id = ?1 AND project = 'courly'", &id), 1);
 }
 
 #[test]

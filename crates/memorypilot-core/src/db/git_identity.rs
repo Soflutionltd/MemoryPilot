@@ -56,8 +56,15 @@ pub(super) fn origin_remote(root: &Path) -> Option<String> {
     for line in config.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            let section: String = line.chars().filter(|character| !character.is_whitespace()).collect();
-            in_origin = section.eq_ignore_ascii_case("[remote\"origin\"]");
+            let section: String = line
+                .split(']')
+                .next()
+                .unwrap_or(line)
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            // `[remote "origin"]`, and the older `[remote.origin]`.
+            in_origin = section.eq_ignore_ascii_case("[remote\"origin\"") || section.eq_ignore_ascii_case("[remote.origin");
             continue;
         }
         if !in_origin {
@@ -65,6 +72,8 @@ pub(super) fn origin_remote(root: &Path) -> Option<String> {
         }
         if let Some((key, value)) = line.split_once('=') {
             if key.trim().eq_ignore_ascii_case("url") {
+                // A comment may follow the value on the same line.
+                let value = value.split(" #").next().unwrap_or(value).split(" ;").next().unwrap_or(value);
                 return normalize_remote(value);
             }
         }
@@ -73,8 +82,10 @@ pub(super) fn origin_remote(root: &Path) -> Option<String> {
 }
 
 /// `host/owner/repository` in lower case, so the SSH and HTTPS spellings of
-/// one remote compare equal. Credentials, port and `.git` are dropped: a
-/// token written in a remote URL is never stored.
+/// one remote compare equal. Credentials, port, query and `.git` are
+/// dropped: a token written in a remote URL is never stored. Not resolved:
+/// `url.<base>.insteadOf` rewrites and SSH host aliases, which name the same
+/// remote differently.
 pub(super) fn normalize_remote(url: &str) -> Option<String> {
     let url = url.trim().trim_matches('"');
     if url.is_empty() {
@@ -84,14 +95,20 @@ pub(super) fn normalize_remote(url: &str) -> Option<String> {
         Some((_, rest)) => (rest, true),
         None => (url, false),
     };
+    // Everything up to the last `@` that is still followed by a path is
+    // credentials, whatever characters a password holds.
+    let rest = match rest.rsplit_once('@') {
+        Some((_, after)) if after.contains('/') || after.contains(':') => after,
+        _ => rest,
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
     let (host_part, path) = if has_scheme {
         rest.split_once('/')?
     } else {
         // `git@host:owner/repository`; anything else is a local path.
         rest.split_once(':').filter(|(host, _)| !host.contains('/'))?
     };
-    let host = host_part.rsplit_once('@').map(|(_, host)| host).unwrap_or(host_part);
-    let host = if has_scheme { host.split_once(':').map(|(host, _)| host).unwrap_or(host) } else { host };
+    let host = if has_scheme { host_part.split_once(':').map(|(host, _)| host).unwrap_or(host_part) } else { host_part };
     let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
     if host.is_empty() || path.is_empty() {
@@ -117,6 +134,29 @@ mod tests {
     fn credentials_in_a_remote_are_never_kept() {
         let normalized = normalize_remote("https://someone:s3cr3t-token@github.com/acme/widget.git").expect("remote");
         assert_eq!(normalized, "github.com/acme/widget");
+    }
+
+    #[test]
+    fn a_password_holding_a_slash_leaves_no_trace() {
+        let normalized = normalize_remote("https://someone:pa/ss@example.com/acme/widget.git").expect("remote");
+        assert_eq!(normalized, "example.com/acme/widget");
+        assert_eq!(normalize_remote("https://github.com/acme/widget.git?ref=main").as_deref(), Some("github.com/acme/widget"));
+    }
+
+    #[test]
+    fn origin_is_read_through_comments_and_the_old_section_syntax() {
+        let root = std::env::temp_dir().join(format!("memory-pilot-git-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).expect("repository");
+        for config in [
+            "[remote \"upstream\"]\n\turl = git@github.com:other/thing.git\n[remote \"origin\"] # main\r\n\turl = https://github.com/Acme/Widget.git # mirror\r\n",
+            "[remote.origin]\n  URL = git@github.com:acme/widget.git ; mirror\n",
+        ] {
+            std::fs::write(root.join(".git/config"), config).expect("config");
+            assert_eq!(origin_remote(&root).as_deref(), Some("github.com/acme/widget"), "{config}");
+        }
+        std::fs::write(root.join(".git/config"), "[core]\n\tbare = false\n").expect("config");
+        assert_eq!(origin_remote(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

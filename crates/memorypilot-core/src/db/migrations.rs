@@ -15,7 +15,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
          CREATE INDEX idx_projects_remote ON projects(remote) WHERE remote IS NOT NULL;
          CREATE TABLE project_aliases (
              alias TEXT NOT NULL,
-             kind TEXT NOT NULL CHECK (kind IN ('name', 'path')),
+             kind TEXT NOT NULL CHECK (kind IN ('name', 'path', 'remote')),
              project TEXT NOT NULL,
              created_at TEXT NOT NULL,
              PRIMARY KEY (kind, alias)

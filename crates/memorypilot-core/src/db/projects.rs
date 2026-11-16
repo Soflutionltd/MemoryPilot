@@ -216,8 +216,9 @@ impl Database {
             .ok()
     }
 
-    /// The project registered with this remote; the one holding the most
-    /// memories when several share it (get_memory_health reports those).
+    /// The project registered with this remote, or the one a merged project
+    /// had it; the one holding the most memories when several share it
+    /// (get_memory_health reports those).
     fn project_for_remote(&self, remote: &str) -> Option<String> {
         self.conn
             .query_row(
@@ -229,9 +230,11 @@ impl Database {
                 |row| row.get(0),
             )
             .ok()
+            .or_else(|| self.project_for_alias("remote", remote))
     }
 
-    /// Records that `alias` (an old name or an old path) means `project`.
+    /// Records that `alias` (an old name, an old path or the remote of a
+    /// merged project) means `project`.
     /// A name or a path a live project still uses is never an alias.
     pub(super) fn add_project_alias(
         conn: &Connection,
@@ -536,8 +539,10 @@ impl Database {
 
     /// The project a working directory belongs to, in this order: a
     /// registered folder, a folder the project used to live in, the `origin`
-    /// remote of the repository, then the name the folder goes by (old names
-    /// follow their alias). A linked worktree answers for its main repository.
+    /// remote of the repository, then the name the folder goes by. An old
+    /// name follows its alias even when a project was created under it
+    /// again: that keeps a duplicate from growing, and get_memory_health
+    /// reports the pair. A linked worktree answers for its main repository.
     pub fn detect_project(&self, working_dir: &str) -> Result<Option<String>, String> {
         let normalized_dir = Self::normalize_path(working_dir);
         if normalized_dir.is_empty() {

@@ -308,7 +308,7 @@ fn all_tool_definitions() -> Value {
                     "tags": { "type": ["array","null"], "items": { "type": "string" } },
                     "importance": { "type": ["integer","null"], "minimum": 1, "maximum": 5 },
                     "expires_at": { "type": ["string","null"] },
-                    "project": { "type": ["string","null"], "description": "Move the memory to this project (\"global\" for the global scope). Omitted or null: unchanged." },
+                    "project": { "type": ["string","null"], "description": "Move the memory to this project (\"global\" for the global scope). Omitted or null: unchanged; an empty name is refused." },
                     "location": { "type": ["string","null"], "description": "Where the value of a credential lives, e.g. \"1Password, Team vault, item Admin\" or an op:// reference" }
                 },
                 "required": ["id"]
@@ -386,7 +386,7 @@ fn all_tool_definitions() -> Value {
         },
         {
             "name": "merge_projects",
-            "description": "Fold project `source` into project `target`: memories, full-text index, episodes, archived originals and knowledge graph move in one transaction, then `source` is deleted and stays known as an alias of `target`. Run with dry_run first: it returns the counts per table and changes nothing. A copy of the database is taken before the real run (path in `backup`). Memories with the same text on both sides are both kept.",
+            "description": "Fold project `source` into project `target`: memories, full-text index, episodes, archived originals, project entities and the triples extracted from its memories move in one transaction (triples naming it from elsewhere are left and counted in knowledge_triples_left), then `source` is deleted and stays known as an alias of `target`. Run with dry_run first: it returns the counts per table and changes nothing. A copy of the database is taken before the real run (path in `backup`). Memories with the same text on both sides are both kept.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1691,14 +1691,13 @@ fn handle_update(db: &Database, args: &Value) -> Value {
         },
         _ => None,
     };
-    if let Some(project) = args.get("project").and_then(|v| v.as_str()) {
-        match db.move_memory_to_project(id, Some(project)) {
-            Ok(Some(_)) => {}
-            Ok(None) => return tool_error(&format!("Not found: {}", id)),
-            Err(e) => return tool_error(&e),
-        }
+    // Checked before anything is written: a bad name must not leave the
+    // other fields updated.
+    let project = args.get("project").and_then(|v| v.as_str());
+    if let Some(Err(e)) = project.map(Database::project_target) {
+        return tool_error(&e);
     }
-    match db.update_memory_full(
+    let updated = db.update_memory_full(
         id,
         content,
         kind,
@@ -1706,7 +1705,12 @@ fn handle_update(db: &Database, args: &Value) -> Value {
         importance,
         expires_at,
         metadata.as_ref(),
-    ) {
+    );
+    let moved = match (updated, project) {
+        (Ok(Some(_)), Some(project)) => db.move_memory_to_project(id, Some(project)),
+        (updated, _) => updated,
+    };
+    match moved {
         Ok(Some(mem)) => tool_result(&serde_json::to_string_pretty(&mem).unwrap()),
         Ok(None) => tool_error(&format!("Not found: {}", id)),
         Err(e) => tool_error(&e),

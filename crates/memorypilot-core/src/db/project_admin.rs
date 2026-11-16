@@ -3,7 +3,9 @@
 //! A project name is stored in `memories`, `memories_fts`, `episodes`,
 //! `memories_archive`, the `project` entities of the knowledge graph,
 //! `knowledge_triples` and `projects`: every change here covers them all in
-//! one transaction, after a copy of the database has been taken.
+//! one transaction, after a copy of the database has been taken. The
+//! conversation index (`conversations.db`) is not covered: its project
+//! column is derived from each conversation's working folder.
 //!
 //! The vector index (`memory.db.ann.usearch`) is keyed by memory id and the
 //! query cache (`memory.db.query_cache.sqlite`) by the hash of the query
@@ -18,6 +20,12 @@ use rusqlite::TransactionBehavior;
 const PROJECT_BACKUPS_KEPT: usize = 10;
 const PROJECT_BACKUP_PREFIX: &str = "memory-before-project-";
 
+/// A triple whose subject or object is the project `?1`. `add_triple`
+/// lower-cases names and writes spaces as underscores.
+const TRIPLE_NAMES_SOURCE: &str = "(lower(trim(subject)) IN (?1, replace(?1, '-', '_')) OR lower(trim(object)) IN (?1, replace(?1, '-', '_')))";
+/// A triple extracted from a memory of the project `?1`.
+const TRIPLE_FROM_SOURCE: &str = "COALESCE(source_memory_id IN (SELECT id FROM memories WHERE project = ?1), 0)";
+
 /// What a merge or a rename moves (dry run) or moved, per table.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectMoveReport {
@@ -30,7 +38,12 @@ pub struct ProjectMoveReport {
     pub episodes: i64,
     pub memories_archive: i64,
     pub project_entities: i64,
+    /// Triples naming the source that come from one of its memories: renamed.
     pub knowledge_triples: i64,
+    /// Triples naming the source that come from elsewhere (kg_add, another
+    /// project's memory): left as they are, the name may mean something
+    /// else there ("swift" the language, not the project).
+    pub knowledge_triples_left: i64,
     pub aliases: i64,
     /// Merge only: memories whose text already exists in the target. Both
     /// copies are kept; `consolidate_memories` folds them on request.
@@ -100,9 +113,11 @@ impl Database {
                 &[&source],
             )?,
             knowledge_triples: self.count(
-                "SELECT COUNT(*) FROM knowledge_triples
-                 WHERE lower(trim(subject)) IN (?1, replace(?1, '-', '_'))
-                    OR lower(trim(object)) IN (?1, replace(?1, '-', '_'))",
+                &format!("SELECT COUNT(*) FROM knowledge_triples WHERE {TRIPLE_NAMES_SOURCE} AND {TRIPLE_FROM_SOURCE}"),
+                &[&source],
+            )?,
+            knowledge_triples_left: self.count(
+                &format!("SELECT COUNT(*) FROM knowledge_triples WHERE {TRIPLE_NAMES_SOURCE} AND NOT {TRIPLE_FROM_SOURCE}"),
                 &[&source],
             )?,
             aliases: self.count("SELECT COUNT(*) FROM project_aliases WHERE project = ?1", &[&source])?,
@@ -158,8 +173,9 @@ impl Database {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .map_err(|error| format!("{}: {}", dir.display(), error))?;
         }
-        let stamp = Utc::now().format("%Y%m%d-%H%M%S%3f");
-        let target = dir.join(format!("{}{}-{}.db", PROJECT_BACKUP_PREFIX, label, stamp));
+        // Timestamp first: the names sort by age whatever the operation.
+        let stamp = Utc::now().format("%Y%m%d-%H%M%S%6f");
+        let target = dir.join(format!("{}{}-{}.db", PROJECT_BACKUP_PREFIX, stamp, label));
         self.conn
             .execute("VACUUM INTO ?1", params![target.to_string_lossy()])
             .map_err(|error| format!("Database backup to {}: {}", target.display(), error))?;
@@ -183,7 +199,6 @@ impl Database {
                     .collect()
             })
             .unwrap_or_default();
-        // The timestamp in the name sorts them by age.
         copies.sort();
         let excess = copies.len().saturating_sub(PROJECT_BACKUPS_KEPT);
         for old in copies.into_iter().take(excess) {
@@ -321,6 +336,17 @@ impl Database {
             ),
             &[&source],
         )?;
+        // Triples follow only when they come from the project's own memories,
+        // and before those memories change project.
+        for column in ["subject", "object"] {
+            step(
+                &format!(
+                    "UPDATE knowledge_triples SET {column} = ?2
+                     WHERE lower(trim({column})) IN (?1, replace(?1, '-', '_')) AND {TRIPLE_FROM_SOURCE}"
+                ),
+                &[&source, &target],
+            )?;
+        }
         step("UPDATE memories SET project = ?2 WHERE project = ?1", &[&source, &target])?;
         step("UPDATE episodes SET project = ?2 WHERE project = ?1", &[&source, &target])?;
         step("UPDATE memories_archive SET project = ?2 WHERE project = ?1", &[&source, &target])?;
@@ -335,18 +361,6 @@ impl Database {
             "UPDATE memory_entities SET entity_value = ?2 WHERE entity_kind = 'project' AND lower(entity_value) = ?1",
             &[&source, &target],
         )?;
-        // Triples spell a multi-word name with underscores, projects with hyphens.
-        step(
-            "UPDATE knowledge_triples SET subject = replace(?2, '-', '_')
-             WHERE lower(trim(subject)) IN (?1, replace(?1, '-', '_'))",
-            &[&source, &target],
-        )?;
-        step(
-            "UPDATE knowledge_triples SET object = replace(?2, '-', '_')
-             WHERE lower(trim(object)) IN (?1, replace(?1, '-', '_'))",
-            &[&source, &target],
-        )?;
-
         step(
             "INSERT INTO projects (name, path, description, remote, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(name) DO UPDATE SET
@@ -356,6 +370,11 @@ impl Database {
         )?;
         step("UPDATE project_aliases SET project = ?2 WHERE project = ?1", &[&source, &target])?;
         Self::add_project_alias(&transaction, "name", source, target)?;
+        for former_remote in [&source_row.remote, &target_row.remote].into_iter().flatten() {
+            if Some(former_remote) != final_remote.as_ref() {
+                Self::add_project_alias(&transaction, "remote", former_remote, target)?;
+            }
+        }
         for former_path in [&source_row.path, &target_row.path] {
             if *former_path != final_path {
                 Self::add_project_alias(&transaction, "path", former_path, target)?;
@@ -396,14 +415,30 @@ impl Database {
         queued
     }
 
-    /// Moves one memory to another project (`None`: the global scope),
+    /// The project a caller names as a destination: `Some(slug)`, or `None`
+    /// for the word "global". An empty or unusable name is refused: it must
+    /// never send a memory to the global scope by accident.
+    pub fn project_target(name: &str) -> Result<Option<String>, String> {
+        if name.trim().eq_ignore_ascii_case("global") {
+            return Ok(None);
+        }
+        match Self::canonical_project_name(name) {
+            Some(slug) => Ok(Some(slug)),
+            None => Err(format!("Invalid project name {:?}: give a project name, or \"global\" for the global scope", name)),
+        }
+    }
+
+    /// Moves one memory to another project (`None` or "global": the global scope),
     /// keeping the full-text index and the project entity in step. Returns
     /// `None` when the memory does not exist.
     pub fn move_memory_to_project(&self, id: &str, project: Option<&str>) -> Result<Option<Memory>, String> {
         let Some(mut memory) = self.fetch_memory(id)? else {
             return Ok(None);
         };
-        let target = Self::canonical_project(project);
+        let target = match project {
+            Some(name) => Self::project_target(name)?,
+            None => None,
+        };
         if memory.project == target {
             return Ok(Some(memory));
         }
@@ -464,7 +499,6 @@ impl Database {
     /// whose project entity is another project's or is missing.
     pub fn project_hygiene_report(&self) -> Result<serde_json::Value, String> {
         use serde_json::json;
-        self.refresh_project_remotes();
         let memory_count = |project: &str| -> i64 {
             self.count("SELECT COUNT(*) FROM memories WHERE project = ?1", &[&project]).unwrap_or(0)
         };
