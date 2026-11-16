@@ -41,6 +41,8 @@ toml = "1.1.8"
 yaml-rust2 = "0.13.0"
 # Prints of redacted secrets (src/secrets.rs), same crate as the updater.
 sha2 = "0.11"
+# OpenAI-compatible chat client (src/llm.rs), same crate as the updater.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [features]
 # Exposes `db::store_contract`, the checks other `MemoryStore` and

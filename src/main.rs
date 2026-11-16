@@ -622,12 +622,48 @@ fn run_benchmark_search(args: &[String]) {
     }
 }
 
+/// `--e2e` settings: models and endpoint from flags, the API key from
+/// MEMORYPILOT_LLM_API_KEY or OPENAI_API_KEY (required unless the endpoint
+/// is a plain-http loopback server such as Ollama or LM Studio).
+fn longmemeval_end_to_end_options(args: &[String]) -> Result<db::EndToEndOptions, String> {
+    let flag = |name: &str| -> Result<Option<String>, String> {
+        match args.iter().position(|a| a == name) {
+            None => Ok(None),
+            Some(index) => args
+                .get(index + 1)
+                .filter(|value| !value.starts_with("--"))
+                .map(|value| Some(value.clone()))
+                .ok_or_else(|| format!("{} needs a value", name)),
+        }
+    };
+    let base_url = flag("--llm-base-url")?
+        .unwrap_or_else(|| memorypilot_core::llm::DEFAULT_BASE_URL.to_string());
+    let judge_model = flag("--judge-model")?.unwrap_or_else(|| db::OFFICIAL_JUDGE_MODEL.to_string());
+    let answer_model = flag("--answer-model")?.unwrap_or_else(|| judge_model.clone());
+    let api_key = ["MEMORYPILOT_LLM_API_KEY", "OPENAI_API_KEY"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()));
+    if api_key.is_none() && !base_url.trim().starts_with("http://") {
+        return Err(format!(
+            "--e2e against {} needs an API key in MEMORYPILOT_LLM_API_KEY or OPENAI_API_KEY",
+            base_url
+        ));
+    }
+    Ok(db::EndToEndOptions {
+        base_url,
+        api_key,
+        answer_model,
+        judge_model,
+        chain_of_thought: args.iter().any(|a| a == "--cot"),
+    })
+}
+
 fn run_benchmark_longmemeval(args: &[String]) {
     eprintln!("[LongMemEval] Starting benchmark runner...");
     eprintln!("Embedding engine: {}", embedding::model_label());
     let dataset_path = args
         .windows(2)
-        .find(|w| w[0] == "--benchmark-longmemeval")
+        .find(|w| w[0] == "--benchmark-longmemeval" && !w[1].starts_with("--"))
         .map(|w| w[1].as_str())
         .unwrap_or("benchmarks/longmemeval_s_cleaned.json");
     let limit = args
@@ -642,9 +678,21 @@ fn run_benchmark_longmemeval(args: &[String]) {
         .windows(2)
         .find(|w| w[0] == "--min-r5")
         .and_then(|w| parse_percent(&w[1]));
+    let end_to_end = if args.iter().any(|a| a == "--e2e") {
+        match longmemeval_end_to_end_options(args) {
+            Ok(options) => Some(options),
+            Err(error) => {
+                eprintln!("✗ {}", error);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
     let options = db::LongMemEvalOptions {
         limit,
         reader: args.iter().any(|a| a == "--reader"),
+        end_to_end,
     };
     match db::Database::benchmark_longmemeval(dataset_path, options) {
         Ok(report) => {
@@ -1238,7 +1286,11 @@ fn print_help() {
     println!("  MemoryPilot --rollback-update NAME  Put back the previous copy of a vendor skill or plugin; the version undone is not installed again");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
-    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT]  LongMemEval retrieval benchmark");
+    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e]  LongMemEval retrieval benchmark");
+    println!("      --reader  Extractive reader on the top 5, SQuAD-style exact match / F1 against the gold answer");
+    println!("      --e2e     End-to-end accuracy: an LLM answers from the top 10, an LLM judge grades it (official LongMemEval prompts)");
+    println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot]", db::OFFICIAL_JUDGE_MODEL);
+    println!("                API key from MEMORYPILOT_LLM_API_KEY or OPENAI_API_KEY; not needed for an http://localhost endpoint");
     println!("  MemoryPilot --benchmark-fr [--min-r5 PCT]  French retrieval benchmark (30 in-memory scenarios)");
     println!("  MemoryPilot --benchmark-concurrency [--clients N] [--queries-per-client N] [--seed-memories N]  Multi-client concurrent search throughput");
     println!("  MemoryPilot --benchmark-latency [--queries N] [--seed-memories N] [--db PATH]  Cold/warm search latency");

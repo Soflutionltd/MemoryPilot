@@ -16,6 +16,56 @@ pub struct LongMemEvalOptions {
     /// Run the extractive reader on the top-5 passages and score the
     /// answer string against the gold answer.
     pub reader: bool,
+    /// End-to-end QA: an LLM answers from the retrieved turns and an LLM
+    /// judge grades the answer, with the official LongMemEval prompts.
+    pub end_to_end: Option<EndToEndOptions>,
+}
+
+/// Settings of the end-to-end evaluation (see [`crate::llm`]).
+#[derive(Clone)]
+pub struct EndToEndOptions {
+    /// OpenAI-compatible base URL, e.g. `https://api.openai.com/v1`.
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub answer_model: String,
+    pub judge_model: String,
+    /// Official "Answer step by step" variant of the generation prompt.
+    pub chain_of_thought: bool,
+}
+
+impl std::fmt::Debug for EndToEndOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndToEndOptions")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("answer_model", &self.answer_model)
+            .field("judge_model", &self.judge_model)
+            .field("chain_of_thought", &self.chain_of_thought)
+            .finish()
+    }
+}
+
+/// The judge model of the official LongMemEval evaluation.
+pub const OFFICIAL_JUDGE_MODEL: &str = "gpt-4o-2024-08-06";
+
+/// One question graded by the LLM judge.
+struct EndToEndOutcome {
+    question_type: String,
+    abstention: bool,
+    correct: bool,
+}
+
+/// Running totals of the end-to-end evaluation.
+#[derive(Default)]
+struct EndToEndTotals {
+    outcomes: Vec<EndToEndOutcome>,
+    answer_prompt_tokens: u64,
+    answer_completion_tokens: u64,
+    judge_prompt_tokens: u64,
+    judge_completion_tokens: u64,
+    llm_ms: f64,
+    hypotheses: Vec<serde_json::Value>,
+    failures: Vec<serde_json::Value>,
 }
 
 /// Per-question outcome, accumulated into the report.
@@ -55,6 +105,14 @@ impl Database {
 
         let total = entries.len();
         eprintln!("[LongMemEval] {} questions loaded", total);
+
+        // Built before the slow embedding phase so a bad URL fails at once.
+        let chat = options
+            .end_to_end
+            .as_ref()
+            .map(|e2e| crate::llm::ChatClient::new(&e2e.base_url, e2e.api_key.clone()))
+            .transpose()?;
+        let mut e2e_totals = EndToEndTotals::default();
 
         let is_abstention = |entry: &serde_json::Value| {
             entry
@@ -251,6 +309,7 @@ impl Database {
                 }
             };
 
+            let haystack = haystack_turns(entry);
             let mut turn_count = 0usize;
             {
                 let tx = match db.conn.transaction() {
@@ -261,7 +320,7 @@ impl Database {
                     }
                 };
 
-                for turn in haystack_turns(entry) {
+                for turn in &haystack {
                     let emb = match embedding_cache.get(&turn.key) {
                         Some(e) => e,
                         None => continue,
@@ -352,6 +411,66 @@ impl Database {
             } else {
                 None
             };
+
+            if let (Some(chat), Some(e2e)) = (chat.as_ref(), options.end_to_end.as_ref()) {
+                let by_key: HashMap<&str, &HaystackTurn> =
+                    haystack.iter().map(|turn| (turn.key.as_str(), turn)).collect();
+                let retrieved: Vec<&HaystackTurn> = results
+                    .iter()
+                    .filter_map(|result| by_key.get(result.memory.id.as_str()).copied())
+                    .collect();
+                let question_id = entry.get("question_id").and_then(|v| v.as_str()).unwrap_or("");
+                let item = EndToEndQuestion {
+                    question_type,
+                    question,
+                    question_date: question_date.unwrap_or(""),
+                    gold_answer: &gold_answer,
+                    abstention: *is_abs,
+                };
+                let graded = Self::lme_end_to_end(chat, e2e, &retrieved, &item);
+                let (hypothesis, correct, usage) = match graded {
+                    Ok(graded) => graded,
+                    Err(error) => {
+                        cleanup_lme_db(&tmp_path);
+                        return Err(format!("end-to-end evaluation failed on question {} ({}): {}", qi + 1, question_id, error));
+                    }
+                };
+                e2e_totals.answer_prompt_tokens += usage.answer_prompt_tokens;
+                e2e_totals.answer_completion_tokens += usage.answer_completion_tokens;
+                e2e_totals.judge_prompt_tokens += usage.judge_prompt_tokens;
+                e2e_totals.judge_completion_tokens += usage.judge_completion_tokens;
+                e2e_totals.llm_ms += usage.elapsed_ms;
+                if !correct && e2e_totals.failures.len() < 60 {
+                    e2e_totals.failures.push(json!({
+                        "question_id": question_id,
+                        "question_type": question_type,
+                        "abstention": *is_abs,
+                        "question": question,
+                        "gold": gold_answer,
+                        "hypothesis": hypothesis,
+                    }));
+                }
+                e2e_totals.hypotheses.push(json!({
+                    "question_id": question_id,
+                    "hypothesis": hypothesis,
+                    "autoeval_label": correct,
+                }));
+                e2e_totals.outcomes.push(EndToEndOutcome {
+                    question_type: question_type.to_string(),
+                    abstention: *is_abs,
+                    correct,
+                });
+                let graded_count = e2e_totals.outcomes.len();
+                if graded_count % 10 == 0 {
+                    let right = e2e_totals.outcomes.iter().filter(|o| o.correct).count();
+                    eprintln!(
+                        "[LongMemEval] end-to-end {}/{}: accuracy {:.1}%",
+                        graded_count,
+                        selected.len(),
+                        right as f64 / graded_count as f64 * 100.0
+                    );
+                }
+            }
 
             if *is_abs {
                 let reader_abstained = reader_verdict.as_ref().map(|verdict| verdict.is_none());
@@ -587,7 +706,38 @@ impl Database {
             report["qa"] = qa;
         }
 
+        if let Some(e2e) = options.end_to_end.as_ref() {
+            report["end_to_end"] = end_to_end_report(e2e, &e2e_totals, selected.len());
+        }
+
         Ok(report)
+    }
+
+    /// Answers `question` from the retrieved turns, then has the judge
+    /// grade the answer. Returns the hypothesis, the verdict and the usage.
+    fn lme_end_to_end(
+        chat: &crate::llm::ChatClient,
+        e2e: &EndToEndOptions,
+        retrieved: &[&HaystackTurn],
+        item: &EndToEndQuestion<'_>,
+    ) -> Result<(String, bool, EndToEndUsage), String> {
+        // Resolved first: an unknown question type costs no answer tokens.
+        let judge_template = e2e_judge_template(item.question_type, item.abstention)?;
+        let start = std::time::Instant::now();
+        let history = e2e_history(retrieved);
+        let answer_prompt = e2e_answer_prompt(&history, item.question_date, item.question, e2e.chain_of_thought);
+        let max_tokens = if e2e.chain_of_thought { 800 } else { 500 };
+        let answer = chat.complete(&e2e.answer_model, &answer_prompt, max_tokens)?;
+        let judge_prompt = fill_template(judge_template, &[item.question, item.gold_answer, &answer.text]);
+        let verdict = chat.complete(&e2e.judge_model, &judge_prompt, 10)?;
+        let usage = EndToEndUsage {
+            answer_prompt_tokens: answer.prompt_tokens,
+            answer_completion_tokens: answer.completion_tokens,
+            judge_prompt_tokens: verdict.prompt_tokens,
+            judge_completion_tokens: verdict.completion_tokens,
+            elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+        };
+        Ok((answer.text, judge_says_yes(&verdict.text), usage))
     }
 
     fn lme_temporal_prefix(session_date: Option<&str>, question_date: Option<&str>) -> String {
@@ -750,6 +900,10 @@ struct HaystackTurn {
     key: String,
     text: String,
     session_day: Option<NaiveDateTime>,
+    /// Raw `haystack_dates` value, as the official generation prompt shows it.
+    session_date: String,
+    role: String,
+    content: String,
 }
 
 /// Every non-empty turn of a question's haystack, with the same
@@ -785,6 +939,9 @@ fn haystack_turns(entry: &serde_json::Value) -> Vec<HaystackTurn> {
                 key: format!("{}__t{}", sid, ti),
                 text: format!("{}{}: {}", temporal_prefix, role, content),
                 session_day,
+                session_date: session_date.unwrap_or("").to_string(),
+                role: role.to_string(),
+                content: content.to_string(),
             });
         }
     }
@@ -810,6 +967,153 @@ fn percentiles(sorted: &[f32]) -> serde_json::Value {
         (sorted[index] as f64 * 1000.0).round() / 1000.0
     };
     json!({ "p10": at(0.10), "p25": at(0.25), "p50": at(0.50), "p75": at(0.75), "p90": at(0.90) })
+}
+
+// ─── End-to-end QA with an LLM judge ────────────────────────────────
+//
+// Prompts copied verbatim from the official LongMemEval repository
+// (github.com/xiaowu0162/LongMemEval, MIT licence):
+// src/generation/run_generation.py (history-chats variant) and
+// src/evaluation/evaluate_qa.py (get_anscheck_prompt).
+
+const E2E_ANSWER_PROMPT: &str = "I will give you several history chats between you and a user. Please answer the question based on the relevant chat history.\n\n\nHistory Chats:\n\n{}\n\nCurrent Date: {}\nQuestion: {}\nAnswer:";
+const E2E_ANSWER_PROMPT_COT: &str = "I will give you several history chats between you and a user. Please answer the question based on the relevant chat history. Answer the question step by step: first extract all the relevant information, and then reason over the information to get the answer.\n\n\nHistory Chats:\n\n{}\n\nCurrent Date: {}\nQuestion: {}\nAnswer (step by step):";
+
+const JUDGE_DEFAULT: &str = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.";
+const JUDGE_TEMPORAL: &str = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. In addition, do not penalize off-by-one errors for the number of days. If the question asks for the number of days/weeks/months, etc., and the model makes off-by-one errors (e.g., predicting 19 days when the answer is 18), the model's response is still correct. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.";
+const JUDGE_KNOWLEDGE_UPDATE: &str = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response contains some previous information along with an updated answer, the response should be considered as correct as long as the updated answer is the required answer.\n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.";
+const JUDGE_PREFERENCE: &str = "I will give you a question, a rubric for desired personalized response, and a response from a model. Please answer yes if the response satisfies the desired response. Otherwise, answer no. The model does not need to reflect all the points in the rubric. The response is correct as long as it recalls and utilizes the user's personal information correctly.\n\nQuestion: {}\n\nRubric: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.";
+const JUDGE_ABSTENTION: &str = "I will give you an unanswerable question, an explanation, and a response from a model. Please answer yes if the model correctly identifies the question as unanswerable. The model could say that the information is incomplete, or some other information is given but the asked information is not.\n\nQuestion: {}\n\nExplanation: {}\n\nModel Response: {}\n\nDoes the model correctly identify the question as unanswerable? Answer yes or no only.";
+
+/// The fields of one question the end-to-end step needs.
+struct EndToEndQuestion<'a> {
+    question_type: &'a str,
+    question: &'a str,
+    question_date: &'a str,
+    gold_answer: &'a str,
+    abstention: bool,
+}
+
+/// Token counts and wall time of one answered and judged question.
+struct EndToEndUsage {
+    answer_prompt_tokens: u64,
+    answer_completion_tokens: u64,
+    judge_prompt_tokens: u64,
+    judge_completion_tokens: u64,
+    elapsed_ms: f64,
+}
+
+/// Fills each `{}` of `template` with the next value, in one pass, so a
+/// value that itself contains `{}` is never substituted again.
+fn fill_template(template: &str, values: &[&str]) -> String {
+    let mut parts = template.split("{}");
+    let mut filled = parts.next().unwrap_or("").to_string();
+    for (index, part) in parts.enumerate() {
+        filled.push_str(values.get(index).copied().unwrap_or(""));
+        filled.push_str(part);
+    }
+    filled
+}
+
+/// Retrieved turns in the official `flat-turn` / `nl` layout, oldest first.
+fn e2e_history(retrieved: &[&HaystackTurn]) -> String {
+    let mut ordered: Vec<&HaystackTurn> = retrieved.to_vec();
+    ordered.sort_by_key(|turn| turn.session_day);
+    ordered
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| {
+            format!(
+                "\n### Session {}:\nSession Date: {}\nSession Content:\n{}: {}\n",
+                index + 1,
+                turn.session_date,
+                turn.role,
+                turn.content.trim()
+            )
+        })
+        .collect()
+}
+
+fn e2e_answer_prompt(history: &str, question_date: &str, question: &str, chain_of_thought: bool) -> String {
+    let template = if chain_of_thought { E2E_ANSWER_PROMPT_COT } else { E2E_ANSWER_PROMPT };
+    fill_template(template, &[history, question_date, question])
+}
+
+/// The official judge prompt for a question type; unknown types are an
+/// error, as in the reference implementation.
+fn e2e_judge_template(question_type: &str, abstention: bool) -> Result<&'static str, String> {
+    if abstention {
+        return Ok(JUDGE_ABSTENTION);
+    }
+    match question_type {
+        "single-session-user" | "single-session-assistant" | "multi-session" => Ok(JUDGE_DEFAULT),
+        "temporal-reasoning" => Ok(JUDGE_TEMPORAL),
+        "knowledge-update" => Ok(JUDGE_KNOWLEDGE_UPDATE),
+        "single-session-preference" => Ok(JUDGE_PREFERENCE),
+        other => Err(format!("no official judge prompt for question type '{}'", other)),
+    }
+}
+
+/// The reference implementation's rule: `'yes' in response.lower()`.
+fn judge_says_yes(verdict: &str) -> bool {
+    verdict.to_lowercase().contains("yes")
+}
+
+fn e2e_accuracy(outcomes: &[&EndToEndOutcome]) -> serde_json::Value {
+    if outcomes.is_empty() {
+        return json!("n/a");
+    }
+    let correct = outcomes.iter().filter(|o| o.correct).count();
+    json!(format!(
+        "{}/{} ({:.1}%)",
+        correct,
+        outcomes.len(),
+        correct as f64 / outcomes.len() as f64 * 100.0
+    ))
+}
+
+fn end_to_end_report(e2e: &EndToEndOptions, totals: &EndToEndTotals, selected: usize) -> serde_json::Value {
+    let all: Vec<&EndToEndOutcome> = totals.outcomes.iter().collect();
+    let answerable: Vec<&EndToEndOutcome> = all.iter().copied().filter(|o| !o.abstention).collect();
+    let abstention: Vec<&EndToEndOutcome> = all.iter().copied().filter(|o| o.abstention).collect();
+    // Grouped by question_type with abstention questions included, as the
+    // official evaluate_qa.py does.
+    let mut types: Vec<&str> = all.iter().map(|o| o.question_type.as_str()).collect();
+    types.sort();
+    types.dedup();
+    let by_type: serde_json::Map<String, serde_json::Value> = types
+        .into_iter()
+        .map(|question_type| {
+            let items: Vec<&EndToEndOutcome> =
+                all.iter().copied().filter(|o| o.question_type == question_type).collect();
+            (question_type.to_string(), e2e_accuracy(&items))
+        })
+        .collect();
+    let graded = all.len().max(1) as f64;
+    json!({
+        "protocol": "official LongMemEval prompts (run_generation.py history-chats, evaluate_qa.py judge); retrieved turns in flat-turn layout",
+        "context": "top-10 turns returned by MemoryPilot search, oldest session first",
+        "base_url": e2e.base_url,
+        "answer_model": e2e.answer_model,
+        "judge_model": e2e.judge_model,
+        "official_judge": e2e.judge_model == OFFICIAL_JUDGE_MODEL,
+        "chain_of_thought": e2e.chain_of_thought,
+        "questions_selected": selected,
+        "questions_graded": all.len(),
+        "accuracy": e2e_accuracy(&all),
+        "accuracy_answerable": e2e_accuracy(&answerable),
+        "accuracy_abstention": e2e_accuracy(&abstention),
+        "by_type": by_type,
+        "tokens": {
+            "answer_prompt": totals.answer_prompt_tokens,
+            "answer_completion": totals.answer_completion_tokens,
+            "judge_prompt": totals.judge_prompt_tokens,
+            "judge_completion": totals.judge_completion_tokens,
+        },
+        "avg_llm_latency_ms": (totals.llm_ms / graded * 100.0).round() / 100.0,
+        "failures_sample": totals.failures,
+        "hypotheses": totals.hypotheses,
+    })
 }
 
 // ─── SQuAD-style answer scoring ─────────────────────────────────────
@@ -891,5 +1195,100 @@ mod tests {
     fn lme_dates_parse() {
         let parsed = parse_lme_date("2023/05/30 (Tue) 23:40").unwrap();
         assert_eq!(parsed.date().to_string(), "2023-05-30");
+    }
+
+    fn turn(date: &str, role: &str, content: &str) -> HaystackTurn {
+        HaystackTurn {
+            key: format!("{}__t0", date),
+            text: String::new(),
+            session_day: parse_lme_date(date),
+            session_date: date.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn template_values_containing_braces_are_not_substituted_again() {
+        let filled = fill_template("Q: {} A: {} R: {}", &["what is {}?", "x", "y"]);
+        assert_eq!(filled, "Q: what is {}? A: x R: y");
+    }
+
+    #[test]
+    fn history_is_sorted_oldest_first_in_the_official_layout() {
+        let newer = turn("2023/05/30 (Tue) 23:40", "user", " I moved to Lyon. ");
+        let older = turn("2023/01/02 (Mon) 10:00", "assistant", "Noted.");
+        let history = e2e_history(&[&newer, &older]);
+        assert_eq!(
+            history,
+            "\n### Session 1:\nSession Date: 2023/01/02 (Mon) 10:00\nSession Content:\nassistant: Noted.\n\
+             \n### Session 2:\nSession Date: 2023/05/30 (Tue) 23:40\nSession Content:\nuser: I moved to Lyon.\n"
+        );
+    }
+
+    #[test]
+    fn answer_prompt_follows_the_official_template() {
+        let prompt = e2e_answer_prompt("H", "2023/06/01 (Thu) 09:00", "Where do I live?", false);
+        assert!(prompt.starts_with("I will give you several history chats between you and a user."));
+        assert!(prompt.ends_with("History Chats:\n\nH\n\nCurrent Date: 2023/06/01 (Thu) 09:00\nQuestion: Where do I live?\nAnswer:"));
+        let cot = e2e_answer_prompt("H", "d", "q", true);
+        assert!(cot.ends_with("Question: q\nAnswer (step by step):"));
+    }
+
+    #[test]
+    fn judge_prompt_matches_question_type() {
+        assert_eq!(e2e_judge_template("multi-session", false), Ok(JUDGE_DEFAULT));
+        assert_eq!(e2e_judge_template("single-session-user", false), Ok(JUDGE_DEFAULT));
+        assert_eq!(e2e_judge_template("temporal-reasoning", false), Ok(JUDGE_TEMPORAL));
+        assert_eq!(e2e_judge_template("knowledge-update", false), Ok(JUDGE_KNOWLEDGE_UPDATE));
+        assert_eq!(e2e_judge_template("single-session-preference", false), Ok(JUDGE_PREFERENCE));
+        assert_eq!(e2e_judge_template("temporal-reasoning", true), Ok(JUDGE_ABSTENTION));
+        assert!(e2e_judge_template("unknown", false).is_err());
+        for template in [JUDGE_DEFAULT, JUDGE_TEMPORAL, JUDGE_KNOWLEDGE_UPDATE, JUDGE_PREFERENCE, JUDGE_ABSTENTION] {
+            assert_eq!(template.matches("{}").count(), 3);
+        }
+    }
+
+    #[test]
+    fn judge_verdict_uses_the_reference_rule() {
+        assert!(judge_says_yes("Yes."));
+        assert!(judge_says_yes("YES"));
+        assert!(!judge_says_yes("No."));
+        assert!(!judge_says_yes(""));
+    }
+
+    #[test]
+    fn report_counts_abstention_inside_its_type() {
+        let outcome = |question_type: &str, abstention: bool, correct: bool| EndToEndOutcome {
+            question_type: question_type.to_string(),
+            abstention,
+            correct,
+        };
+        let totals = EndToEndTotals {
+            outcomes: vec![
+                outcome("multi-session", false, true),
+                outcome("multi-session", true, false),
+                outcome("temporal-reasoning", false, true),
+                outcome("temporal-reasoning", false, false),
+            ],
+            ..EndToEndTotals::default()
+        };
+        let options = EndToEndOptions {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: Some("sk-test".into()),
+            answer_model: OFFICIAL_JUDGE_MODEL.into(),
+            judge_model: OFFICIAL_JUDGE_MODEL.into(),
+            chain_of_thought: false,
+        };
+        let report = end_to_end_report(&options, &totals, 5);
+        assert_eq!(report["accuracy"], "2/4 (50.0%)");
+        assert_eq!(report["accuracy_answerable"], "2/3 (66.7%)");
+        assert_eq!(report["accuracy_abstention"], "0/1 (0.0%)");
+        assert_eq!(report["by_type"]["multi-session"], "1/2 (50.0%)");
+        assert_eq!(report["official_judge"], true);
+        assert_eq!(report["questions_selected"], 5);
+        assert_eq!(report["questions_graded"], 4);
+        assert!(!report.to_string().contains("sk-test"));
+        assert!(!format!("{:?}", options).contains("sk-test"));
     }
 }

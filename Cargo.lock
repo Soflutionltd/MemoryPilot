@@ -1681,6 +1681,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "unicode-normalization",
+ "ureq",
  "usearch",
  "uuid",
  "yaml-rust2",
