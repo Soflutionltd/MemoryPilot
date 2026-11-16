@@ -644,6 +644,12 @@ fn longmemeval_end_to_end_options(args: &[String]) -> Result<db::EndToEndOptions
                 .ok_or_else(|| format!("{} needs a value", name)),
         }
     };
+    let number = |name: &str| -> Result<Option<usize>, String> {
+        match flag(name)? {
+            None => Ok(None),
+            Some(value) => value.parse().map(Some).map_err(|_| format!("{} needs a whole number, got {}", name, value)),
+        }
+    };
     let base_url = flag("--llm-base-url")?
         .unwrap_or_else(|| memorypilot_core::llm::DEFAULT_BASE_URL.to_string());
     let judge_model = flag("--judge-model")?.unwrap_or_else(|| db::OFFICIAL_JUDGE_MODEL.to_string());
@@ -663,6 +669,9 @@ fn longmemeval_end_to_end_options(args: &[String]) -> Result<db::EndToEndOptions
         answer_model,
         judge_model,
         chain_of_thought: args.iter().any(|a| a == "--cot"),
+        answer_max_tokens: number("--answer-max-tokens")?.map(|value| value as u32),
+        context_turns: number("--context-turns")?.unwrap_or(10).max(10),
+        neighbor_turns: number("--neighbors")?.unwrap_or(0),
     })
 }
 
@@ -708,6 +717,8 @@ fn run_benchmark_longmemeval(args: &[String]) {
         reader: args.iter().any(|a| a == "--reader"),
         end_to_end,
         coverage_depths,
+        // `--every 5`: one question in five within each type.
+        every: args.windows(2).find(|w| w[0] == "--every").and_then(|w| w[1].parse().ok()),
     };
     match db::Database::benchmark_longmemeval(dataset_path, options) {
         Ok(report) => {
@@ -1302,7 +1313,7 @@ fn print_help() {
     println!("  MemoryPilot --rollback-update NAME  Put back the previous copy of a vendor skill or plugin; the version undone is not installed again");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
-    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM)");
+    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30] [--every N]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM; --every: one question in N per type; with --e2e: --cot, --answer-max-tokens N, --context-turns N, --neighbors K)");
     println!("      --reader  Extractive reader on the top 5, SQuAD-style exact match / F1 against the gold answer");
     println!("      --e2e     End-to-end accuracy: an LLM answers from the top 10, an LLM judge grades it (official LongMemEval prompts)");
     println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot]", db::OFFICIAL_JUDGE_MODEL);

@@ -24,6 +24,9 @@ pub struct LongMemEvalOptions {
     /// question and no LLM call: it tells whether a wrong answer could have
     /// been right with a larger context, or had everything it needed.
     pub coverage_depths: Vec<usize>,
+    /// Keep one question out of this many within each question type (and
+    /// among the abstention questions): a sample spread like the full set.
+    pub every: Option<usize>,
 }
 
 /// Settings of the end-to-end evaluation (see [`crate::llm`]).
@@ -36,6 +39,13 @@ pub struct EndToEndOptions {
     pub judge_model: String,
     /// Official "Answer step by step" variant of the generation prompt.
     pub chain_of_thought: bool,
+    /// Cap of the answer, in tokens. `None`: 500, or 800 step by step.
+    pub answer_max_tokens: Option<u32>,
+    /// Retrieved turns given to the reader (10 by default, never fewer).
+    pub context_turns: usize,
+    /// Turns of the same session added before and after each retrieved
+    /// turn. Above zero the history is laid out one block per session.
+    pub neighbor_turns: usize,
 }
 
 impl std::fmt::Debug for EndToEndOptions {
@@ -181,12 +191,22 @@ impl Database {
             eval_count, abs_count
         );
 
-        let selected: Vec<(&serde_json::Value, bool)> = answerable
+        let mut selected: Vec<(&serde_json::Value, bool)> = answerable
             .iter()
             .take(eval_count)
             .map(|e| (*e, false))
             .chain(abstention.iter().take(abs_count).map(|e| (*e, true)))
             .collect();
+        if let Some(step) = options.every.filter(|step| *step > 1) {
+            let mut seen: HashMap<String, usize> = HashMap::new();
+            selected.retain(|(entry, is_abs)| {
+                let kind = entry.get("question_type").and_then(|v| v.as_str()).unwrap_or("");
+                let rank = seen.entry(format!("{}#{}", kind, is_abs)).or_default();
+                *rank += 1;
+                (*rank - 1) % step == 0
+            });
+            eprintln!("[LongMemEval] Sample: 1 question in {} per type, {} questions kept", step, selected.len());
+        }
 
         eprintln!("[LongMemEval] Phase 1: Pre-computing turn embeddings (global cache)...");
         let mut embedding_cache: HashMap<String, Vec<f32>> = HashMap::new();
@@ -453,10 +473,28 @@ impl Database {
             if let (Some(chat), Some(e2e)) = (chat.as_ref(), options.end_to_end.as_ref()) {
                 let by_key: HashMap<&str, &HaystackTurn> =
                     haystack.iter().map(|turn| (turn.key.as_str(), turn)).collect();
-                let retrieved: Vec<&HaystackTurn> = results
+                // A separate search for a larger context: the first ten, and
+                // the retrieval metrics computed on them, stay what they are.
+                let deeper = if e2e.context_turns > 10 {
+                    match db.search_at(question_now, question, e2e.context_turns, None, None, None, None) {
+                        Ok((deeper, _)) => Some(deeper),
+                        Err(error) => {
+                            cleanup_lme_db(&tmp_path);
+                            return Err(format!("context search failed on question {}: {}", qi + 1, error));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut retrieved: Vec<&HaystackTurn> = deeper
+                    .as_ref()
+                    .unwrap_or(&results)
                     .iter()
                     .filter_map(|result| by_key.get(result.memory.id.as_str()).copied())
                     .collect();
+                if e2e.neighbor_turns > 0 {
+                    retrieved = with_neighbors(&retrieved, &by_key, e2e.neighbor_turns);
+                }
                 let question_id = entry.get("question_id").and_then(|v| v.as_str()).unwrap_or("");
                 let item = EndToEndQuestion {
                     question_type,
@@ -789,9 +827,9 @@ impl Database {
         // Resolved first: an unknown question type costs no answer tokens.
         let judge_template = e2e_judge_template(item.question_type, item.abstention)?;
         let start = std::time::Instant::now();
-        let history = e2e_history(retrieved);
+        let history = if e2e.neighbor_turns > 0 { e2e_history_by_session(retrieved) } else { e2e_history(retrieved) };
         let answer_prompt = e2e_answer_prompt(&history, item.question_date, item.question, e2e.chain_of_thought);
-        let max_tokens = if e2e.chain_of_thought { 800 } else { 500 };
+        let max_tokens = e2e.answer_max_tokens.unwrap_or(if e2e.chain_of_thought { 800 } else { 500 });
         let answer = chat.complete(&e2e.answer_model, &answer_prompt, max_tokens)?;
         let judge_prompt = fill_template(judge_template, &[item.question, item.gold_answer, &answer.text]);
         // 10 tokens is the official budget; a thinking model can spend it
@@ -1108,6 +1146,65 @@ fn fill_template(template: &str, values: &[&str]) -> String {
     filled
 }
 
+/// `(session id, turn index)` of a haystack key (`<session>__t<index>`).
+fn turn_position(key: &str) -> Option<(&str, usize)> {
+    let (session, index) = key.rsplit_once("__t")?;
+    Some((session, index.parse().ok()?))
+}
+
+/// The retrieved turns plus up to `span` turns before and after each one in
+/// its session, without repeats, in retrieval order of first appearance.
+fn with_neighbors<'a>(
+    retrieved: &[&'a HaystackTurn],
+    by_key: &HashMap<&str, &'a HaystackTurn>,
+    span: usize,
+) -> Vec<&'a HaystackTurn> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for turn in retrieved {
+        let Some((session, index)) = turn_position(&turn.key) else {
+            if seen.insert(turn.key.clone()) {
+                out.push(*turn);
+            }
+            continue;
+        };
+        for neighbor in index.saturating_sub(span)..=index + span {
+            let key = format!("{}__t{}", session, neighbor);
+            if let Some(found) = by_key.get(key.as_str()) {
+                if seen.insert(key) {
+                    out.push(*found);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One block per session, oldest first, its turns in the order they were
+/// said: the official `flat-session` layout, limited to the turns given.
+fn e2e_history_by_session(turns: &[&HaystackTurn]) -> String {
+    let mut ordered: Vec<(&str, usize, &HaystackTurn)> = turns
+        .iter()
+        .map(|turn| {
+            let (session, index) = turn_position(&turn.key).unwrap_or((turn.key.as_str(), 0));
+            (session, index, *turn)
+        })
+        .collect();
+    ordered.sort_by(|a, b| (a.2.session_day, a.0, a.1).cmp(&(b.2.session_day, b.0, b.1)));
+    let mut history = String::new();
+    let mut current: Option<&str> = None;
+    let mut number = 0;
+    for (session, _, turn) in ordered {
+        if current != Some(session) {
+            number += 1;
+            history.push_str(&format!("\n### Session {}:\nSession Date: {}\nSession Content:\n", number, turn.session_date));
+            current = Some(session);
+        }
+        history.push_str(&format!("{}: {}\n", turn.role, turn.content.trim()));
+    }
+    history
+}
+
 /// Retrieved turns in the official `flat-turn` / `nl` layout, oldest first.
 fn e2e_history(retrieved: &[&HaystackTurn]) -> String {
     let mut ordered: Vec<&HaystackTurn> = retrieved.to_vec();
@@ -1185,7 +1282,12 @@ fn end_to_end_report(e2e: &EndToEndOptions, totals: &EndToEndTotals, selected: u
     let graded = all.len().max(1) as f64;
     json!({
         "protocol": "official LongMemEval prompts (run_generation.py history-chats, evaluate_qa.py judge); retrieved turns in flat-turn layout",
-        "context": "top-10 turns returned by MemoryPilot search, oldest session first",
+        "context": format!(
+            "top-{} turns returned by MemoryPilot search{}, oldest session first",
+            e2e.context_turns.max(10),
+            if e2e.neighbor_turns > 0 { format!(", each with up to {} turn(s) before and after it in its session, one block per session", e2e.neighbor_turns) } else { String::new() }
+        ),
+        "answer_max_tokens": e2e.answer_max_tokens.unwrap_or(if e2e.chain_of_thought { 800 } else { 500 }),
         "base_url": e2e.base_url,
         "answer_model": e2e.answer_model,
         "judge_model": e2e.judge_model,
@@ -1323,6 +1425,39 @@ mod tests {
     }
 
     #[test]
+    fn neighbours_are_added_once_and_sessions_are_laid_out_in_order() {
+        let turn = |key: &str, day: u32, role: &str, content: &str| HaystackTurn {
+            key: key.to_string(),
+            text: String::new(),
+            session_day: chrono::NaiveDate::from_ymd_opt(2023, 5, day).and_then(|date| date.and_hms_opt(9, 0, 0)),
+            session_date: format!("2023/05/{:02} (Mon) 09:00", day),
+            role: role.to_string(),
+            content: content.to_string(),
+        };
+        let turns = vec![
+            turn("late__t0", 20, "user", "I moved to Lyon."),
+            turn("late__t1", 20, "assistant", "Noted, Lyon."),
+            turn("early__t0", 3, "user", "I live in Nice."),
+            turn("early__t1", 3, "assistant", "Nice it is."),
+            turn("early__t2", 3, "user", "And I work from home."),
+        ];
+        let by_key: HashMap<&str, &HaystackTurn> = turns.iter().map(|turn| (turn.key.as_str(), turn)).collect();
+        // Two hits in the same session, one in another.
+        let retrieved = vec![&turns[0], &turns[3], &turns[2]];
+
+        let widened = with_neighbors(&retrieved, &by_key, 1);
+        let keys: Vec<&str> = widened.iter().map(|turn| turn.key.as_str()).collect();
+        assert_eq!(keys, vec!["late__t0", "late__t1", "early__t0", "early__t1", "early__t2"], "each turn once");
+
+        let history = e2e_history_by_session(&widened);
+        assert_eq!(
+            history,
+            "\n### Session 1:\nSession Date: 2023/05/03 (Mon) 09:00\nSession Content:\nuser: I live in Nice.\nassistant: Nice it is.\nuser: And I work from home.\n\n### Session 2:\nSession Date: 2023/05/20 (Mon) 09:00\nSession Content:\nuser: I moved to Lyon.\nassistant: Noted, Lyon.\n"
+        );
+        assert_eq!(with_neighbors(&retrieved, &by_key, 0).len(), 3);
+    }
+
+    #[test]
     fn answer_prompt_follows_the_official_template() {
         let prompt = e2e_answer_prompt("H", "2023/06/01 (Thu) 09:00", "Where do I live?", false);
         assert!(prompt.starts_with("I will give you several history chats between you and a user."));
@@ -1375,6 +1510,9 @@ mod tests {
             answer_model: OFFICIAL_JUDGE_MODEL.into(),
             judge_model: OFFICIAL_JUDGE_MODEL.into(),
             chain_of_thought: false,
+            answer_max_tokens: None,
+            context_turns: 10,
+            neighbor_turns: 0,
         };
         let report = end_to_end_report(&options, &totals, 5);
         assert_eq!(report["accuracy"], "2/4 (50.0%)");
