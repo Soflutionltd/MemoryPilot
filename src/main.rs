@@ -179,6 +179,10 @@ fn main() {
         run_benchmark_episodic(&args);
         return;
     }
+    if args.iter().any(|a| a == "--footprint") {
+        println!("{}", serde_json::to_string_pretty(&tools::footprint()).unwrap_or_default());
+        return;
+    }
     if args.iter().any(|a| a == "--benchmark-latency") {
         run_benchmark_latency(&args);
         return;
@@ -1299,6 +1303,7 @@ fn print_help() {
     println!("  MemoryPilot --benchmark-fr [--min-r5 PCT]  French retrieval benchmark (30 in-memory scenarios)");
     println!("  MemoryPilot --benchmark-concurrency [--clients N] [--queries-per-client N] [--seed-memories N]  Multi-client concurrent search throughput");
     println!("  MemoryPilot --benchmark-latency [--queries N] [--seed-memories N] [--db PATH]  Cold/warm search latency");
+    println!("  MemoryPilot --footprint      What a client pays before any call: tools, schema size, instructions, LLM calls per write (JSON)");
     println!("  MemoryPilot --version        Show version");
     println!("  MemoryPilot update [--check] Install the latest release now (--check: only report it). Servers check by themselves every 6 h; MEMORYPILOT_AUTO_UPDATE=0 turns that off");
     println!("  MemoryPilot --self-test DB   Open DB with this version's schema upgrades (run by the updater on a copy)");

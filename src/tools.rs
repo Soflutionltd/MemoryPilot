@@ -2469,6 +2469,46 @@ fn handle_get_agent_skill(args: &Value) -> Value {
 
 /// MCP `instructions`, shared by the stdio and HTTP servers, with the names
 /// of the agent skills so the client knows they exist.
+/// What MemoryPilot costs a client before any call: the tool list of each
+/// profile and the server instructions, in characters (exact) and tokens
+/// (estimated at four characters each, the usual rule of thumb: a client's
+/// own tokenizer gives the real figure).
+pub fn footprint() -> Value {
+    let was_full = TOOLS_FULL.load(std::sync::atomic::Ordering::Relaxed);
+    let profile = |full: bool| -> Value {
+        TOOLS_FULL.store(full, std::sync::atomic::Ordering::Relaxed);
+        let definitions = tool_definitions();
+        let tools = definitions["tools"].as_array().cloned().unwrap_or_default();
+        let characters = serde_json::to_string(&tools).map(|text| text.chars().count()).unwrap_or(0);
+        let longest = tools
+            .iter()
+            .map(|tool| (tool["description"].as_str().unwrap_or("").chars().count(), tool["name"].as_str().unwrap_or("")))
+            .max()
+            .unwrap_or((0, ""));
+        json!({
+            "tools": tools.len(),
+            "schema_characters": characters,
+            "estimated_tokens": characters / 4,
+            "longest_description": { "tool": longest.1, "characters": longest.0, "client_limit": MAX_TOOL_DESCRIPTION_CHARS },
+        })
+    };
+    let core = profile(false);
+    let full = profile(true);
+    TOOLS_FULL.store(was_full, std::sync::atomic::Ordering::Relaxed);
+    let instructions = server_instructions().chars().count();
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        "tool_list": { "core (default)": core, "full (MEMORYPILOT_TOOLS=full)": full },
+        "server_instructions": { "characters": instructions, "estimated_tokens": instructions / 4 },
+        "llm_calls_per_write": 0,
+        "llm_calls_per_search": 0,
+        "runtime_dependencies": "none (SQLite and ONNX models are bundled or fetched once)",
+        "binary_bytes": std::env::current_exe().ok().and_then(|exe| std::fs::metadata(exe).ok()).map(|file| file.len()),
+        "token_estimate": "characters / 4",
+    })
+}
+
 pub fn server_instructions() -> String {
     let mut text = String::from("CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials.");
     if let Some(line) = crate::agent_skills::agents_dir().and_then(|root| crate::agent_skills::instructions_line(&root)) {
