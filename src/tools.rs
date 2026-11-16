@@ -48,10 +48,23 @@ pub fn init_tools_profile(db: &Database) {
     TOOLS_FULL.store(env_full || cfg_full, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Claude Code cuts the description of a tool loaded at start to this many
+/// characters: what comes after is never seen by the model.
+const MAX_TOOL_DESCRIPTION_CHARS: usize = 4_096;
+/// Hint kept for each `memory_admin` action. With some fifty actions the
+/// list stays well under `MAX_TOOL_DESCRIPTION_CHARS`.
+const ADMIN_HINT_CHARS: usize = 44;
+
+/// The first sentence of a description, cut at a word when longer than `max`.
 fn first_sentence(text: &str, max: usize) -> String {
     let cut = text.find(". ").map(|i| i + 1).unwrap_or(text.len());
-    let s: String = text[..cut].chars().take(max).collect();
-    s.trim_end_matches('.').to_string()
+    let sentence = text[..cut].trim_end_matches('.');
+    if sentence.chars().count() <= max {
+        return sentence.to_string();
+    }
+    let head: String = sentence.chars().take(max).collect();
+    let head = head.rfind(' ').map(|space| &head[..space]).unwrap_or(&head);
+    head.trim_end_matches([',', ';', ':', ' ', '(']).to_string()
 }
 
 pub fn tool_definitions() -> Value {
@@ -68,7 +81,7 @@ pub fn tool_definitions() -> Value {
         if CORE_TOOLS.contains(&name.as_str()) {
             core.push(tool);
         } else {
-            let desc = first_sentence(tool["description"].as_str().unwrap_or(""), 90);
+            let desc = first_sentence(tool["description"].as_str().unwrap_or(""), ADMIN_HINT_CHARS);
             admin_lines.push(format!("{}: {}", name, desc));
             admin_names.push(name);
         }
@@ -2597,5 +2610,50 @@ fn handle_project_facts(db: &Database, args: &Value) -> Value {
             "No Git repository registered for project {}: register_project with its path first.",
             project
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A longer description is cut by Claude Code: the actions listed last
+    /// in `memory_admin` lost their hint when the list grew past the limit.
+    #[test]
+    fn no_tool_description_is_longer_than_what_clients_keep() {
+        for (profile, full) in [("core", false), ("full", true)] {
+            TOOLS_FULL.store(full, std::sync::atomic::Ordering::Relaxed);
+            let definitions = tool_definitions();
+            for tool in definitions["tools"].as_array().expect("tools") {
+                let description = tool["description"].as_str().expect("description");
+                assert!(
+                    description.chars().count() <= MAX_TOOL_DESCRIPTION_CHARS,
+                    "{} ({}): {} characters",
+                    tool["name"],
+                    profile,
+                    description.chars().count()
+                );
+            }
+        }
+        TOOLS_FULL.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn every_admin_action_keeps_a_hint_and_can_be_called() {
+        TOOLS_FULL.store(false, std::sync::atomic::Ordering::Relaxed);
+        let definitions = tool_definitions();
+        let admin = definitions["tools"].as_array().expect("tools").iter().find(|tool| tool["name"] == "memory_admin").expect("memory_admin");
+        let description = admin["description"].as_str().expect("description");
+        let actions = admin["inputSchema"]["properties"]["action"]["enum"].as_array().expect("actions");
+        for action in actions.iter().filter_map(|action| action.as_str()).filter(|action| *action != "help") {
+            assert!(description.contains(&format!("{}: ", action)), "{action} has no hint");
+        }
+        assert!(actions.len() > 40);
+    }
+
+    #[test]
+    fn a_hint_is_cut_at_a_word() {
+        assert_eq!(first_sentence("Short one. Second sentence.", 44), "Short one");
+        assert_eq!(first_sentence("Resynchronise the full-text index with the memories table (orphan rows).", 44), "Resynchronise the full-text index with the");
     }
 }

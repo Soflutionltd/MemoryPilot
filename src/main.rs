@@ -1304,7 +1304,7 @@ fn print_help() {
     println!("  MemoryPilot --self-test DB   Open DB with this version's schema upgrades (run by the updater on a copy)");
     println!("  MemoryPilot --help           Show this help");
     println!();
-    println!("MCP TOOLS (41):");
+    println!("MCP TOOLS (22 by default, 70 with MEMORYPILOT_TOOLS=full; the most used):");
     println!("  recall              Load all context in one shot (start here)");
     println!("  remember_working    Store ephemeral session scratchpad context");
     println!("  recall_working      Recall current in-process working memory");
