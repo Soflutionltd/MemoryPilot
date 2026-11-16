@@ -203,7 +203,7 @@ impl Database {
                 let kind = entry.get("question_type").and_then(|v| v.as_str()).unwrap_or("");
                 let rank = seen.entry(format!("{}#{}", kind, is_abs)).or_default();
                 *rank += 1;
-                (*rank - 1) % step == 0
+                (*rank - 1).is_multiple_of(step)
             });
             eprintln!("[LongMemEval] Sample: 1 question in {} per type, {} questions kept", step, selected.len());
         }
@@ -1434,7 +1434,7 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
         };
-        let turns = vec![
+        let turns = [
             turn("late__t0", 20, "user", "I moved to Lyon."),
             turn("late__t1", 20, "assistant", "Noted, Lyon."),
             turn("early__t0", 3, "user", "I live in Nice."),
