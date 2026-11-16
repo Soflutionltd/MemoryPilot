@@ -457,4 +457,169 @@ impl Database {
         }
         Ok(Some(memory))
     }
+
+    /// What get_memory_health says about projects: folders that no longer
+    /// exist, projects that are the same one (same remote, or one named or
+    /// located like another's alias) with the merge to run, and memories
+    /// whose project entity is another project's or is missing.
+    pub fn project_hygiene_report(&self) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        self.refresh_project_remotes();
+        let memory_count = |project: &str| -> i64 {
+            self.count("SELECT COUNT(*) FROM memories WHERE project = ?1", &[&project]).unwrap_or(0)
+        };
+        let merge_command = |source: &str, target: &str| {
+            json!({ "tool": "memory_admin", "action": "merge_projects", "args": { "source": source, "target": target, "dry_run": true } })
+        };
+
+        let mut missing_paths = Vec::new();
+        let mut by_remote: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        {
+            let mut statement = self
+                .conn
+                .prepare("SELECT name, path, remote FROM projects ORDER BY name")
+                .map_err(|error| format!("Project hygiene: {}", error))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+                })
+                .map_err(|error| format!("Project hygiene: {}", error))?;
+            for (name, path, remote) in rows.flatten() {
+                if !path.is_empty() && !Path::new(&path).exists() {
+                    missing_paths.push(json!({
+                        "project": name,
+                        "path": path,
+                        "memories": memory_count(&name),
+                        "fix": { "tool": "memory_admin", "action": "rename_project",
+                                 "args": { "old_name": name, "new_name": name, "new_path": "<folder the project lives in now>" } },
+                    }));
+                }
+                if let Some(remote) = remote {
+                    by_remote.entry(remote).or_default().push(name);
+                }
+            }
+        }
+
+        let mut same_project = Vec::new();
+        for (remote, mut names) in by_remote {
+            if names.len() < 2 {
+                continue;
+            }
+            // The project holding the most memories is the one to keep.
+            names.sort_by_key(|name| std::cmp::Reverse(memory_count(name)));
+            let target = names[0].clone();
+            for source in &names[1..] {
+                same_project.push(json!({
+                    "reason": "same_remote", "remote": remote,
+                    "projects": [source, target],
+                    "fix": merge_command(source, &target),
+                }));
+            }
+        }
+        {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT a.kind, a.alias, a.project, p.name FROM project_aliases a
+                     JOIN projects p ON p.name != a.project
+                      AND ((a.kind = 'name' AND p.name = a.alias) OR (a.kind = 'path' AND p.path = a.alias))
+                     ORDER BY a.project, p.name",
+                )
+                .map_err(|error| format!("Project hygiene: {}", error))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+                })
+                .map_err(|error| format!("Project hygiene: {}", error))?;
+            for (kind, alias, owner, other) in rows.flatten() {
+                same_project.push(json!({
+                    "reason": format!("shared_{}_alias", kind), "alias": alias,
+                    "projects": [other, owner],
+                    "fix": merge_command(&other, &owner),
+                }));
+            }
+        }
+
+        let mut stale_entities = Vec::new();
+        {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT e.entity_value, COALESCE(m.project, '(global)'), COUNT(*)
+                     FROM memory_entities e JOIN memories m ON m.id = e.memory_id
+                     WHERE e.entity_kind = 'project' AND e.entity_value != COALESCE(m.project, '')
+                     GROUP BY 1, 2 ORDER BY 3 DESC",
+                )
+                .map_err(|error| format!("Project hygiene: {}", error))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))
+                .map_err(|error| format!("Project hygiene: {}", error))?;
+            for (entity, project, count) in rows.flatten() {
+                stale_entities.push(json!({ "entity": entity, "project": project, "count": count }));
+            }
+        }
+
+        let mut missing_entities = Vec::new();
+        {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT m.project, COUNT(*) FROM memories m
+                     WHERE m.project IS NOT NULL
+                       AND NOT EXISTS (SELECT 1 FROM memory_entities e
+                                       WHERE e.memory_id = m.id AND e.entity_kind = 'project' AND e.entity_value = m.project)
+                     GROUP BY 1 ORDER BY 2 DESC",
+                )
+                .map_err(|error| format!("Project hygiene: {}", error))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .map_err(|error| format!("Project hygiene: {}", error))?;
+            for (project, count) in rows.flatten() {
+                missing_entities.push(json!({ "project": project, "count": count }));
+            }
+        }
+
+        let entities_out_of_step = !stale_entities.is_empty() || !missing_entities.is_empty();
+        let issues = missing_paths.len() + same_project.len() + stale_entities.len() + missing_entities.len();
+        let mut report = json!({
+            "issues": issues,
+            "missing_paths": missing_paths,
+            "same_project": same_project,
+            "stale_project_entities": stale_entities,
+            "missing_project_entities": missing_entities,
+        });
+        if entities_out_of_step {
+            report["project_entities_fix"] = json!({ "tool": "memory_admin", "action": "repair_index" });
+        }
+        Ok(report)
+    }
+
+    /// Gives every memory exactly the project entity of its own project.
+    /// Returns how many entity rows were removed and added.
+    pub fn repair_project_entities(&self) -> Result<(usize, usize), String> {
+        let transaction = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|error| format!("Repair project entities begin: {}", error))?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM memory_entities
+                 WHERE entity_kind = 'project'
+                   AND entity_value != COALESCE((SELECT m.project FROM memories m WHERE m.id = memory_entities.memory_id), '')",
+                [],
+            )
+            .map_err(|error| format!("Repair project entities: {}", error))?;
+        let added = transaction
+            .execute(
+                "INSERT INTO memory_entities (memory_id, entity_kind, entity_value)
+                 SELECT m.id, 'project', m.project FROM memories m
+                 WHERE m.project IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM memory_entities e
+                                   WHERE e.memory_id = m.id AND e.entity_kind = 'project' AND e.entity_value = m.project)",
+                [],
+            )
+            .map_err(|error| format!("Repair project entities: {}", error))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Repair project entities commit: {}", error))?;
+        Ok((removed, added))
+    }
 }

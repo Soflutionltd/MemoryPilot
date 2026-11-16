@@ -677,7 +677,7 @@ fn all_tool_definitions() -> Value {
         },
         {
             "name": "get_memory_health",
-            "description": "Comprehensive health report: memory distribution by kind/project/importance, stale count, orphan entities, compression potential, avg age, pinned count.",
+            "description": "Comprehensive health report: memory distribution by kind/project/importance, stale count, orphan entities, compression potential, avg age, pinned count. `projects` lists the project problems with the command that fixes each: folders that no longer exist, projects that are the same one (same Git remote or shared alias, to merge_projects), memories whose project entity is wrong or missing (repair_index).",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -872,7 +872,7 @@ fn all_tool_definitions() -> Value {
         },
         {
             "name": "repair_index",
-            "description": "Resynchronise the full-text index with the memories table (orphan and missing rows). Also runs at startup.",
+            "description": "Resynchronise the full-text index with the memories table (orphan and missing rows; also runs at startup), and give every memory the project entity of its own project.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -997,8 +997,11 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "project_facts" => handle_project_facts(db, args),
         "resolve_memory" => handle_resolve_memory(db, args),
         "reveal_secret" => handle_reveal_secret(db, args),
-        "repair_index" => match db.repair_fts() {
-            Ok((removed, added)) => tool_result(&format!("FTS index: {} orphan rows removed, {} missing rows added.", removed, added)),
+        "repair_index" => match db.repair_fts().and_then(|fts| Ok((fts, db.repair_project_entities()?))) {
+            Ok(((removed, added), (entities_removed, entities_added))) => tool_result(&format!(
+                "FTS index: {} orphan rows removed, {} missing rows added. Project entities: {} stale rows removed, {} missing rows added.",
+                removed, added, entities_removed, entities_added
+            )),
             Err(e) => tool_error(&e),
         },
         "get_skill" => handle_get_skill(db, args),

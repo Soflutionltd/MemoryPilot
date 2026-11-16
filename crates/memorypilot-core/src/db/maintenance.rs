@@ -537,6 +537,7 @@ impl Database {
             "by_kind": by_kind.into_iter().map(|(k, c)| json!({"kind": k, "count": c})).collect::<Vec<_>>(),
             "by_project": by_project.into_iter().map(|(p, c)| json!({"project": p, "count": c})).collect::<Vec<_>>(),
             "by_importance": by_importance.into_iter().map(|(i, c)| json!({"importance": i, "count": c})).collect::<Vec<_>>(),
+            "projects": self.project_hygiene_report()?,
         }))
     }
 

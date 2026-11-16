@@ -388,3 +388,72 @@ fn an_old_folder_name_follows_its_alias() {
 
     assert_eq!(db.detect_project(&folder.to_string_lossy()).expect("detect").as_deref(), Some("courly"));
 }
+
+#[test]
+fn health_reports_missing_folders_duplicates_and_stale_entities_with_their_fix() {
+    let workspace = Workspace::new("hygiene");
+    let db = workspace.open();
+    let first = workspace.repository("App/courly", "git@github.com:Acme/courly.git");
+    let second = workspace.repository("App/ratatoskr", "https://github.com/acme/courly.git");
+    db.register_project("courly", &first.to_string_lossy(), None).expect("register");
+    db.register_project("ratatoskr", &second.to_string_lossy(), None).expect("register");
+    add(&db, "Threads are grouped by the References header.", "fact", "courly");
+    add(&db, "Search runs on the local index first.", "fact", "courly");
+    add(&db, "The compose window autosaves every five seconds.", "fact", "ratatoskr");
+    let gone = workspace.root.join("App/gone");
+    db.conn
+        .execute(
+            "INSERT INTO projects (name, path, created_at) VALUES ('gone', ?1, '2026-01-01T00:00:00+00:00')",
+            params![gone.to_string_lossy()],
+        )
+        .expect("project without folder");
+
+    let report = db.memory_health_report().expect("health");
+    let projects = &report["projects"];
+
+    assert_eq!(projects["missing_paths"].as_array().expect("missing").len(), 1);
+    assert_eq!(projects["missing_paths"][0]["project"], "gone");
+    let same = projects["same_project"].as_array().expect("same");
+    assert_eq!(same.len(), 1);
+    assert_eq!(same[0]["reason"], "same_remote");
+    assert_eq!(same[0]["fix"]["action"], "merge_projects");
+    assert_eq!(same[0]["fix"]["args"]["source"], "ratatoskr");
+    assert_eq!(same[0]["fix"]["args"]["target"], "courly", "the project with the most memories is kept");
+    assert_eq!(projects["issues"], 2);
+
+    // The reported merge, then a manual SQL move that forgot the graph.
+    db.merge_projects("ratatoskr", "courly", false).expect("merge");
+    db.conn
+        .execute("UPDATE memory_entities SET entity_value = 'ratatoskr' WHERE entity_kind = 'project' AND rowid = (SELECT MIN(rowid) FROM memory_entities WHERE entity_kind = 'project')", [])
+        .expect("stale entity");
+    let report = db.memory_health_report().expect("health");
+    assert_eq!(report["projects"]["same_project"].as_array().expect("same").len(), 0);
+    assert_eq!(report["projects"]["stale_project_entities"][0]["entity"], "ratatoskr");
+    assert_eq!(report["projects"]["stale_project_entities"][0]["project"], "courly");
+    assert_eq!(report["projects"]["missing_project_entities"][0]["project"], "courly");
+    assert_eq!(report["projects"]["project_entities_fix"]["action"], "repair_index");
+
+    assert_eq!(db.repair_project_entities().expect("repair"), (1, 1));
+    let report = db.memory_health_report().expect("health");
+    assert_eq!(report["projects"]["stale_project_entities"].as_array().expect("stale").len(), 0);
+    assert_eq!(report["projects"]["missing_project_entities"].as_array().expect("missing").len(), 0);
+    assert_eq!(report["projects"]["issues"], 1, "only the missing folder is left");
+}
+
+#[test]
+fn a_project_recreated_under_an_alias_is_reported_for_merge() {
+    let workspace = Workspace::new("alias-duplicate");
+    let db = workspace.open();
+    seed_project(&db, "ratatoskr");
+    db.rename_project("ratatoskr", "courly", None, false).expect("rename");
+    // An old client writes under the former name again.
+    add(&db, "Signatures are stored per account.", "fact", "ratatoskr");
+
+    let report = db.project_hygiene_report().expect("hygiene");
+
+    let same = report["same_project"].as_array().expect("same");
+    assert_eq!(same.len(), 1);
+    assert_eq!(same[0]["reason"], "shared_name_alias");
+    assert_eq!(same[0]["fix"]["args"]["source"], "ratatoskr");
+    assert_eq!(same[0]["fix"]["args"]["target"], "courly");
+}
