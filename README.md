@@ -66,7 +66,8 @@ Evaluated on the 470 answerable questions of [LongMemEval-S](https://arxiv.org/a
 |--------|--------------------------------:|-------|--------|
 | **MemoryPilot v4.2 (adaptive rerank)** | **99.1%** | 470 questions, ~900 ms/query on an M-series Mac | This repo, `--benchmark-longmemeval` |
 | **MemoryPilot v4.2 (rerank off)** | **98.7%** | 470 questions, ~28 ms/query with `MEMORYPILOT_CROSS_RERANK=off` | This repo, `--benchmark-longmemeval` |
-| MemPalace v3.3.3 (hybrid) | 98.4% | 450 held-out questions after tuning on 50; 96.6% raw on 500 | MemPalace v3.3.3 release notes |
+| MemPalace v3.12.0 (hybrid) | 98.4% | 450 held-out questions after tuning on 50; 96.6% raw on 500 | [MemPalace README](https://github.com/MemPalace/mempalace), read 2026-11-16 |
+| ICM v0.11.5 | 97.4% | 500 questions (487 hits), no LLM, one memory per session | [rtk-ai/icm README](https://github.com/rtk-ai/icm), read 2026-11-16 |
 | agentmemory v0.9 | 95.2% | 500 questions (abstention included), all-MiniLM | [github.com/rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) `benchmark/LONGMEMEVAL.md` |
 | mcp-memory-service v10.34.0 | 80.4% | labelled R@5; hit definition not stated | [v10.34.0 release notes](https://github.com/doobidoo/mcp-memory-service/releases/tag/v10.34.0) |
 
@@ -74,11 +75,32 @@ Evaluated on the 470 answerable questions of [LongMemEval-S](https://arxiv.org/a
 
 | System | QA accuracy | Setup | Source |
 |--------|------------:|-------|--------|
-| Mem0 (cloud) | 94.4% | Mem0's own suite, top-200 retrieval | [mem0.ai blog](https://mem0.ai/blog/benchmarked-openai-memory-vs-langmem-vs-memgpt-vs-mem0-for-long-term-memory-here-s-how-they-stacked-up) |
-| Zep / Graphiti | 63.8% / 71.2% | gpt-4o-mini / gpt-4o as reader, GPT-4o judge | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956), Table 2 |
+| Mem0 (managed platform) | 94.4% (472/500) | Mem0's own suite, top-200 retrieval; reader and judge not stated on the page | [mem0ai/memory-benchmarks](https://github.com/mem0ai/memory-benchmarks), read 2026-11-16 |
+| Zep (cloud, 2026) | 90.2% (451/500) | gpt-5.4 as reader and as judge, median context 4,408 tokens | [getzep.com research](https://www.getzep.com/research/memory-benchmarks/), read 2026-11-16 |
+| Zep / Graphiti (2025 paper) | 63.8% / 71.2% | gpt-4o-mini / gpt-4o as reader, GPT-4o judge | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956), Table 2 |
+| Supermemory | 85.2% / 84.6% | gemini-3-pro / gpt-5 as reader, LongMemEval-S, 500 questions | [supermemory.ai research](https://supermemory.ai/research/longmembench/), read 2026-11-16 |
 | MemoryPilot | not measured | an end-to-end QA run is planned | |
 
 > All figures are published by their own authors, none was reproduced independently, and the two tables cannot be compared with each other. On session-level recall MemoryPilot posts the highest published local score, by a margin smaller than the gap between this metric and a plain BM25 baseline. The protocol to settle a comparison: same 470 questions, same hardware, every system run by the same script, reporting `recall_any@5`, `recall_all@5`, turn-level evidence recall and end-to-end QA accuracy with a fixed reader and judge.
+
+#### What a memory costs (measured, `MemoryPilot --footprint`)
+
+Quality is one axis. The others decide what a memory costs on every conversation and every write.
+
+| Measure | MemoryPilot v4.13 | How to reproduce |
+|---------|------------------:|------------------|
+| LLM calls per write | **0** | Dedup, entities, graph links and embeddings run locally |
+| LLM calls per search | **0** | Local encoder and reranker |
+| Tools exposed, default profile | 22 | `--footprint` |
+| Tool list, default profile | 17,692 characters, about 4,400 tokens | `--footprint` (tokens estimated at 4 characters each) |
+| Tools exposed, full profile | 70 | `MEMORYPILOT_TOOLS=full` |
+| Tool list, full profile | 34,954 characters, about 8,700 tokens | `--footprint` |
+| Server instructions | 2,258 characters, about 560 tokens | `--footprint` |
+| Runtime dependencies | none | One binary; no database server, no API key |
+
+For scale, as published by each project and read on 2026-11-16: Mem0, Zep, Graphiti, Letta, Supermemory and Hindsight call an LLM on every write; MemPalace does not. Tool counts: Cognee 6 by default, Mem0 11, Zep 12, ICM 32, MemPalace 47. Clients that defer tool schemas (Claude Code does by default) mostly pay for tool names and server instructions, so the count matters less there than on clients that load every schema.
+
+Other long-term-memory benchmarks: ICM publishes 92.9% answer accuracy on LoCoMo (1,540 questions, Gemini as reader and judge, [source](https://github.com/rtk-ai/icm)); Mem0 92.5% and Zep 94.7% on LoCoMo, on their own harnesses. MemoryPilot has no LoCoMo runner yet.
 
 #### Detailed view — MemoryPilot vs MemPalace (closest local competitor)
 
@@ -192,7 +214,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Confidence scoring | Embedding similarity | LLM-based merge |
 | HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
-| MCP tools | 41 tools | 29 tools | **65 tools** | N/A | Limited MCP server |
+| MCP tools | 70 tools, 22 exposed by default (the rest behind `memory_admin`) | 47 tools | **65 tools** | N/A | Limited MCP server |
 | Hooks / event capture | SessionStart auto-recall for **Cursor, Claude Code and Codex**, per-prompt recall (Claude Code), conversation index at session end, opt-in Stop auto-ingest (incremental, distilled, agent narration filtered, secrets redacted) + file watcher | No | **12 named hooks** (Claude Code, Cursor, Codex, Copilot CLI…) | No | No |
 | Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |
 | Language | Rust (single binary, zero deps) | Python (pip install) | TypeScript / Node (npm install) | SaaS | Python + Neo4j |
@@ -477,7 +499,7 @@ MemoryPilot --backfill
 MemoryPilot --backfill-force
 ```
 
-## MCP Tools (30)
+## MCP Tools (22 by default, 70 in the full profile)
 
 ### Core
 
