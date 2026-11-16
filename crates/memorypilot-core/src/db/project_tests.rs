@@ -475,6 +475,33 @@ fn an_old_folder_name_follows_its_alias() {
 }
 
 #[test]
+fn a_known_project_is_found_for_a_folder_without_ever_making_one_up() {
+    let workspace = Workspace::new("known-project");
+    let db = workspace.open();
+    let repository = workspace.repository("App/courly", "git@github.com:Acme/courly.git");
+    db.register_project("courly", &repository.to_string_lossy(), None).expect("register");
+    add(&db, "The sidebar lists accounts by unread count.", "fact", "courly");
+    let known = |path: &Path| db.known_project_for_path(&path.to_string_lossy());
+
+    assert_eq!(known(&repository.join("src/sync")).as_deref(), Some("courly"));
+    // Another clone of the same remote, and a worktree of the repository.
+    let clone = workspace.repository("Elsewhere/mail-copy", "https://github.com/acme/courly");
+    assert_eq!(known(&clone).as_deref(), Some("courly"));
+    let worktree = workspace.worktree("Worktrees/courly/fix", &repository);
+    assert_eq!(known(&worktree.join("src")).as_deref(), Some("courly"));
+    // A folder that exists but belongs to nothing known, and one that does not exist.
+    let stranger = workspace.repository("App/stranger", "git@github.com:Acme/stranger.git");
+    assert_eq!(known(&stranger), None);
+    assert_eq!(known(&workspace.root.join("App/never-existed/src")), None);
+    assert_eq!(db.list_projects().expect("projects").len(), 1, "nothing was registered on the way");
+
+    // The folder is deleted: its recorded path still answers.
+    std::fs::remove_dir_all(&repository).expect("delete");
+    assert_eq!(known(&repository.join("src/sync")).as_deref(), Some("courly"));
+    assert_eq!(db.project_remote("courly").as_deref(), Some("github.com/acme/courly"));
+}
+
+#[test]
 fn health_reports_missing_folders_duplicates_and_stale_entities_with_their_fix() {
     let workspace = Workspace::new("hygiene");
     let db = workspace.open();

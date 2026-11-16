@@ -537,6 +537,67 @@ impl Database {
         Ok(projects)
     }
 
+    /// The project already known for a folder: a registered folder, a former
+    /// one, the remote of its repository, or a known name or alias of the
+    /// repository. Unlike `detect_project` it never makes a name up, and it
+    /// answers for a folder that no longer exists when its path is recorded.
+    pub fn known_project_for_path(&self, path: &str) -> Option<String> {
+        let normalized = Self::normalize_path(path);
+        if normalized.is_empty() {
+            return None;
+        }
+        let project_root = Self::infer_project_root(&normalized);
+        let identity_root = Self::identity_root(&project_root);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT name, folder FROM (
+                     SELECT name, path AS folder FROM projects WHERE path != ''
+                     UNION ALL SELECT project, alias FROM project_aliases WHERE kind = 'path'
+                 ) ORDER BY length(folder) DESC",
+            )
+            .ok()?;
+        let folders: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ok()?
+            .flatten()
+            .collect();
+        for (name, folder) in folders {
+            let folder = Self::normalize_path(&folder);
+            if Self::is_generic_folder(&folder) {
+                continue;
+            }
+            if [&project_root, &normalized, &identity_root].iter().any(|candidate| Self::path_matches(candidate, &folder)) {
+                return Some(name);
+            }
+        }
+        let root = Path::new(&identity_root);
+        if Self::is_generic_folder(&identity_root) || !(root.join(".git").exists() || root.join("Cargo.toml").exists() || root.join("package.json").exists()) {
+            return None;
+        }
+        git_identity::origin_remote(root)
+            .and_then(|remote| self.project_for_remote(&remote))
+            .or_else(|| {
+                Self::project_slug_candidates(&identity_root)
+                    .into_iter()
+                    .map(|candidate| self.project_for_alias("name", &candidate).unwrap_or(candidate))
+                    .find(|candidate| self.project_is_known(candidate))
+            })
+    }
+
+    /// The remote recorded for a project.
+    pub fn project_remote(&self, name: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT remote FROM projects WHERE name = ?1", params![name], |row| row.get(0))
+            .ok()
+            .flatten()
+    }
+
+    /// The canonical spelling of a project name, when it is one.
+    pub fn project_slug(name: &str) -> Option<String> {
+        Self::canonical_project_name(name)
+    }
+
     /// The project a working directory belongs to, in this order: a
     /// registered folder, a folder the project used to live in, the `origin`
     /// remote of the repository, then the name the folder goes by. An old
