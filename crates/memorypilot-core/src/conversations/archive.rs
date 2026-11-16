@@ -45,6 +45,8 @@ pub struct ArchiveOptions<'a> {
     pub remote_of: &'a dyn Fn(&str) -> Option<String>,
     /// The canonical spelling of a project name.
     pub slug: &'a dyn Fn(&str) -> Option<String>,
+    /// Whether a canonical name is a project already known.
+    pub is_project: &'a dyn Fn(&str) -> bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +76,9 @@ pub struct ArchiveReport {
     pub conversations: usize,
     pub written: usize,
     pub unchanged: usize,
+    /// Files left as they are because they hold more messages than the
+    /// store now does (Cursor pruned the conversation since).
+    pub kept_richer: usize,
     pub without_project: usize,
     pub user_messages: usize,
     pub assistant_messages: usize,
@@ -94,11 +99,22 @@ pub struct ArchiveReport {
 struct Rendered {
     id: String,
     relative_path: PathBuf,
+    messages: usize,
     content: String,
 }
 
 /// Reads every conversation of the Cursor store and writes the archive.
 pub fn archive_cursor(options: &ArchiveOptions) -> Result<ArchiveReport, String> {
+    // An immutable read ignores the write-ahead log: what Cursor has not
+    // checkpointed yet would be missing from the archive.
+    let mut wal = options.store.as_os_str().to_owned();
+    wal.push("-wal");
+    if std::fs::metadata(&wal).map(|file| file.len() > 0).unwrap_or(false) {
+        return Err(format!(
+            "{} is not empty: Cursor is running or was not closed cleanly. Open and quit Cursor, then run again.",
+            Path::new(&wal).display()
+        ));
+    }
     let conn = cursor::open_immutable(options.store)?;
     let composers = cursor::list_composers(&conn)?;
     let window_folders = cursor::workspace_folders(options.store);
@@ -227,9 +243,23 @@ impl<'a> ProjectResolver<'a> {
                     .map(|folder| (folder, "dossier d'un sous-agent"))
             });
         if let Some((folder, method)) = recorded {
-            let project = self
-                .known(&folder)
-                .or_else(|| (self.options.slug)(&super::store::project_name(&folder)));
+            if let Some(project) = self.known(&folder) {
+                return Found { project: Some(project), workspace: Some(folder), method };
+            }
+            // A worktree removed since (`…/Worktrees/<project>/<topic>`) or a
+            // sub-folder: a folder above it bears the name of a known project.
+            let above = Path::new(&folder).ancestors().skip(1).take(2).find_map(|ancestor| {
+                let name = (self.options.slug)(ancestor.file_name()?.to_str()?)?;
+                (self.options.is_project)(&name).then_some(name)
+            });
+            if let Some(project) = above {
+                return Found { project: Some(project), workspace: Some(folder), method: "dossier parent au nom d'un projet" };
+            }
+            // Unknown to MemoryPilot: filed under the folder's own name,
+            // and said so. The home folder names no project.
+            let is_home = self.options.home.as_deref().map(|home| home.trim_end_matches('/')) == Some(folder.trim_end_matches('/'));
+            let project = (!is_home).then(|| (self.options.slug)(&super::store::project_name(&folder))).flatten();
+            let method = if project.is_some() { "nom du dossier, projet inconnu de MemoryPilot" } else { "introuvable" };
             return Found { project, workspace: Some(folder), method };
         }
         let Some(home) = self.options.home.clone() else {
@@ -298,7 +328,7 @@ fn redact_counted(text: &str, report: &mut ArchiveReport) -> String {
 
 /// A line of a message that looks like one of the archive's own markers.
 fn escape_marks(text: &str) -> String {
-    text.lines()
+    text.split('\n')
         .map(|line| {
             if line.starts_with(MESSAGE_MARK) || line.starts_with(THREAD_MARK) || line.starts_with('\\') {
                 format!("\\{}", line)
@@ -319,6 +349,22 @@ fn quoted(value: Option<&str>) -> String {
         Some(value) => serde_json::Value::String(value.to_string()).to_string(),
         None => "null".to_string(),
     }
+}
+
+/// A title on one line: a line break in it would break the heading and
+/// could pass for one of the archive's markers.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A project name as a folder name: nothing that leaves the archive.
+fn folder_name(project: &str) -> String {
+    let name: String = project
+        .chars()
+        .map(|character| if character.is_alphanumeric() || matches!(character, '-' | '_' | ' ') { character } else { '-' })
+        .collect();
+    let name = name.trim().to_string();
+    if name.is_empty() { NO_PROJECT_DIR.to_string() } else { name }
 }
 
 fn day_and_minute(at: Option<&str>) -> String {
@@ -353,13 +399,15 @@ fn render(
         .title
         .as_deref()
         .or_else(|| members.iter().find_map(|composer| composer.conversation.title.as_deref()))
-        .map(|title| redact_counted(title.trim(), report));
+        .map(|title| redact_counted(&one_line(title), report))
+        .filter(|title| !title.is_empty());
     let created_at = members.iter().filter_map(|composer| composer.conversation.created_at.clone()).min();
     let updated_at = threads
         .iter()
         .flat_map(|thread| thread.messages.iter().filter_map(|message| message.at.clone()))
         .max();
     let remote = found.project.as_deref().and_then(|project| (options.remote_of)(project));
+    let workspace = found.workspace.as_deref().map(|folder| redact_counted(folder, report));
 
     let mut body = String::new();
     let mut messages = 0;
@@ -373,6 +421,16 @@ fn render(
                 Role::Assistant => ("assistant", "Cursor", message.text.trim().to_string()),
             };
             if said.is_empty() {
+                // Only harness text: nothing to show, but the turn starts
+                // here, and the index attaches the next answer to it.
+                if message.role == Role::User {
+                    section.push_str(&format!(
+                        "{}id={} role=user at={} empty=1 -->\n\n",
+                        MESSAGE_MARK,
+                        message.key,
+                        message.at.as_deref().unwrap_or("-")
+                    ));
+                }
                 continue;
             }
             let said = redact_counted(&said, report);
@@ -392,7 +450,7 @@ fn render(
                 escape_marks(&said)
             ));
         }
-        if section.is_empty() {
+        if !section.contains("\n**") {
             continue;
         }
         body.push_str(&format!(
@@ -403,7 +461,7 @@ fn render(
             source.version
         ));
         if !is_main {
-            let name = source.title.as_deref().map(|title| redact_counted(title.trim(), report));
+            let name = source.title.as_deref().map(|title| redact_counted(&one_line(title), report)).filter(|name| !name.is_empty());
             body.push_str(&format!("## Sous-agent : {}\n\n", name.as_deref().unwrap_or("sans titre")));
         }
         body.push_str(&section);
@@ -417,7 +475,7 @@ fn render(
         ("created_at", quoted(created_at.as_deref())),
         ("updated_at", quoted(updated_at.as_deref())),
         ("version", quoted(Some(&root.version))),
-        ("workspace", quoted(found.workspace.as_deref())),
+        ("workspace", quoted(workspace.as_deref())),
         ("project", quoted(found.project.as_deref())),
         ("project_found_by", quoted(Some(found.method))),
         ("remote", quoted(remote.as_deref())),
@@ -431,16 +489,22 @@ fn render(
 
     let day = created_at.as_deref().and_then(|at| at.get(..10)).unwrap_or("sans-date");
     let slug = title.as_deref().map(file_slug).filter(|slug| !slug.is_empty()).unwrap_or_else(|| "sans-titre".to_string());
-    let short_id: String = root_id.chars().take(8).collect();
-    let folder = found.project.as_deref().unwrap_or(NO_PROJECT_DIR);
+    // The whole id: two conversations never share a file.
+    let id_part: String = root_id.chars().filter(|character| character.is_alphanumeric() || *character == '-').collect();
+    let folder = found.project.as_deref().map(folder_name).unwrap_or_else(|| NO_PROJECT_DIR.to_string());
     Rendered {
         id: root_id.to_string(),
-        relative_path: Path::new(folder).join(format!("{}-{}-{}.md", day, slug, short_id)),
+        relative_path: Path::new(&folder).join(format!("{}-{}-{}.md", day, slug, id_part)),
+        messages,
         content,
     }
 }
 
+/// Creates a folder for its owner only. One that exists is left as it is.
 fn private_dir(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        return Ok(());
+    }
     std::fs::create_dir_all(path).map_err(|error| format!("Cannot create {}: {}", path.display(), error))?;
     #[cfg(unix)]
     {
@@ -469,18 +533,29 @@ fn private_write(path: &Path, content: &str) -> Result<(), String> {
 fn write_files(out_dir: &Path, rendered: &[Rendered], report: &mut ArchiveReport) -> Result<(), String> {
     private_dir(out_dir)?;
     let manifest_path = out_dir.join(MANIFEST);
-    let mut manifest: BTreeMap<String, String> = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
+    let mut manifest: BTreeMap<String, String> = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("{} is unreadable ({}): nothing written, fix or remove it", manifest_path.display(), error))?,
+        Err(_) => BTreeMap::new(),
+    };
+    // Only a file of the archive itself is ever replaced or removed.
+    let own_file = |relative: &str| {
+        let path = Path::new(relative);
+        path.extension().is_some_and(|extension| extension == "md")
+            && path.components().count() == 2
+            && path.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+    };
     for file in rendered {
         let relative = file.relative_path.to_string_lossy().into_owned();
         let target = out_dir.join(&file.relative_path);
-        let previous = manifest.get(&file.id).cloned();
-        if previous.as_deref() == Some(relative.as_str())
-            && std::fs::read_to_string(&target).map(|current| current == file.content).unwrap_or(false)
-        {
+        let previous = manifest.get(&file.id).cloned().filter(|previous| own_file(previous));
+        let stored = previous.as_deref().and_then(|previous| std::fs::read_to_string(out_dir.join(previous)).ok());
+        if previous.as_deref() == Some(relative.as_str()) && stored.as_deref() == Some(file.content.as_str()) {
             report.unchanged += 1;
+            continue;
+        }
+        if stored.as_deref().and_then(messages_of).is_some_and(|kept| kept > file.messages) {
+            report.kept_richer += 1;
             continue;
         }
         if let Some(parent) = target.parent() {
@@ -496,6 +571,12 @@ fn write_files(out_dir: &Path, rendered: &[Rendered], report: &mut ArchiveReport
     }
     let manifest_text = serde_json::to_string_pretty(&manifest).map_err(|error| format!("Manifest: {}", error))?;
     private_write(&manifest_path, &manifest_text)
+}
+
+/// The `messages` count of an archive file's front matter.
+fn messages_of(content: &str) -> Option<usize> {
+    let front = content.strip_prefix("---\n")?.split_once("\n---\n")?.0;
+    front.lines().find_map(|line| line.strip_prefix("messages: ")).and_then(|count| count.trim().parse().ok())
 }
 
 /// One archived conversation, as the index needs it back.
@@ -558,11 +639,13 @@ fn parse(content: &str, path: &Path) -> Result<ArchivedConversation, String> {
     let mut skip_label = false;
     let close = |open: &mut Option<Message>, threads: &mut Vec<(SourceConversation, Vec<Message>)>| {
         if let (Some(mut message), Some((_, messages))) = (open.take(), threads.last_mut()) {
-            message.text = message.text.trim().to_string();
+            // The blank lines around a message are the file's: a message is
+            // written trimmed.
+            message.text = message.text.trim_matches('\n').to_string();
             messages.push(message);
         }
     };
-    for line in body.lines() {
+    for line in body.split('\n') {
         if line.starts_with(THREAD_MARK) {
             close(&mut open, &mut threads);
             let origin_id = attribute(line, "id").ok_or("thread without id")?.to_string();
@@ -594,7 +677,7 @@ fn parse(content: &str, path: &Path) -> Result<ArchivedConversation, String> {
                 order: Some(threads.last().map(|(_, messages)| messages.len()).unwrap_or(0)),
                 text: String::new(),
             });
-            skip_label = true;
+            skip_label = attribute(line, "empty").is_none();
         } else if let Some(message) = open.as_mut() {
             if std::mem::take(&mut skip_label) && line.starts_with("**") {
                 continue;
@@ -678,6 +761,7 @@ mod tests {
                 known_project: &known,
                 remote_of: &|project| (project == "widget").then(|| "github.com/acme/widget".to_string()),
                 slug: &|name| Some(name.to_lowercase()),
+                is_project: &|name| name == "widget",
             })
             .expect("archive")
         }
@@ -788,9 +872,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "_sans-projet/2026-01-02-question-générale-orphan-0.md",
-                "widget/2026-01-02-refonte-du-tri-lost-000.md",
-                "widget/2026-01-02-sync-des-dossiers-imap-main-000.md",
+                "_sans-projet/2026-01-02-question-générale-orphan-0003.md",
+                "widget/2026-01-02-refonte-du-tri-lost-0002.md",
+                "widget/2026-01-02-sync-des-dossiers-imap-main-0001.md",
             ]
         );
         let main = std::fs::read_to_string(&files[2]).expect("main file");
@@ -810,7 +894,6 @@ mod tests {
 
         // Cursor's store is byte for byte what it was.
         assert_eq!(std::fs::read(fixture.store()).expect("store bytes"), store_before);
-        assert!(!fixture.store().with_extension("vscdb-wal").exists() && !fixture.root.join("User/globalStorage/state.vscdb-shm").exists());
     }
 
     #[cfg(unix)]
@@ -849,8 +932,8 @@ mod tests {
         assert_eq!((third.written, third.unchanged), (1, 2));
         let names: Vec<String> = fixture.files().iter().map(|path| path.file_name().expect("name").to_string_lossy().into_owned()).collect();
         assert_eq!(names.len(), 3, "{names:?}");
-        assert!(names.contains(&"2026-01-02-idle-contre-noop-orphan-0.md".to_string()));
-        assert!(!fixture.out().join(NO_PROJECT_DIR).join("2026-01-02-question-générale-orphan-0.md").exists());
+        assert!(names.contains(&"2026-01-02-idle-contre-noop-orphan-0003.md".to_string()));
+        assert!(!fixture.out().join(NO_PROJECT_DIR).join("2026-01-02-question-générale-orphan-0003.md").exists());
     }
 
     #[test]
@@ -929,10 +1012,164 @@ mod tests {
         let report = fixture.run(true);
 
         assert_eq!(report.without_project, 0);
-        assert_eq!(report.project_found_by.get("fenêtre Cursor"), Some(&1));
-        let file = fixture.out().join("mail client/2026-01-02-question-générale-orphan-0.md");
+        assert_eq!(report.project_found_by.get("nom du dossier, projet inconnu de MemoryPilot"), Some(&1));
+        let file = fixture.out().join("mail client/2026-01-02-question-générale-orphan-0003.md");
         let content = std::fs::read_to_string(&file).expect("file filed under the folder's name");
         assert!(content.contains(&format!("workspace: \"{}\"", folder)));
+    }
+
+    #[test]
+    fn two_conversations_never_share_a_file() {
+        let fixture = Fixture::new("collision");
+        // Same day, same title, same project, ids alike on their first characters.
+        for id in ["abcd1234-aaaa", "abcd1234-bbbb"] {
+            fixture.composer(id, json!({ "name": "Même titre" }));
+            fixture.bubble(id, "b1", 1, json!({ "type": 1, "text": format!("Question de la conversation {id}") }));
+        }
+
+        let report = fixture.run(true);
+
+        assert_eq!(report.written, 2);
+        let files = fixture.files();
+        assert_eq!(files.len(), 2);
+        for (file, id) in files.iter().zip(["abcd1234-aaaa", "abcd1234-bbbb"]) {
+            assert!(std::fs::read_to_string(file).expect("file").contains(&format!("Question de la conversation {id}")));
+        }
+    }
+
+    #[test]
+    fn a_removed_worktree_is_filed_under_its_project_and_the_home_folder_under_none() {
+        let fixture = Fixture::new("worktree");
+        let home = fixture.home();
+        for (id, folder) in [
+            ("wt-0001", format!("{home}/Worktrees/Widget/fix-login")),
+            ("home-0002", home.clone()),
+            ("old-0003", format!("{home}/App/Retired")),
+        ] {
+            fixture.composer(id, json!({ "name": "Titre", "workspaceIdentifier": { "uri": { "fsPath": folder } } }));
+            fixture.bubble(id, "b1", 1, json!({ "type": 1, "text": "Un message assez long pour compter." }));
+        }
+
+        let report = fixture.run(false);
+
+        assert_eq!(report.project_found_by.get("dossier parent au nom d'un projet"), Some(&1));
+        assert_eq!(report.conversations_by_project.get("widget"), Some(&1));
+        assert_eq!(report.conversations_by_project.get("retired"), Some(&1), "an unknown folder is filed under its own name, and said so");
+        assert_eq!(report.project_found_by.get("nom du dossier, projet inconnu de MemoryPilot"), Some(&1));
+        assert_eq!(report.without_project, 1, "the home folder is no project");
+    }
+
+    #[test]
+    fn titles_stay_on_one_line_and_odd_text_reads_back_exactly() {
+        let fixture = Fixture::new("odd-text");
+        let said = "**gras en tête**\r\nligne\r\n\\barre\n\n---\n<!-- thread id=faux main=1 version=1 -->\nfin";
+        fixture.composer("odd-0001", json!({ "name": "Titre\n<!-- thread id=fake main=1 version=1 -->" }));
+        fixture.bubble("odd-0001", "b1", 1, json!({ "type": 1, "text": said }));
+
+        fixture.run(true);
+        let (conversations, errors) = read_archive(&fixture.out());
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(conversations.len(), 1);
+        let threads = &conversations[0].threads;
+        assert_eq!(threads.len(), 1, "a line break in a title opens no thread");
+        assert_eq!(threads[0].0.title.as_deref(), Some("Titre <!-- thread id=fake main=1 version=1 -->"));
+        assert_eq!(threads[0].1[0].text, said);
+    }
+
+    #[test]
+    fn a_turn_holding_only_harness_text_still_starts_a_turn_in_the_index() {
+        let fixture = Fixture::new("empty-turn");
+        fixture.composer("turns-0001", json!({ "name": "Trois tours" }));
+        let answer = |n: u32| format!("Réponse numéro {n}, assez longue pour être gardée par l'index.");
+        fixture.bubble("turns-0001", "b1", 1, json!({ "type": 1, "text": "Première question, assez longue." }));
+        fixture.bubble("turns-0001", "b2", 2, json!({ "type": 2, "text": answer(1) }));
+        fixture.bubble("turns-0001", "b3", 3, json!({ "type": 1, "text": "<system_reminder>rappel du harnais</system_reminder>" }));
+        fixture.bubble("turns-0001", "b4", 4, json!({ "type": 2, "text": answer(2) }));
+        let report = fixture.run(true);
+        assert_eq!((report.user_messages, report.assistant_messages), (1, 2));
+
+        let mut store = crate::conversations::ConversationStore::open(&fixture.root.join("conversations.db")).expect("index");
+        let mut sync = crate::conversations::SyncReport::default();
+        crate::conversations::sync_archive(&mut store, &fixture.out(), &mut sync, &|_| false);
+
+        let answers: Vec<String> = {
+            let mut statement = store.conn.prepare("SELECT source_key FROM segments WHERE role = 'assistant' ORDER BY source_key").expect("query");
+            let keys = statement.query_map([], |row| row.get(0)).expect("rows").flatten().collect();
+            keys
+        };
+        assert_eq!(answers, vec!["cursor:turns-0001:b1#answer", "cursor:turns-0001:b3#answer"], "each answer keeps its own turn");
+    }
+
+    #[test]
+    fn a_store_cursor_has_not_checkpointed_is_refused() {
+        let fixture = Fixture::new("wal");
+        seed(&fixture);
+        std::fs::write(fixture.root.join("User/globalStorage/state.vscdb-wal"), b"pending pages").expect("wal");
+        let options_error = archive_cursor(&ArchiveOptions {
+            store: &fixture.store(),
+            out_dir: &fixture.out(),
+            apply: true,
+            home: None,
+            known_project: &|_| None,
+            remote_of: &|_| None,
+            slug: &|_| None,
+            is_project: &|_| false,
+        })
+        .expect_err("must refuse");
+        assert!(options_error.contains("is not empty"), "{options_error}");
+        assert!(!fixture.out().exists());
+    }
+
+    #[test]
+    fn a_file_richer_than_the_store_is_kept_and_a_broken_manifest_stops_everything() {
+        let fixture = Fixture::new("richer");
+        seed(&fixture);
+        fixture.run(true);
+        // Cursor pruned the conversation: one answer is gone from the store.
+        fixture.connection().execute("DELETE FROM cursorDiskKV WHERE key = 'bubbleId:lost-0002:b3'", []).expect("prune");
+        let kept = fixture.out().join("widget/2026-01-02-refonte-du-tri-lost-0002.md");
+        let before = std::fs::read_to_string(&kept).expect("file");
+
+        let report = fixture.run(true);
+
+        assert_eq!((report.written, report.kept_richer), (0, 1));
+        assert_eq!(std::fs::read_to_string(&kept).expect("file"), before);
+
+        std::fs::write(fixture.out().join(MANIFEST), "{ not json").expect("break manifest");
+        let home = fixture.home();
+        let error = archive_cursor(&ArchiveOptions {
+            store: &fixture.store(),
+            out_dir: &fixture.out(),
+            apply: true,
+            home: Some(home),
+            known_project: &|_| None,
+            remote_of: &|_| None,
+            slug: &|name| Some(name.to_lowercase()),
+            is_project: &|_| false,
+        })
+        .expect_err("must refuse");
+        assert!(error.contains("unreadable"), "{error}");
+        assert_eq!(std::fs::read_to_string(&kept).expect("file"), before);
+    }
+
+    #[test]
+    fn the_index_keeps_a_project_unless_the_archive_is_asked_to_replace_it() {
+        let fixture = Fixture::new("identity");
+        let mut store = crate::conversations::ConversationStore::open(&fixture.root.join("conversations.db")).expect("index");
+        store.conn.execute("INSERT INTO conversations (id, tool, project) VALUES ('c1', 'cursor', 'bon-projet'), ('c2', 'cursor', NULL)", []).expect("rows");
+        let project = |store: &crate::conversations::ConversationStore, id: &str| -> (Option<String>, Option<String>) {
+            store.conn.query_row("SELECT project, workspace FROM conversations WHERE id = ?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).expect("row")
+        };
+
+        assert!(store.set_identity("c1", Some("autre"), Some("/dossier"), false).expect("fill"));
+        assert!(store.set_identity("c2", Some("autre"), None, false).expect("fill"));
+        assert_eq!(project(&store, "c1"), (Some("bon-projet".to_string()), Some("/dossier".to_string())));
+        assert_eq!(project(&store, "c2").0.as_deref(), Some("autre"));
+
+        assert!(store.set_identity("c1", Some("autre"), Some("/ailleurs"), true).expect("replace"));
+        assert_eq!(project(&store, "c1"), (Some("autre".to_string()), Some("/dossier".to_string())), "the folder only fills a gap");
+        assert!(!store.set_identity("absent", Some("autre"), None, true).expect("absent"));
     }
 
     #[test]

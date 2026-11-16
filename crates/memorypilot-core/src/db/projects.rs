@@ -585,6 +585,11 @@ impl Database {
             })
     }
 
+    /// Whether a canonical name is a project holding a row or memories.
+    pub fn is_known_project(&self, name: &str) -> bool {
+        self.project_is_known(name)
+    }
+
     /// The remote recorded for a project.
     pub fn project_remote(&self, name: &str) -> Option<String> {
         self.conn

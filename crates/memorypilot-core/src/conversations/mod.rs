@@ -171,6 +171,7 @@ pub fn sync_archive(
     let (conversations, errors) = archive::read_archive(dir);
     report.errors.extend(errors);
     for conversation in &conversations {
+        let mut read = false;
         for (source, messages) in &conversation.threads {
             if over_budget(report) {
                 return;
@@ -190,12 +191,17 @@ pub fn sync_archive(
                 Ok(written) => {
                     report.messages_written += written;
                     report.origins_updated += 1;
+                    read = true;
                 }
                 Err(error) => report.errors.push(error),
             }
         }
-        if let Err(error) = store.set_identity(&conversation.id, conversation.project.as_deref(), conversation.workspace.as_deref()) {
-            report.errors.push(error);
+        // Once, when the conversation enters the index: a project given to
+        // it since (a rename, a merge) is never overwritten by the archive.
+        if read {
+            if let Err(error) = store.set_identity(&conversation.id, conversation.project.as_deref(), conversation.workspace.as_deref(), true) {
+                report.errors.push(error);
+            }
         }
     }
 }

@@ -243,13 +243,25 @@ impl ConversationStore {
     }
 
     /// Records the project and folder the archive found for a conversation
-    /// already indexed. Returns whether the conversation is in the index.
-    pub fn set_identity(&mut self, conversation_id: &str, project: Option<&str>, workspace: Option<&str>) -> Result<bool, String> {
+    /// already indexed. The folder only fills a gap. The project replaces
+    /// the one in place with `replace` (the archive was just built and
+    /// checked), else only fills a gap too. Returns whether the
+    /// conversation is in the index.
+    pub fn set_identity(
+        &mut self,
+        conversation_id: &str,
+        project: Option<&str>,
+        workspace: Option<&str>,
+        replace: bool,
+    ) -> Result<bool, String> {
         let changed = self
             .conn
             .execute(
-                "UPDATE conversations SET project = COALESCE(?2, project), workspace = COALESCE(workspace, ?3) WHERE id = ?1",
-                params![conversation_id, project, workspace],
+                "UPDATE conversations SET
+                    project = CASE WHEN ?4 THEN COALESCE(?2, project) ELSE COALESCE(project, ?2) END,
+                    workspace = COALESCE(workspace, ?3)
+                 WHERE id = ?1",
+                params![conversation_id, project, workspace, replace],
             )
             .map_err(|error| format!("Conversation identity: {}", error))?;
         Ok(changed > 0)

@@ -87,7 +87,7 @@ pub fn run_archive(args: &[String]) {
         let mut updated = 0;
         let mut absent = 0;
         for conversation in &conversations {
-            match store.set_identity(&conversation.id, conversation.project.as_deref(), conversation.workspace.as_deref()) {
+            match store.set_identity(&conversation.id, conversation.project.as_deref(), conversation.workspace.as_deref(), true) {
                 Ok(true) => updated += 1,
                 Ok(false) => absent += 1,
                 Err(error) => fail(error),
@@ -117,9 +117,11 @@ pub fn run_archive(args: &[String]) {
         known_project: &|folder| db.known_project_for_path(folder),
         remote_of: &|project| db.project_remote(project),
         slug: &|name| Database::project_slug(name),
+        is_project: &|name| db.is_known_project(name),
     };
     match archive::archive_cursor(&options) {
         Ok(report) => {
+            let incomplete = !report.unreadable.is_empty();
             let mut value = serde_json::to_value(&report).unwrap_or_default();
             value["known_secret_prints"] = json!(known_prints);
             println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
@@ -130,6 +132,10 @@ pub fn run_archive(args: &[String]) {
                 report.without_project,
                 report.secrets_masked
             );
+            if incomplete {
+                eprintln!("✗ {} conversation(s) illisible(s), voir \"unreadable\".", report.unreadable.len());
+                std::process::exit(3);
+            }
         }
         Err(error) => fail(error),
     }

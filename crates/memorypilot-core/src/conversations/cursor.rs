@@ -45,8 +45,8 @@ pub fn open_immutable(path: &Path) -> Result<Connection, String> {
     let mut uri = String::from("file:");
     for byte in path.to_string_lossy().bytes() {
         match byte {
-            b'%' | b'?' | b'#' | b' ' => uri.push_str(&format!("%{:02X}", byte)),
-            _ => uri.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => uri.push(byte as char),
+            _ => uri.push_str(&format!("%{:02X}", byte)),
         }
     }
     uri.push_str("?mode=ro&immutable=1");
@@ -401,4 +401,24 @@ fn timestamp_of(value: &serde_json::Value) -> Option<String> {
 
 fn millis_to_rfc3339(millis: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(millis).map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_store_under_a_folder_with_accents_and_spaces_opens() {
+        let dir = std::env::temp_dir().join(format!("memory-pilot-cursor-é à #-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("folder");
+        let path = dir.join("state.vscdb");
+        Connection::open(&path)
+            .and_then(|conn| conn.execute_batch("CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB);"))
+            .expect("store");
+
+        let conn = open_immutable(&path).expect("open");
+        assert!(list_composers(&conn).expect("composers").is_empty());
+        assert!(conn.execute("INSERT INTO cursorDiskKV VALUES ('k', 'v')", []).is_err(), "nothing can be written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
