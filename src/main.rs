@@ -697,10 +697,17 @@ fn run_benchmark_longmemeval(args: &[String]) {
     } else {
         None
     };
+    // `--coverage 10,20,30`: whether every gold session is in the first N turns.
+    let coverage_depths: Vec<usize> = args
+        .windows(2)
+        .find(|w| w[0] == "--coverage")
+        .map(|w| w[1].split(',').filter_map(|depth| depth.trim().parse().ok()).filter(|depth| *depth > 0).collect())
+        .unwrap_or_default();
     let options = db::LongMemEvalOptions {
         limit,
         reader: args.iter().any(|a| a == "--reader"),
         end_to_end,
+        coverage_depths,
     };
     match db::Database::benchmark_longmemeval(dataset_path, options) {
         Ok(report) => {
@@ -1295,7 +1302,7 @@ fn print_help() {
     println!("  MemoryPilot --rollback-update NAME  Put back the previous copy of a vendor skill or plugin; the version undone is not installed again");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
-    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e]  LongMemEval retrieval benchmark");
+    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM)");
     println!("      --reader  Extractive reader on the top 5, SQuAD-style exact match / F1 against the gold answer");
     println!("      --e2e     End-to-end accuracy: an LLM answers from the top 10, an LLM judge grades it (official LongMemEval prompts)");
     println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot]", db::OFFICIAL_JUDGE_MODEL);

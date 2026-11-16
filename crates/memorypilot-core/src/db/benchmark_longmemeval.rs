@@ -19,6 +19,11 @@ pub struct LongMemEvalOptions {
     /// End-to-end QA: an LLM answers from the retrieved turns and an LLM
     /// judge grades the answer, with the official LongMemEval prompts.
     pub end_to_end: Option<EndToEndOptions>,
+    /// Context sizes (in retrieved turns) at which to report whether every
+    /// gold session of a question is present. Costs one more search per
+    /// question and no LLM call: it tells whether a wrong answer could have
+    /// been right with a larger context, or had everything it needed.
+    pub coverage_depths: Vec<usize>,
 }
 
 /// Settings of the end-to-end evaluation (see [`crate::llm`]).
@@ -95,6 +100,29 @@ struct QaScore {
     f1: f64,
     contains: bool,
     answered: bool,
+}
+
+/// Per depth: the questions whose every gold session is among the turns
+/// retrieved, over all questions and over those with several gold sessions.
+fn context_coverage_report(depths: &[usize], rows: &[serde_json::Value]) -> serde_json::Value {
+    if depths.is_empty() {
+        return serde_json::Value::Null;
+    }
+    let complete = |row: &serde_json::Value, depth: usize| -> bool {
+        row["gold_sessions_found_at"][depth.to_string()].as_u64() == row["gold_sessions"].as_u64()
+    };
+    let several: Vec<&serde_json::Value> = rows.iter().filter(|row| row["gold_sessions"].as_u64().unwrap_or(0) > 1).collect();
+    let mut by_depth = serde_json::Map::new();
+    for depth in depths {
+        by_depth.insert(
+            depth.to_string(),
+            json!({
+                "every_gold_session_present": format!("{}/{}", rows.iter().filter(|row| complete(row, *depth)).count(), rows.len()),
+                "among_questions_with_several_gold_sessions": format!("{}/{}", several.iter().filter(|row| complete(row, *depth)).count(), several.len()),
+            }),
+        );
+    }
+    json!({ "depths_in_turns": depths, "by_depth": by_depth, "questions": rows })
 }
 
 impl Database {
@@ -264,6 +292,7 @@ impl Database {
         let mut total_search_ms = 0.0f64;
         let mut total_reader_ms = 0.0f64;
         let mut misses: Vec<serde_json::Value> = Vec::new();
+        let mut coverage_rows: Vec<serde_json::Value> = Vec::new();
         let mut qa_failures: Vec<serde_json::Value> = Vec::new();
 
         for (qi, (entry, is_abs)) in selected.iter().enumerate() {
@@ -491,6 +520,30 @@ impl Database {
             }
 
             let result_ids: Vec<&str> = results.iter().map(|r| r.memory.id.as_str()).collect();
+            if let Some(deepest) = options.coverage_depths.iter().copied().max() {
+                // A separate search: a larger limit may reorder the first ten.
+                match db.search_at(question_now, question, deepest, None, None, None, None) {
+                    Ok((deep, _)) => {
+                        let ids: Vec<&str> = deep.iter().map(|r| r.memory.id.as_str()).collect();
+                        let mut covered = serde_json::Map::new();
+                        for depth in &options.coverage_depths {
+                            let found = answer_session_ids
+                                .iter()
+                                .filter(|gold| ids.iter().take(*depth).any(|id| id.starts_with(gold.as_str())))
+                                .count();
+                            covered.insert(depth.to_string(), json!(found));
+                        }
+                        coverage_rows.push(json!({
+                            "question_id": entry.get("question_id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "question_type": question_type,
+                            "gold_sessions": answer_session_ids.len(),
+                            "turns_returned": ids.len(),
+                            "gold_sessions_found_at": covered,
+                        }));
+                    }
+                    Err(e) => eprintln!("[LongMemEval] Q{}: coverage search failed: {}", qi, e),
+                }
+            }
             let matches_gold =
                 |id: &&str| -> bool { answer_session_ids.iter().any(|gold| id.starts_with(gold)) };
 
@@ -702,6 +755,7 @@ impl Database {
                 "avg_search_latency_ms": avg_ms,
             },
             "abstention": abstention_report,
+            "context_coverage": context_coverage_report(&options.coverage_depths, &coverage_rows),
             "misses": misses,
             "gold_ranks": outcomes.iter().map(|o| o.best_rank).collect::<Vec<_>>(),
             "by_category": by_category,
