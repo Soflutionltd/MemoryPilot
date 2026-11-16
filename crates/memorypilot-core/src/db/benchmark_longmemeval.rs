@@ -1429,6 +1429,7 @@ mod tests {
             session_date: date.to_string(),
             role: role.to_string(),
             content: content.to_string(),
+            evidence: false,
         }
     }
 
@@ -1459,6 +1460,7 @@ mod tests {
             session_date: format!("2023/05/{:02} (Mon) 09:00", day),
             role: role.to_string(),
             content: content.to_string(),
+            evidence: false,
         };
         let turns = [
             turn("late__t0", 20, "user", "I moved to Lyon."),
