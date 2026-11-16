@@ -3,6 +3,8 @@
 //! Used by the LongMemEval end-to-end evaluation only: one `user` message,
 //! temperature 0, bounded output. The same code reaches OpenAI, Anthropic's
 //! OpenAI-compatible endpoint, Ollama or LM Studio through `base_url`.
+//! Anthropic rejects `temperature` on its current models, so it is left to
+//! the server default there.
 
 use std::time::Duration;
 
@@ -20,6 +22,8 @@ pub struct Completion {
     pub text: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// `finish_reason` was `length`: the output hit `max_tokens`.
+    pub truncated: bool,
 }
 
 /// Connection to one OpenAI-compatible endpoint.
@@ -27,7 +31,11 @@ pub struct ChatClient {
     agent: ureq::Agent,
     endpoint: String,
     api_key: Option<String>,
+    sends_temperature: bool,
 }
+
+/// Anthropic's endpoint: `temperature` returns a 400 on its current models.
+const ANTHROPIC_HOST: &str = "api.anthropic.com";
 
 impl ChatClient {
     /// `base_url` must be HTTPS, or plain HTTP on a loopback host, so an
@@ -45,7 +53,13 @@ impl ChatClient {
             agent,
             endpoint: format!("{}/chat/completions", base),
             api_key: api_key.filter(|key| !key.trim().is_empty()),
+            sends_temperature: url_host(base) != ANTHROPIC_HOST,
         })
+    }
+
+    /// False when requests leave `temperature` to the server default.
+    pub fn sends_temperature(&self) -> bool {
+        self.sends_temperature
     }
 
     /// Sends `prompt` as a single user message, retrying on 429, 5xx and
@@ -63,14 +77,16 @@ impl ChatClient {
     }
 
     fn complete_raw(&self, model: &str, prompt: &str, max_tokens: u32) -> Result<Completion, String> {
-        let body = json!({
+        let mut body = json!({
             "model": model,
             "messages": [{ "role": "user", "content": prompt }],
             "n": 1,
-            "temperature": 0,
             "max_tokens": max_tokens,
-        })
-        .to_string();
+        });
+        if self.sends_temperature {
+            body["temperature"] = json!(0);
+        }
+        let body = body.to_string();
 
         let mut last_error = String::new();
         for attempt in 0..MAX_ATTEMPTS {
@@ -145,11 +161,20 @@ fn parse_completion(text: &str) -> Result<Completion, String> {
         .and_then(|content| content.as_str())
         .ok_or_else(|| format!("no choices[0].message.content in LLM response: {}", excerpt(text)))?;
     let usage = |field: &str| value.pointer(&format!("/usage/{}", field)).and_then(|v| v.as_u64()).unwrap_or(0);
+    let truncated = value.pointer("/choices/0/finish_reason").and_then(|reason| reason.as_str()) == Some("length");
     Ok(Completion {
+        truncated,
         text: content.trim().to_string(),
         prompt_tokens: usage("prompt_tokens"),
         completion_tokens: usage("completion_tokens"),
     })
+}
+
+/// Host of an already validated base URL, lowercased, without port.
+fn url_host(base: &str) -> String {
+    let rest = base.split_once("://").map(|(_, rest)| rest).unwrap_or(base);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.rsplit_once(':').map(|(host, _)| host).unwrap_or(authority).to_lowercase()
 }
 
 fn excerpt(text: &str) -> String {
@@ -190,6 +215,21 @@ mod tests {
         assert_eq!(parsed.text, "Yes.");
         assert_eq!(parsed.prompt_tokens, 120);
         assert_eq!(parsed.completion_tokens, 2);
+        assert!(!parsed.truncated);
+        let cut = parse_completion(r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#)
+            .expect("valid completion");
+        assert!(cut.truncated);
+    }
+
+    #[test]
+    fn temperature_is_left_out_only_for_anthropic() {
+        let anthropic = ChatClient::new("https://api.anthropic.com/v1", None).expect("client");
+        assert!(!anthropic.sends_temperature());
+        let openai = ChatClient::new("https://api.openai.com/v1", None).expect("client");
+        assert!(openai.sends_temperature());
+        let local = ChatClient::new("http://localhost:11434/v1", None).expect("client");
+        assert!(local.sends_temperature());
+        assert_eq!(url_host("https://API.Anthropic.com:443/v1"), "api.anthropic.com");
     }
 
     #[test]

@@ -64,6 +64,12 @@ struct EndToEndTotals {
     judge_prompt_tokens: u64,
     judge_completion_tokens: u64,
     llm_ms: f64,
+    /// Answers cut by `max_tokens` (finish_reason `length`).
+    answers_truncated: usize,
+    /// Verdicts cut at the official 10 tokens, then asked again.
+    verdicts_retried: usize,
+    /// False when the endpoint rejects `temperature` (Anthropic).
+    temperature_sent: bool,
     hypotheses: Vec<serde_json::Value>,
     failures: Vec<serde_json::Value>,
 }
@@ -112,7 +118,10 @@ impl Database {
             .as_ref()
             .map(|e2e| crate::llm::ChatClient::new(&e2e.base_url, e2e.api_key.clone()))
             .transpose()?;
-        let mut e2e_totals = EndToEndTotals::default();
+        let mut e2e_totals = EndToEndTotals {
+            temperature_sent: chat.as_ref().is_some_and(|client| client.sends_temperature()),
+            ..EndToEndTotals::default()
+        };
 
         let is_abstention = |entry: &serde_json::Value| {
             entry
@@ -440,6 +449,8 @@ impl Database {
                 e2e_totals.judge_prompt_tokens += usage.judge_prompt_tokens;
                 e2e_totals.judge_completion_tokens += usage.judge_completion_tokens;
                 e2e_totals.llm_ms += usage.elapsed_ms;
+                e2e_totals.answers_truncated += usize::from(usage.answer_truncated);
+                e2e_totals.verdicts_retried += usize::from(usage.verdict_retried);
                 if !correct && e2e_totals.failures.len() < 60 {
                     e2e_totals.failures.push(json!({
                         "question_id": question_id,
@@ -461,7 +472,7 @@ impl Database {
                     correct,
                 });
                 let graded_count = e2e_totals.outcomes.len();
-                if graded_count % 10 == 0 {
+                if graded_count.is_multiple_of(10) {
                     let right = e2e_totals.outcomes.iter().filter(|o| o.correct).count();
                     eprintln!(
                         "[LongMemEval] end-to-end {}/{}: accuracy {:.1}%",
@@ -729,13 +740,31 @@ impl Database {
         let max_tokens = if e2e.chain_of_thought { 800 } else { 500 };
         let answer = chat.complete(&e2e.answer_model, &answer_prompt, max_tokens)?;
         let judge_prompt = fill_template(judge_template, &[item.question, item.gold_answer, &answer.text]);
-        let verdict = chat.complete(&e2e.judge_model, &judge_prompt, 10)?;
+        // 10 tokens is the official budget; a thinking model can spend it
+        // before writing yes/no. A cut verdict is asked again with room to
+        // spare, never scored as "no".
+        let first_verdict = chat.complete(&e2e.judge_model, &judge_prompt, JUDGE_MAX_TOKENS)?;
+        let (verdict, verdict_retried, retry_tokens) = if first_verdict.truncated {
+            let retried = chat.complete(&e2e.judge_model, &judge_prompt, JUDGE_RETRY_MAX_TOKENS)?;
+            if retried.truncated {
+                return Err(format!(
+                    "judge verdict still cut at {} tokens: {:?}",
+                    JUDGE_RETRY_MAX_TOKENS, retried.text
+                ));
+            }
+            let spent = (first_verdict.prompt_tokens, first_verdict.completion_tokens);
+            (retried, true, spent)
+        } else {
+            (first_verdict, false, (0, 0))
+        };
         let usage = EndToEndUsage {
             answer_prompt_tokens: answer.prompt_tokens,
             answer_completion_tokens: answer.completion_tokens,
-            judge_prompt_tokens: verdict.prompt_tokens,
-            judge_completion_tokens: verdict.completion_tokens,
+            judge_prompt_tokens: verdict.prompt_tokens + retry_tokens.0,
+            judge_completion_tokens: verdict.completion_tokens + retry_tokens.1,
             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+            answer_truncated: answer.truncated,
+            verdict_retried,
         };
         Ok((answer.text, judge_says_yes(&verdict.text), usage))
     }
@@ -985,6 +1014,11 @@ const JUDGE_KNOWLEDGE_UPDATE: &str = "I will give you a question, a correct answ
 const JUDGE_PREFERENCE: &str = "I will give you a question, a rubric for desired personalized response, and a response from a model. Please answer yes if the response satisfies the desired response. Otherwise, answer no. The model does not need to reflect all the points in the rubric. The response is correct as long as it recalls and utilizes the user's personal information correctly.\n\nQuestion: {}\n\nRubric: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.";
 const JUDGE_ABSTENTION: &str = "I will give you an unanswerable question, an explanation, and a response from a model. Please answer yes if the model correctly identifies the question as unanswerable. The model could say that the information is incomplete, or some other information is given but the asked information is not.\n\nQuestion: {}\n\nExplanation: {}\n\nModel Response: {}\n\nDoes the model correctly identify the question as unanswerable? Answer yes or no only.";
 
+/// The official judge budget (evaluate_qa.py), then the retry budget for a
+/// verdict a thinking model cut short.
+const JUDGE_MAX_TOKENS: u32 = 10;
+const JUDGE_RETRY_MAX_TOKENS: u32 = 2048;
+
 /// The fields of one question the end-to-end step needs.
 struct EndToEndQuestion<'a> {
     question_type: &'a str,
@@ -1001,6 +1035,9 @@ struct EndToEndUsage {
     judge_prompt_tokens: u64,
     judge_completion_tokens: u64,
     elapsed_ms: f64,
+    answer_truncated: bool,
+    /// The verdict was cut at the official 10 tokens and asked again.
+    verdict_retried: bool,
 }
 
 /// Fills each `{}` of `template` with the next value, in one pass, so a
@@ -1098,6 +1135,9 @@ fn end_to_end_report(e2e: &EndToEndOptions, totals: &EndToEndTotals, selected: u
         "judge_model": e2e.judge_model,
         "official_judge": e2e.judge_model == OFFICIAL_JUDGE_MODEL,
         "chain_of_thought": e2e.chain_of_thought,
+        "temperature": if totals.temperature_sent { json!(0) } else { json!("server default (endpoint rejects temperature)") },
+        "answers_truncated_by_max_tokens": totals.answers_truncated,
+        "verdicts_retried_with_larger_budget": totals.verdicts_retried,
         "questions_selected": selected,
         "questions_graded": all.len(),
         "accuracy": e2e_accuracy(&all),
@@ -1288,6 +1328,8 @@ mod tests {
         assert_eq!(report["official_judge"], true);
         assert_eq!(report["questions_selected"], 5);
         assert_eq!(report["questions_graded"], 4);
+        assert_eq!(report["answers_truncated_by_max_tokens"], 0);
+        assert_eq!(report["verdicts_retried_with_larger_budget"], 0);
         assert!(!report.to_string().contains("sk-test"));
         assert!(!format!("{:?}", options).contains("sk-test"));
     }
