@@ -297,11 +297,14 @@ pub enum PairTokenizerKind {
     XlmRoberta,
     /// ModernBERT byte-level BPE, `[CLS] q [SEP] d [SEP]`.
     ModernBert,
+    /// Gemma SentencePiece-style BPE (mmBERT), `<bos> q <eos> d <eos>`.
+    Gemma,
 }
 
 enum PairTokenizer {
     XlmRoberta(crate::tokenizer::Unigram),
     ModernBert(Box<crate::tokenizer::ModernBertBpe>),
+    Gemma(Box<crate::tokenizer::SentencePieceBpe>),
 }
 
 impl PairTokenizer {
@@ -314,6 +317,8 @@ impl PairTokenizer {
                 crate::tokenizer::ModernBertBpe::from_file(path)
                     .map(|tokenizer| PairTokenizer::ModernBert(Box::new(tokenizer)))
             }
+            PairTokenizerKind::Gemma => crate::tokenizer::SentencePieceBpe::from_file(path)
+                .map(|tokenizer| PairTokenizer::Gemma(Box::new(tokenizer))),
         }
     }
 
@@ -321,6 +326,7 @@ impl PairTokenizer {
         match self {
             PairTokenizer::XlmRoberta(tokenizer) => tokenizer.encode_pair(query, document, max_tokens),
             PairTokenizer::ModernBert(tokenizer) => tokenizer.encode_pair(query, document, max_tokens),
+            PairTokenizer::Gemma(tokenizer) => tokenizer.encode_pair(query, document, max_tokens),
         }
     }
 
@@ -328,6 +334,7 @@ impl PairTokenizer {
         match self {
             PairTokenizer::XlmRoberta(tokenizer) => tokenizer.pad_id(),
             PairTokenizer::ModernBert(tokenizer) => tokenizer.pad_id(),
+            PairTokenizer::Gemma(tokenizer) => tokenizer.pad_id(),
         }
     }
 }
@@ -718,14 +725,21 @@ const JINA_V2_INT8: OrtRerankerSpec = OrtRerankerSpec {
 
 /// Lighter candidates, all Apache-2.0, selected with
 /// `MEMORYPILOT_RERANKER_MODEL` to measure them against the default. Their
-/// repositories ship one int8 graph per CPU family; these are the arm64
-/// ones. Their logits are on another scale than jina's, so the abstention
+/// cross-encoder repositories ship one int8 graph per CPU family; these
+/// are the arm64 ones. Their logits are on another scale than jina's, so the abstention
 /// threshold `MEMORYPILOT_TRUST_CROSS` is not calibrated for them.
 const MMARCO_L12_INT8: OrtRerankerSpec = OrtRerankerSpec {
     repo: "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
     onnx_file: "onnx/model_qint8_arm64.onnx",
     label: "mmarco-mMiniLMv2-L12-H384-v1 int8 (multilingual, 118M)",
     tokenizer: PairTokenizerKind::XlmRoberta,
+    output: RerankOutput::Logits,
+};
+const HORIZON_SMALL_INT8: OrtRerankerSpec = OrtRerankerSpec {
+    repo: "Horizon-Labs/multilingual-reranker-small",
+    onnx_file: "onnx/model_quantized.onnx",
+    label: "multilingual-reranker-small int8 (47 languages, 141M)",
+    tokenizer: PairTokenizerKind::Gemma,
     output: RerankOutput::Logits,
 };
 const ETTIN_32M_INT8: OrtRerankerSpec = OrtRerankerSpec {
@@ -776,7 +790,7 @@ fn cross_reranker_model() -> RerankerChoice {
     let requested = std::env::var("MEMORYPILOT_RERANKER_MODEL").unwrap_or_default();
     let spec = reranker_spec_from(&requested).unwrap_or_else(|| {
         eprintln!(
-            "[MemoryPilot] MEMORYPILOT_RERANKER_MODEL={} is not a known cross-encoder (jina-v2, mmarco, ettin-32m, ettin-17m): using jina-reranker-v2-base-multilingual.",
+            "[MemoryPilot] MEMORYPILOT_RERANKER_MODEL={} is not a known cross-encoder (jina-v2, horizon-small, mmarco, ettin-32m, ettin-17m): using jina-reranker-v2-base-multilingual.",
             requested.trim()
         );
         JINA_V2_INT8
@@ -792,6 +806,7 @@ fn reranker_spec_from(requested: &str) -> Option<OrtRerankerSpec> {
             Some(JINA_V2_INT8)
         }
         "mmarco" | "mmarco-l12" | "cross-encoder/mmarco-mminilmv2-l12-h384-v1" => Some(MMARCO_L12_INT8),
+        "horizon-small" | "horizon-labs/multilingual-reranker-small" => Some(HORIZON_SMALL_INT8),
         "ettin-32m" | "cross-encoder/ettin-reranker-32m-v1" => Some(ETTIN_32M_INT8),
         "ettin-17m" | "cross-encoder/ettin-reranker-17m-v1" => Some(ETTIN_17M_INT8),
         _ => None,
@@ -1029,6 +1044,7 @@ mod tests {
         assert_eq!(reranker_spec_from(""), Some(JINA_V2_INT8));
         assert_eq!(reranker_spec_from(" Jina-V2 "), Some(JINA_V2_INT8));
         assert_eq!(reranker_spec_from("mmarco"), Some(MMARCO_L12_INT8));
+        assert_eq!(reranker_spec_from("horizon-small"), Some(HORIZON_SMALL_INT8));
         assert_eq!(reranker_spec_from("ettin-32m"), Some(ETTIN_32M_INT8));
         assert_eq!(reranker_spec_from("ettin-17m"), Some(ETTIN_17M_INT8));
         assert_eq!(reranker_spec_from("bge-reranker-v2-m3"), None);
@@ -1045,7 +1061,7 @@ mod tests {
             "The project stores its data in a PostgreSQL database.".to_string(),
             "Lunch is served at noon in the cafeteria.".to_string(),
         ];
-        for spec in [MMARCO_L12_INT8, ETTIN_32M_INT8, ETTIN_17M_INT8] {
+        for spec in [HORIZON_SMALL_INT8, MMARCO_L12_INT8, ETTIN_32M_INT8, ETTIN_17M_INT8] {
             let mut model = OrtReranker::load(spec).expect(spec.label);
             let scores = model.scores(query, &documents).expect(spec.label);
             eprintln!("[candidate probe] {}: {:?}", spec.label, scores);
