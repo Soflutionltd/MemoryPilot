@@ -889,13 +889,21 @@ impl Database {
             .filter(|value| value.is_object())
             .ok_or_else(|| format!("{} holds no end_to_end section: it is not the output of an --e2e run", results_path))?;
         let items = rejudge_items(entries, source)?;
+        // Every prompt is built before the first call: a question type
+        // without a judge prompt costs no token.
+        let prompts = items
+            .iter()
+            .map(|item| {
+                let template = e2e_judge_template(&item.question_type, item.abstention)
+                    .map_err(|error| format!("question {}: {}", item.question_id, error))?;
+                Ok(fill_template(template, &[&item.question, &item.gold_answer, &item.hypothesis]))
+            })
+            .collect::<Result<Vec<String>, String>>()?;
         let chat = crate::llm::ChatClient::new(&e2e.base_url, e2e.api_key.clone())?;
         eprintln!("[LongMemEval] Grading {} saved answers again with {}", items.len(), e2e.judge_model);
         let mut verdicts = Vec::with_capacity(items.len());
-        for (index, item) in items.iter().enumerate() {
-            let template = e2e_judge_template(&item.question_type, item.abstention)?;
-            let prompt = fill_template(template, &[&item.question, &item.gold_answer, &item.hypothesis]);
-            let verdict = judge_verdict(&chat, &e2e.judge_model, &prompt)
+        for (index, (item, prompt)) in items.iter().zip(&prompts).enumerate() {
+            let verdict = judge_verdict(&chat, &e2e.judge_model, prompt)
                 .map_err(|error| format!("judge failed on answer {} ({}): {}", index + 1, item.question_id, error))?;
             verdicts.push(verdict);
             if (index + 1).is_multiple_of(25) {
@@ -1277,8 +1285,6 @@ fn e2e_answer_prompt(history: &str, question_date: &str, question: &str, chain_o
     fill_template(template, &[history, question_date, question])
 }
 
-/// The official judge prompt for a question type; unknown types are an
-/// error, as in the reference implementation.
 /// The judge's answer to one prompt, with the tokens of both attempts.
 struct JudgeVerdict {
     yes: bool,
@@ -1459,6 +1465,8 @@ fn rejudge_report(
     })
 }
 
+/// The official judge prompt for a question type; unknown types are an
+/// error, as in the reference implementation.
 fn e2e_judge_template(question_type: &str, abstention: bool) -> Result<&'static str, String> {
     if abstention {
         return Ok(JUDGE_ABSTENTION);
