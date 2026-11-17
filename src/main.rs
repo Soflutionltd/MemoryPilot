@@ -677,6 +677,7 @@ fn longmemeval_end_to_end_options(args: &[String]) -> Result<db::EndToEndOptions
         answer_model,
         judge_model,
         chain_of_thought: args.iter().any(|a| a == "--cot"),
+        reading_guide: args.iter().any(|a| a == "--reading-guide"),
         answer_max_tokens: number("--answer-max-tokens")?.map(|value| value as u32),
         context_turns: number("--context-turns")?.unwrap_or(10).max(10),
         neighbor_turns: number("--neighbors")?.unwrap_or(0),
@@ -1341,7 +1342,7 @@ fn print_help() {
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30] [--every N]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM; --every: one question in N per type; with --e2e: --cot, --answer-max-tokens N, --context-turns N, --neighbors K, --assistant-full-top M [--assistant-chars K] (assistant turns ranked after the first M cut to K characters, left out without K); --rejudge FILE: grade again the answers saved by an --e2e run with --judge-model, no search and no reader call)");
     println!("      --reader  Extractive reader on the top 5, SQuAD-style exact match / F1 against the gold answer");
     println!("      --e2e     End-to-end accuracy: an LLM answers from the top 10, an LLM judge grades it (official LongMemEval prompts)");
-    println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot]", db::OFFICIAL_JUDGE_MODEL);
+    println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot] [--reading-guide] (step-by-step prompt with our own reading instructions, not the official wording)", db::OFFICIAL_JUDGE_MODEL);
     println!("                API key from MEMORYPILOT_LLM_API_KEY or OPENAI_API_KEY; not needed for an http://localhost endpoint");
     println!("  MemoryPilot --benchmark-fr [--min-r5 PCT]  French retrieval benchmark (30 in-memory scenarios)");
     println!("  MemoryPilot --benchmark-concurrency [--clients N] [--queries-per-client N] [--seed-memories N]  Multi-client concurrent search throughput");

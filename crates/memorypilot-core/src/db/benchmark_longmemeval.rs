@@ -39,6 +39,9 @@ pub struct EndToEndOptions {
     pub judge_model: String,
     /// Official "Answer step by step" variant of the generation prompt.
     pub chain_of_thought: bool,
+    /// Step-by-step prompt with reading instructions of our own (not the
+    /// official wording): how to count, date and reconcile the excerpts.
+    pub reading_guide: bool,
     /// Cap of the answer, in tokens. `None`: 500, or 800 step by step.
     pub answer_max_tokens: Option<u32>,
     /// Retrieved turns given to the reader (10 by default, never fewer).
@@ -892,8 +895,8 @@ impl Database {
         let judge_template = e2e_judge_template(item.question_type, item.abstention)?;
         let start = std::time::Instant::now();
         let history = if e2e.neighbor_turns > 0 { e2e_history_by_session(retrieved) } else { e2e_history(retrieved) };
-        let answer_prompt = e2e_answer_prompt(&history, item.question_date, item.question, e2e.chain_of_thought);
-        let max_tokens = e2e.answer_max_tokens.unwrap_or(if e2e.chain_of_thought { 800 } else { 500 });
+        let answer_prompt = e2e_answer_prompt(&history, item.question_date, item.question, e2e);
+        let max_tokens = e2e_answer_max_tokens(e2e);
         let answer = chat.complete(&e2e.answer_model, &answer_prompt, max_tokens)?;
         let judge_prompt = fill_template(judge_template, &[item.question, item.gold_answer, &answer.text]);
         let verdict = judge_verdict(chat, &e2e.judge_model, &judge_prompt)?;
@@ -1200,6 +1203,10 @@ fn percentiles(sorted: &[f32]) -> serde_json::Value {
 const E2E_ANSWER_PROMPT: &str = "I will give you several history chats between you and a user. Please answer the question based on the relevant chat history.\n\n\nHistory Chats:\n\n{}\n\nCurrent Date: {}\nQuestion: {}\nAnswer:";
 const E2E_ANSWER_PROMPT_COT: &str = "I will give you several history chats between you and a user. Please answer the question based on the relevant chat history. Answer the question step by step: first extract all the relevant information, and then reason over the information to get the answer.\n\n\nHistory Chats:\n\n{}\n\nCurrent Date: {}\nQuestion: {}\nAnswer (step by step):";
 
+/// Not part of the official benchmark: the step-by-step prompt with the
+/// mistakes a reader makes on excerpts spelled out. The judge is unchanged.
+const E2E_ANSWER_PROMPT_GUIDE: &str = "I will give you several history chats between you and a user. Please answer the question based on the relevant chat history. Answer the question step by step: first extract all the relevant information, and then reason over the information to get the answer.\n\nHow to read the chats:\n- They are excerpts of past sessions. Each session starts with its date, and a message ending with [...] was shortened.\n- First quote every passage that bears on the question, each with its session date. Read every session: the answer is often spread over several of them.\n- If the question asks how many, how much in total, or for a list: write out each distinct item with its session date, merge the mentions of one same event or object, then count or add.\n- If a fact changes from one session to another, the most recent session is the current one.\n- For a question about time (how long ago, how many days between, which came first): write the dates involved and compute from them and from the Current Date. An expression such as \"last week\" or \"yesterday\" inside a message is relative to the date of its session.\n- For advice or a suggestion, use what the chats say about the user's tastes, habits and situation.\n- If the chats do not hold what the question needs, say that the information was not mentioned instead of guessing.\nFinish with one sentence that states the final answer.\n\n\nHistory Chats:\n\n{}\n\nCurrent Date: {}\nQuestion: {}\nAnswer (step by step):";
+
 const JUDGE_DEFAULT: &str = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.";
 const JUDGE_TEMPORAL: &str = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. In addition, do not penalize off-by-one errors for the number of days. If the question asks for the number of days/weeks/months, etc., and the model makes off-by-one errors (e.g., predicting 19 days when the answer is 18), the model's response is still correct. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.";
 const JUDGE_KNOWLEDGE_UPDATE: &str = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response contains some previous information along with an updated answer, the response should be considered as correct as long as the updated answer is the required answer.\n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only.";
@@ -1348,9 +1355,22 @@ fn e2e_history(retrieved: &[&HaystackTurn]) -> String {
         .collect()
 }
 
-fn e2e_answer_prompt(history: &str, question_date: &str, question: &str, chain_of_thought: bool) -> String {
-    let template = if chain_of_thought { E2E_ANSWER_PROMPT_COT } else { E2E_ANSWER_PROMPT };
+fn e2e_answer_prompt(history: &str, question_date: &str, question: &str, e2e: &EndToEndOptions) -> String {
+    let template = if e2e.reading_guide {
+        E2E_ANSWER_PROMPT_GUIDE
+    } else if e2e.chain_of_thought {
+        E2E_ANSWER_PROMPT_COT
+    } else {
+        E2E_ANSWER_PROMPT
+    };
     fill_template(template, &[history, question_date, question])
+}
+
+/// Cap of the answer: the given one, else 500 tokens, or 800 for the
+/// step-by-step prompts.
+fn e2e_answer_max_tokens(e2e: &EndToEndOptions) -> u32 {
+    let step_by_step = e2e.chain_of_thought || e2e.reading_guide;
+    e2e.answer_max_tokens.unwrap_or(if step_by_step { 800 } else { 500 })
 }
 
 /// The judge's answer to one prompt, with the tokens of both attempts.
@@ -1505,6 +1525,7 @@ fn rejudge_report(
             "judge_model": source.get("judge_model"),
             "context": source.get("context"),
             "chain_of_thought": source.get("chain_of_thought"),
+            "reading_guide": source.get("reading_guide"),
             "answer_max_tokens": source.get("answer_max_tokens"),
             "accuracy": source.get("accuracy"),
         },
@@ -1597,12 +1618,13 @@ fn end_to_end_report(e2e: &EndToEndOptions, totals: &EndToEndTotals, selected: u
             }
         ),
         "diversity_filter": crate::diversity::is_enabled(),
-        "answer_max_tokens": e2e.answer_max_tokens.unwrap_or(if e2e.chain_of_thought { 800 } else { 500 }),
+        "answer_max_tokens": e2e_answer_max_tokens(e2e),
         "base_url": e2e.base_url,
         "answer_model": e2e.answer_model,
         "judge_model": e2e.judge_model,
         "official_judge": e2e.judge_model == OFFICIAL_JUDGE_MODEL,
         "chain_of_thought": e2e.chain_of_thought,
+        "reading_guide": e2e.reading_guide,
         "temperature": if totals.temperature_sent { json!(0) } else { json!("server default (endpoint rejects temperature)") },
         "answers_truncated_by_max_tokens": totals.answers_truncated,
         "verdicts_retried_with_larger_budget": totals.verdicts_retried,
@@ -1793,11 +1815,50 @@ mod tests {
 
     #[test]
     fn answer_prompt_follows_the_official_template() {
-        let prompt = e2e_answer_prompt("H", "2023/06/01 (Thu) 09:00", "Where do I live?", false);
+        let options = |chain_of_thought: bool, reading_guide: bool| EndToEndOptions {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: None,
+            answer_model: "reader".into(),
+            judge_model: "judge".into(),
+            chain_of_thought,
+            reading_guide,
+            answer_max_tokens: None,
+            context_turns: 10,
+            neighbor_turns: 0,
+            assistant_trim: None,
+        };
+        let prompt = e2e_answer_prompt("H", "2023/06/01 (Thu) 09:00", "Where do I live?", &options(false, false));
         assert!(prompt.starts_with("I will give you several history chats between you and a user."));
         assert!(prompt.ends_with("History Chats:\n\nH\n\nCurrent Date: 2023/06/01 (Thu) 09:00\nQuestion: Where do I live?\nAnswer:"));
-        let cot = e2e_answer_prompt("H", "d", "q", true);
+        assert_eq!(e2e_answer_max_tokens(&options(false, false)), 500);
+        let cot = e2e_answer_prompt("H", "d", "q", &options(true, false));
         assert!(cot.ends_with("Question: q\nAnswer (step by step):"));
+        assert!(!cot.contains("How to read the chats"));
+        assert_eq!(e2e_answer_max_tokens(&options(true, false)), 800);
+    }
+
+    #[test]
+    fn reading_guide_prompt_keeps_the_official_frame_around_its_instructions() {
+        let options = EndToEndOptions {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: None,
+            answer_model: "reader".into(),
+            judge_model: "judge".into(),
+            chain_of_thought: false,
+            reading_guide: true,
+            answer_max_tokens: None,
+            context_turns: 10,
+            neighbor_turns: 0,
+            assistant_trim: None,
+        };
+        let prompt = e2e_answer_prompt("H", "2023/06/01 (Thu) 09:00", "How many trips?", &options);
+        assert!(prompt.starts_with("I will give you several history chats between you and a user."));
+        assert!(prompt.contains("How to read the chats:\n- They are excerpts"));
+        assert!(prompt.ends_with(
+            "History Chats:\n\nH\n\nCurrent Date: 2023/06/01 (Thu) 09:00\nQuestion: How many trips?\nAnswer (step by step):"
+        ));
+        assert_eq!(e2e_answer_max_tokens(&options), 800);
+        assert_eq!(e2e_answer_max_tokens(&EndToEndOptions { answer_max_tokens: Some(1500), ..options }), 1500);
     }
 
     #[test]
@@ -1844,6 +1905,7 @@ mod tests {
             answer_model: OFFICIAL_JUDGE_MODEL.into(),
             judge_model: OFFICIAL_JUDGE_MODEL.into(),
             chain_of_thought: false,
+            reading_guide: false,
             answer_max_tokens: None,
             context_turns: 10,
             neighbor_turns: 0,
@@ -1915,6 +1977,7 @@ mod tests {
             answer_model: OFFICIAL_JUDGE_MODEL.into(),
             judge_model: OFFICIAL_JUDGE_MODEL.into(),
             chain_of_thought: false,
+            reading_guide: false,
             answer_max_tokens: None,
             context_turns: 10,
             neighbor_turns: 0,
