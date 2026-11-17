@@ -301,7 +301,7 @@ pub enum PairTokenizerKind {
 
 enum PairTokenizer {
     XlmRoberta(crate::tokenizer::Unigram),
-    ModernBert(crate::tokenizer::ModernBertBpe),
+    ModernBert(Box<crate::tokenizer::ModernBertBpe>),
 }
 
 impl PairTokenizer {
@@ -311,7 +311,8 @@ impl PairTokenizer {
                 crate::tokenizer::Unigram::from_file(path).map(PairTokenizer::XlmRoberta)
             }
             PairTokenizerKind::ModernBert => {
-                crate::tokenizer::ModernBertBpe::from_file(path).map(PairTokenizer::ModernBert)
+                crate::tokenizer::ModernBertBpe::from_file(path)
+                    .map(|tokenizer| PairTokenizer::ModernBert(Box::new(tokenizer)))
             }
         }
     }
