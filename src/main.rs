@@ -659,7 +659,7 @@ fn longmemeval_end_to_end_options(args: &[String]) -> Result<db::EndToEndOptions
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()));
     if api_key.is_none() && !base_url.trim().starts_with("http://") {
         return Err(format!(
-            "--e2e against {} needs an API key in MEMORYPILOT_LLM_API_KEY or OPENAI_API_KEY",
+            "LLM calls against {} need an API key in MEMORYPILOT_LLM_API_KEY or OPENAI_API_KEY",
             base_url
         ));
     }
@@ -683,6 +683,22 @@ fn run_benchmark_longmemeval(args: &[String]) {
         .find(|w| w[0] == "--benchmark-longmemeval" && !w[1].starts_with("--"))
         .map(|w| w[1].as_str())
         .unwrap_or("benchmarks/longmemeval_s_cleaned.json");
+    // `--rejudge FILE`: grade again the answers an earlier --e2e run saved.
+    if let Some(index) = args.iter().position(|a| a == "--rejudge") {
+        let graded = match args.get(index + 1).filter(|value| !value.starts_with("--")) {
+            None => Err("--rejudge needs the results file of an --e2e run".to_string()),
+            Some(results_path) => longmemeval_end_to_end_options(args)
+                .and_then(|options| db::Database::rejudge_longmemeval(dataset_path, results_path, &options)),
+        };
+        match graded {
+            Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())),
+            Err(error) => {
+                eprintln!("✗ {}", error);
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     let limit = args
         .windows(2)
         .find(|w| w[0] == "--limit")
@@ -1313,7 +1329,7 @@ fn print_help() {
     println!("  MemoryPilot --rollback-update NAME  Put back the previous copy of a vendor skill or plugin; the version undone is not installed again");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
-    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30] [--every N]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM; --every: one question in N per type; with --e2e: --cot, --answer-max-tokens N, --context-turns N, --neighbors K)");
+    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30] [--every N]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM; --every: one question in N per type; with --e2e: --cot, --answer-max-tokens N, --context-turns N, --neighbors K; --rejudge FILE: grade again the answers saved by an --e2e run with --judge-model, no search and no reader call)");
     println!("      --reader  Extractive reader on the top 5, SQuAD-style exact match / F1 against the gold answer");
     println!("      --e2e     End-to-end accuracy: an LLM answers from the top 10, an LLM judge grades it (official LongMemEval prompts)");
     println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot]", db::OFFICIAL_JUDGE_MODEL);

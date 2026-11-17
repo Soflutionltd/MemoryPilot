@@ -855,33 +855,55 @@ impl Database {
         let max_tokens = e2e.answer_max_tokens.unwrap_or(if e2e.chain_of_thought { 800 } else { 500 });
         let answer = chat.complete(&e2e.answer_model, &answer_prompt, max_tokens)?;
         let judge_prompt = fill_template(judge_template, &[item.question, item.gold_answer, &answer.text]);
-        // 10 tokens is the official budget; a thinking model can spend it
-        // before writing yes/no. A cut verdict is asked again with room to
-        // spare, never scored as "no".
-        let first_verdict = chat.complete(&e2e.judge_model, &judge_prompt, JUDGE_MAX_TOKENS)?;
-        let (verdict, verdict_retried, retry_tokens) = if first_verdict.truncated {
-            let retried = chat.complete(&e2e.judge_model, &judge_prompt, JUDGE_RETRY_MAX_TOKENS)?;
-            if retried.truncated {
-                return Err(format!(
-                    "judge verdict still cut at {} tokens: {:?}",
-                    JUDGE_RETRY_MAX_TOKENS, retried.text
-                ));
-            }
-            let spent = (first_verdict.prompt_tokens, first_verdict.completion_tokens);
-            (retried, true, spent)
-        } else {
-            (first_verdict, false, (0, 0))
-        };
+        let verdict = judge_verdict(chat, &e2e.judge_model, &judge_prompt)?;
         let usage = EndToEndUsage {
             answer_prompt_tokens: answer.prompt_tokens,
             answer_completion_tokens: answer.completion_tokens,
-            judge_prompt_tokens: verdict.prompt_tokens + retry_tokens.0,
-            judge_completion_tokens: verdict.completion_tokens + retry_tokens.1,
+            judge_prompt_tokens: verdict.prompt_tokens,
+            judge_completion_tokens: verdict.completion_tokens,
             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
             answer_truncated: answer.truncated,
-            verdict_retried,
+            verdict_retried: verdict.retried,
         };
-        Ok((answer.text, judge_says_yes(&verdict.text), usage))
+        Ok((answer.text, verdict.yes, usage))
+    }
+
+    /// Has `e2e.judge_model` grade again the answers saved in the results
+    /// file of an earlier `--e2e` run: no search and no reader call, only
+    /// one verdict per saved answer. Reports the new accuracy and every
+    /// question the two judges disagree on.
+    pub fn rejudge_longmemeval(
+        dataset_path: &str,
+        results_path: &str,
+        e2e: &EndToEndOptions,
+    ) -> Result<serde_json::Value, String> {
+        let read = |path: &str| -> Result<serde_json::Value, String> {
+            let raw = std::fs::read_to_string(path).map_err(|error| format!("Cannot read {}: {}", path, error))?;
+            serde_json::from_str(&raw).map_err(|error| format!("Invalid JSON in {}: {}", path, error))
+        };
+        let dataset = read(dataset_path)?;
+        let entries = dataset.as_array().ok_or_else(|| format!("{} is not a list of questions", dataset_path))?;
+        let results = read(results_path)?;
+        let source = results
+            .get("end_to_end")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| format!("{} holds no end_to_end section: it is not the output of an --e2e run", results_path))?;
+        let items = rejudge_items(entries, source)?;
+        let chat = crate::llm::ChatClient::new(&e2e.base_url, e2e.api_key.clone())?;
+        eprintln!("[LongMemEval] Grading {} saved answers again with {}", items.len(), e2e.judge_model);
+        let mut verdicts = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let template = e2e_judge_template(&item.question_type, item.abstention)?;
+            let prompt = fill_template(template, &[&item.question, &item.gold_answer, &item.hypothesis]);
+            let verdict = judge_verdict(&chat, &e2e.judge_model, &prompt)
+                .map_err(|error| format!("judge failed on answer {} ({}): {}", index + 1, item.question_id, error))?;
+            verdicts.push(verdict);
+            if (index + 1).is_multiple_of(25) {
+                let right = verdicts.iter().filter(|verdict| verdict.yes).count();
+                eprintln!("[LongMemEval] judged {}/{}: accuracy {:.1}%", index + 1, items.len(), right as f64 / (index + 1) as f64 * 100.0);
+            }
+        }
+        Ok(rejudge_report(e2e, results_path, source, &items, &verdicts, chat.sends_temperature()))
     }
 
     fn lme_temporal_prefix(session_date: Option<&str>, question_date: Option<&str>) -> String {
@@ -1257,6 +1279,186 @@ fn e2e_answer_prompt(history: &str, question_date: &str, question: &str, chain_o
 
 /// The official judge prompt for a question type; unknown types are an
 /// error, as in the reference implementation.
+/// The judge's answer to one prompt, with the tokens of both attempts.
+struct JudgeVerdict {
+    yes: bool,
+    /// The verdict was cut at the official 10 tokens and asked again.
+    retried: bool,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+/// Asks the judge within the official 10 tokens. A thinking model can spend
+/// them before writing yes/no: a cut verdict is asked again with room to
+/// spare, never scored as "no".
+fn judge_verdict(chat: &crate::llm::ChatClient, model: &str, prompt: &str) -> Result<JudgeVerdict, String> {
+    let first = chat.complete(model, prompt, JUDGE_MAX_TOKENS)?;
+    if !first.truncated {
+        return Ok(JudgeVerdict {
+            yes: judge_says_yes(&first.text),
+            retried: false,
+            prompt_tokens: first.prompt_tokens,
+            completion_tokens: first.completion_tokens,
+        });
+    }
+    let retried = chat.complete(model, prompt, JUDGE_RETRY_MAX_TOKENS)?;
+    if retried.truncated {
+        return Err(format!("judge verdict still cut at {} tokens: {:?}", JUDGE_RETRY_MAX_TOKENS, retried.text));
+    }
+    Ok(JudgeVerdict {
+        yes: judge_says_yes(&retried.text),
+        retried: true,
+        prompt_tokens: first.prompt_tokens + retried.prompt_tokens,
+        completion_tokens: first.completion_tokens + retried.completion_tokens,
+    })
+}
+
+/// One saved answer to grade again, joined with its question.
+#[derive(Debug)]
+struct RejudgeItem {
+    question_id: String,
+    question_type: String,
+    question: String,
+    gold_answer: String,
+    abstention: bool,
+    hypothesis: String,
+    /// What the judge of the saved run decided.
+    previous_label: bool,
+}
+
+/// Joins the answers saved under `end_to_end.hypotheses` with the dataset,
+/// in the saved order. An answer whose question is not in the dataset, or
+/// an entry without its text or label, is an error: nothing is skipped.
+fn rejudge_items(entries: &[serde_json::Value], source: &serde_json::Value) -> Result<Vec<RejudgeItem>, String> {
+    let by_id: HashMap<&str, &serde_json::Value> = entries
+        .iter()
+        .filter_map(|entry| Some((entry.get("question_id")?.as_str()?, entry)))
+        .collect();
+    let saved = source
+        .get("hypotheses")
+        .and_then(|value| value.as_array())
+        .filter(|saved| !saved.is_empty())
+        .ok_or("the results file holds no saved answer (end_to_end.hypotheses)")?;
+    saved
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| {
+            let question_id = answer
+                .get("question_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| format!("saved answer {} has no question_id", index + 1))?;
+            let hypothesis = answer
+                .get("hypothesis")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| format!("saved answer {} has no hypothesis", question_id))?;
+            let previous_label = answer
+                .get("autoeval_label")
+                .and_then(|value| value.as_bool())
+                .ok_or_else(|| format!("saved answer {} has no autoeval_label", question_id))?;
+            let entry = by_id
+                .get(question_id)
+                .ok_or_else(|| format!("question {} of the results file is not in the dataset", question_id))?;
+            let text = |field: &str| entry.get(field).and_then(|value| value.as_str()).unwrap_or("").to_string();
+            let gold_answer = match entry.get("answer") {
+                Some(serde_json::Value::String(answer)) => answer.clone(),
+                Some(other) => other.to_string(),
+                None => return Err(format!("question {} has no answer in the dataset", question_id)),
+            };
+            Ok(RejudgeItem {
+                question_id: question_id.to_string(),
+                question_type: text("question_type"),
+                question: text("question"),
+                gold_answer,
+                abstention: question_id.ends_with("_abs"),
+                hypothesis: hypothesis.to_string(),
+                previous_label,
+            })
+        })
+        .collect()
+}
+
+fn rejudge_report(
+    e2e: &EndToEndOptions,
+    results_path: &str,
+    source: &serde_json::Value,
+    items: &[RejudgeItem],
+    verdicts: &[JudgeVerdict],
+    temperature_sent: bool,
+) -> serde_json::Value {
+    let outcome = |item: &RejudgeItem, correct: bool| EndToEndOutcome {
+        question_type: item.question_type.clone(),
+        abstention: item.abstention,
+        correct,
+    };
+    let graded: Vec<EndToEndOutcome> = items.iter().zip(verdicts).map(|(item, verdict)| outcome(item, verdict.yes)).collect();
+    let previous: Vec<EndToEndOutcome> = items.iter().map(|item| outcome(item, item.previous_label)).collect();
+    let accuracy = |outcomes: &[EndToEndOutcome], keep: &dyn Fn(&EndToEndOutcome) -> bool| {
+        e2e_accuracy(&outcomes.iter().filter(|outcome| keep(outcome)).collect::<Vec<_>>())
+    };
+    let mut types: Vec<&str> = items.iter().map(|item| item.question_type.as_str()).collect();
+    types.sort();
+    types.dedup();
+    let by_type: serde_json::Map<String, serde_json::Value> = types
+        .into_iter()
+        .map(|question_type| {
+            let of_type = |outcome: &EndToEndOutcome| outcome.question_type == question_type;
+            (question_type.to_string(), json!({ "accuracy": accuracy(&graded, &of_type), "previous_judge": accuracy(&previous, &of_type) }))
+        })
+        .collect();
+    let disagreements: Vec<serde_json::Value> = items
+        .iter()
+        .zip(verdicts)
+        .filter(|(item, verdict)| item.previous_label != verdict.yes)
+        .map(|(item, verdict)| {
+            json!({
+                "question_id": item.question_id,
+                "question_type": item.question_type,
+                "abstention": item.abstention,
+                "question": item.question,
+                "gold": item.gold_answer,
+                "hypothesis": item.hypothesis,
+                "previous_judge": item.previous_label,
+                "this_judge": verdict.yes,
+            })
+        })
+        .collect();
+    json!({
+        "benchmark": "LongMemEval-S (ICLR 2025), saved answers graded again",
+        "protocol": "official LongMemEval judge prompts (evaluate_qa.py) on the answers of an earlier run; no search and no reader call",
+        "source": {
+            "results_file": results_path,
+            "answer_model": source.get("answer_model"),
+            "judge_model": source.get("judge_model"),
+            "context": source.get("context"),
+            "chain_of_thought": source.get("chain_of_thought"),
+            "answer_max_tokens": source.get("answer_max_tokens"),
+            "accuracy": source.get("accuracy"),
+        },
+        "base_url": e2e.base_url,
+        "judge_model": e2e.judge_model,
+        "official_judge": e2e.judge_model == OFFICIAL_JUDGE_MODEL,
+        "temperature": if temperature_sent { json!(0) } else { json!("server default (endpoint rejects temperature)") },
+        "questions_graded": graded.len(),
+        "accuracy": accuracy(&graded, &|_| true),
+        "accuracy_answerable": accuracy(&graded, &|outcome| !outcome.abstention),
+        "accuracy_abstention": accuracy(&graded, &|outcome| outcome.abstention),
+        "accuracy_previous_judge": accuracy(&previous, &|_| true),
+        "by_type": by_type,
+        "judges_agree": format!("{}/{}", items.len() - disagreements.len(), items.len()),
+        "verdicts_retried_with_larger_budget": verdicts.iter().filter(|verdict| verdict.retried).count(),
+        "tokens": {
+            "judge_prompt": verdicts.iter().map(|verdict| verdict.prompt_tokens).sum::<u64>(),
+            "judge_completion": verdicts.iter().map(|verdict| verdict.completion_tokens).sum::<u64>(),
+        },
+        "disagreements": disagreements,
+        "hypotheses": items.iter().zip(verdicts).map(|(item, verdict)| json!({
+            "question_id": item.question_id,
+            "hypothesis": item.hypothesis,
+            "autoeval_label": verdict.yes,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn e2e_judge_template(question_type: &str, abstention: bool) -> Result<&'static str, String> {
     if abstention {
         return Ok(JUDGE_ABSTENTION);
@@ -1554,5 +1756,78 @@ mod tests {
         assert_eq!(report["verdicts_retried_with_larger_budget"], 0);
         assert!(!report.to_string().contains("sk-test"));
         assert!(!format!("{:?}", options).contains("sk-test"));
+    }
+
+    fn rejudge_fixture() -> (Vec<serde_json::Value>, serde_json::Value) {
+        let entries = vec![
+            json!({"question_id": "q1", "question_type": "multi-session", "question": "How many?", "answer": 3}),
+            json!({"question_id": "q2_abs", "question_type": "temporal-reasoning", "question": "When?", "answer": "Not mentioned"}),
+        ];
+        let source = json!({
+            "answer_model": "reader",
+            "judge_model": "first-judge",
+            "accuracy": "1/2 (50.0%)",
+            "hypotheses": [
+                {"question_id": "q2_abs", "hypothesis": "You never said.", "autoeval_label": true},
+                {"question_id": "q1", "hypothesis": "Two.", "autoeval_label": false},
+            ],
+        });
+        (entries, source)
+    }
+
+    #[test]
+    fn saved_answers_are_joined_with_their_question_in_the_saved_order() {
+        let (entries, source) = rejudge_fixture();
+        let items = rejudge_items(&entries, &source).expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].question_id, "q2_abs");
+        assert!(items[0].abstention && items[0].previous_label);
+        assert_eq!(items[1].gold_answer, "3");
+        assert_eq!(items[1].question_type, "multi-session");
+        assert!(!items[1].abstention && !items[1].previous_label);
+    }
+
+    #[test]
+    fn a_saved_answer_that_cannot_be_graded_is_an_error_not_a_skip() {
+        let (entries, source) = rejudge_fixture();
+        let error = rejudge_items(&entries[..1], &source).expect_err("unknown question");
+        assert!(error.contains("q2_abs"), "{error}");
+        let unlabelled = json!({"hypotheses": [{"question_id": "q1", "hypothesis": "Two."}]});
+        assert!(rejudge_items(&entries, &unlabelled).expect_err("no label").contains("autoeval_label"));
+        assert!(rejudge_items(&entries, &json!({"hypotheses": []})).is_err());
+        assert!(rejudge_items(&entries, &json!({})).is_err());
+    }
+
+    #[test]
+    fn rejudge_report_compares_the_two_judges() {
+        let (entries, source) = rejudge_fixture();
+        let items = rejudge_items(&entries, &source).expect("items");
+        let verdict = |yes: bool, retried: bool| JudgeVerdict { yes, retried, prompt_tokens: 100, completion_tokens: 2 };
+        let verdicts = vec![verdict(true, false), verdict(true, true)];
+        let options = EndToEndOptions {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: Some("sk-test".into()),
+            answer_model: OFFICIAL_JUDGE_MODEL.into(),
+            judge_model: OFFICIAL_JUDGE_MODEL.into(),
+            chain_of_thought: false,
+            answer_max_tokens: None,
+            context_turns: 10,
+            neighbor_turns: 0,
+        };
+        let report = rejudge_report(&options, "run.json", &source, &items, &verdicts, true);
+        assert_eq!(report["accuracy"], "2/2 (100.0%)");
+        assert_eq!(report["accuracy_previous_judge"], "1/2 (50.0%)");
+        assert_eq!(report["accuracy_abstention"], "1/1 (100.0%)");
+        assert_eq!(report["by_type"]["multi-session"]["accuracy"], "1/1 (100.0%)");
+        assert_eq!(report["by_type"]["multi-session"]["previous_judge"], "0/1 (0.0%)");
+        assert_eq!(report["judges_agree"], "1/2");
+        assert_eq!(report["disagreements"].as_array().map(Vec::len), Some(1));
+        assert_eq!(report["disagreements"][0]["question_id"], "q1");
+        assert_eq!(report["official_judge"], true);
+        assert_eq!(report["source"]["judge_model"], "first-judge");
+        assert_eq!(report["verdicts_retried_with_larger_budget"], 1);
+        assert_eq!(report["tokens"]["judge_prompt"], 200);
+        assert_eq!(report["hypotheses"][1]["autoeval_label"], true);
+        assert!(!report.to_string().contains("sk-test"));
     }
 }
