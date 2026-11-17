@@ -663,6 +663,14 @@ fn longmemeval_end_to_end_options(args: &[String]) -> Result<db::EndToEndOptions
             base_url
         ));
     }
+    let assistant_trim = match (number("--assistant-full-top")?, number("--assistant-chars")?) {
+        (None, None) => None,
+        (Some(full_top), chars) => Some(db::AssistantTrim { full_top, chars: chars.unwrap_or(0) }),
+        (None, Some(_)) => return Err("--assistant-chars needs --assistant-full-top".to_string()),
+    };
+    if assistant_trim.is_some() && number("--neighbors")?.unwrap_or(0) > 0 {
+        return Err("--assistant-full-top cannot be combined with --neighbors".to_string());
+    }
     Ok(db::EndToEndOptions {
         base_url,
         api_key,
@@ -672,6 +680,7 @@ fn longmemeval_end_to_end_options(args: &[String]) -> Result<db::EndToEndOptions
         answer_max_tokens: number("--answer-max-tokens")?.map(|value| value as u32),
         context_turns: number("--context-turns")?.unwrap_or(10).max(10),
         neighbor_turns: number("--neighbors")?.unwrap_or(0),
+        assistant_trim,
     })
 }
 
@@ -1329,7 +1338,7 @@ fn print_help() {
     println!("  MemoryPilot --rollback-update NAME  Put back the previous copy of a vendor skill or plugin; the version undone is not installed again");
     println!("  MemoryPilot --benchmark-recall [--scenario-limit N]");
     println!("  MemoryPilot --benchmark-search [--scenario-limit N]   Search quality: R@5, R@10, NDCG@10, cluster coherence");
-    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30] [--every N]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM; --every: one question in N per type; with --e2e: --cot, --answer-max-tokens N, --context-turns N, --neighbors K; --rejudge FILE: grade again the answers saved by an --e2e run with --judge-model, no search and no reader call)");
+    println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30] [--every N]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM; --every: one question in N per type; with --e2e: --cot, --answer-max-tokens N, --context-turns N, --neighbors K, --assistant-full-top M [--assistant-chars K] (assistant turns ranked after the first M cut to K characters, left out without K); --rejudge FILE: grade again the answers saved by an --e2e run with --judge-model, no search and no reader call)");
     println!("      --reader  Extractive reader on the top 5, SQuAD-style exact match / F1 against the gold answer");
     println!("      --e2e     End-to-end accuracy: an LLM answers from the top 10, an LLM judge grades it (official LongMemEval prompts)");
     println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot]", db::OFFICIAL_JUDGE_MODEL);

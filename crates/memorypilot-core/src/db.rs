@@ -120,7 +120,7 @@ pub use episodic::{
     DEFAULT_EPISODE_ABSOLUTE_FLOOR, EPISODE_ABSOLUTE_FLOOR_KEY, EPISODE_RELATIVE_FLOOR,
 };
 pub use consolidate::AUTO_THRESHOLD as AUTO_CONSOLIDATE_THRESHOLD;
-pub use benchmark_longmemeval::{EndToEndOptions, LongMemEvalOptions, OFFICIAL_JUDGE_MODEL};
+pub use benchmark_longmemeval::{AssistantTrim, EndToEndOptions, LongMemEvalOptions, OFFICIAL_JUDGE_MODEL};
 
 const PROMPT_FILE: &str = "GLOBAL_PROMPT.md";
 const DEDUP_THRESHOLD: f64 = 0.85;

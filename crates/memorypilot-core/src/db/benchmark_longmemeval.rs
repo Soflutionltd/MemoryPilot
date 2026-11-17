@@ -46,6 +46,18 @@ pub struct EndToEndOptions {
     /// Turns of the same session added before and after each retrieved
     /// turn. Above zero the history is laid out one block per session.
     pub neighbor_turns: usize,
+    /// Shortens the assistant turns ranked below the first few.
+    pub assistant_trim: Option<AssistantTrim>,
+}
+
+/// How much of the assistant turns the reader is given. They are most of
+/// the retrieved text and seldom hold the answer below the first ranks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AssistantTrim {
+    /// Assistant turns ranked within the first `full_top` stay whole.
+    pub full_top: usize,
+    /// Characters kept of the others; zero leaves them out.
+    pub chars: usize,
 }
 
 impl std::fmt::Debug for EndToEndOptions {
@@ -494,6 +506,14 @@ impl Database {
                     .collect();
                 if e2e.neighbor_turns > 0 {
                     retrieved = with_neighbors(&retrieved, &by_key, e2e.neighbor_turns);
+                }
+                let trimmed: Option<Vec<HaystackTurn>> = e2e.assistant_trim.map(|trim| trim_assistant_turns(&retrieved, trim));
+                if let Some(trimmed) = trimmed.as_ref() {
+                    retrieved = trimmed.iter().collect();
+                }
+                if retrieved.is_empty() {
+                    cleanup_lme_db(&tmp_path);
+                    return Err(format!("no turn left for the reader on question {}: every retrieved turn was left out", qi + 1));
                 }
                 let question_id = entry.get("question_id").and_then(|v| v.as_str()).unwrap_or("");
                 let item = EndToEndQuestion {
@@ -1093,6 +1113,7 @@ impl Database {
 }
 
 /// One haystack turn ready for indexing.
+#[derive(Clone)]
 struct HaystackTurn {
     key: String,
     text: String,
@@ -1255,6 +1276,32 @@ fn with_neighbors<'a>(
         }
     }
     out
+}
+
+/// Mark closing an assistant turn that was cut short.
+const CUT_MARK: &str = " [...]";
+
+/// The turns in the same rank order, the assistant ones ranked after
+/// `trim.full_top` cut to `trim.chars` characters, or left out at zero.
+fn trim_assistant_turns(retrieved: &[&HaystackTurn], trim: AssistantTrim) -> Vec<HaystackTurn> {
+    retrieved
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, turn)| {
+            if turn.role != "assistant" || rank < trim.full_top {
+                return Some((*turn).clone());
+            }
+            if trim.chars == 0 {
+                return None;
+            }
+            let content = turn.content.trim();
+            if content.chars().count() <= trim.chars {
+                return Some((*turn).clone());
+            }
+            let kept: String = content.chars().take(trim.chars).collect();
+            Some(HaystackTurn { content: format!("{}{}", kept.trim_end(), CUT_MARK), ..(*turn).clone() })
+        })
+        .collect()
 }
 
 /// One block per session, oldest first, its turns in the order they were
@@ -1540,10 +1587,16 @@ fn end_to_end_report(e2e: &EndToEndOptions, totals: &EndToEndTotals, selected: u
     json!({
         "protocol": "official LongMemEval prompts (run_generation.py history-chats, evaluate_qa.py judge); retrieved turns in flat-turn layout",
         "context": format!(
-            "top-{} turns returned by MemoryPilot search{}, oldest session first",
+            "top-{} turns returned by MemoryPilot search{}{}, oldest session first",
             e2e.context_turns.max(10),
-            if e2e.neighbor_turns > 0 { format!(", each with up to {} turn(s) before and after it in its session, one block per session", e2e.neighbor_turns) } else { String::new() }
+            if e2e.neighbor_turns > 0 { format!(", each with up to {} turn(s) before and after it in its session, one block per session", e2e.neighbor_turns) } else { String::new() },
+            match e2e.assistant_trim {
+                Some(AssistantTrim { full_top, chars: 0 }) => format!(", assistant turns ranked after the first {} left out", full_top),
+                Some(AssistantTrim { full_top, chars }) => format!(", assistant turns ranked after the first {} cut to {} characters", full_top, chars),
+                None => String::new(),
+            }
         ),
+        "diversity_filter": crate::diversity::is_enabled(),
         "answer_max_tokens": e2e.answer_max_tokens.unwrap_or(if e2e.chain_of_thought { 800 } else { 500 }),
         "base_url": e2e.base_url,
         "answer_model": e2e.answer_model,
@@ -1717,6 +1770,28 @@ mod tests {
     }
 
     #[test]
+    fn assistant_turns_below_the_first_ranks_are_cut_or_left_out() {
+        let long = "é".repeat(40);
+        let turns = [
+            turn("2023/05/01 (Mon) 09:00", "assistant", &long),
+            turn("2023/05/02 (Tue) 09:00", "user", &long),
+            turn("2023/05/03 (Wed) 09:00", "assistant", &long),
+            turn("2023/05/04 (Thu) 09:00", "assistant", "Short."),
+        ];
+        let retrieved: Vec<&HaystackTurn> = turns.iter().collect();
+
+        let cut = trim_assistant_turns(&retrieved, AssistantTrim { full_top: 1, chars: 10 });
+        let contents: Vec<&str> = cut.iter().map(|turn| turn.content.as_str()).collect();
+        let shortened = format!("{}{}", "é".repeat(10), CUT_MARK);
+        assert_eq!(contents, vec![long.as_str(), long.as_str(), shortened.as_str(), "Short."]);
+        assert_eq!(cut[2].session_date, "2023/05/03 (Wed) 09:00", "only the content changes");
+
+        let dropped = trim_assistant_turns(&retrieved, AssistantTrim { full_top: 1, chars: 0 });
+        let roles: Vec<&str> = dropped.iter().map(|turn| turn.role.as_str()).collect();
+        assert_eq!(roles, vec!["assistant", "user"], "every assistant turn after the first rank is left out");
+    }
+
+    #[test]
     fn answer_prompt_follows_the_official_template() {
         let prompt = e2e_answer_prompt("H", "2023/06/01 (Thu) 09:00", "Where do I live?", false);
         assert!(prompt.starts_with("I will give you several history chats between you and a user."));
@@ -1772,6 +1847,7 @@ mod tests {
             answer_max_tokens: None,
             context_turns: 10,
             neighbor_turns: 0,
+            assistant_trim: None,
         };
         let report = end_to_end_report(&options, &totals, 5);
         assert_eq!(report["accuracy"], "2/4 (50.0%)");
@@ -1842,6 +1918,7 @@ mod tests {
             answer_max_tokens: None,
             context_turns: 10,
             neighbor_turns: 0,
+            assistant_trim: None,
         };
         let report = rejudge_report(&options, "run.json", &source, &items, &verdicts, true);
         assert_eq!(report["accuracy"], "2/2 (100.0%)");
