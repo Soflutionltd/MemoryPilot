@@ -630,14 +630,6 @@ const IDENTIFIER_WORDS: &[&str] = &[
     "ref", "item", "build", "workspace", "org", "ruleset", "rule",
 ];
 
-/// Words announcing the print of a file or of a commit, which is public.
-const PRINT_WORDS: &[&str] = &[
-    "sha", "sha1", "sha256", "sha384", "sha512", "md5", "checksum", "digest", "empreinte", "revision", "révision",
-];
-
-/// Lengths, in hex digits, of MD5, SHA-1 (and git), SHA-256 and SHA-512.
-const PRINT_HEX_LENGTHS: &[usize] = &[32, 40, 64, 128];
-
 /// Words that make a nearby identifier word irrelevant: the value is a secret.
 const SECRET_CONTEXT_WORDS: &[&str] = &["bearer", "credential", "credentials", "apikey", "signing"];
 
@@ -765,65 +757,6 @@ fn names_identifier(tokens: &[&str], index: usize) -> bool {
         SECRET_KEYWORDS.contains(&word.as_str()) || SECRET_CONTEXT_WORDS.contains(&word.as_str())
     });
     !secret && words.iter().any(|word| IDENTIFIER_WORDS.contains(&word.as_str()))
-}
-
-/// Label words of the `count` tokens before `index` that carry a letter or
-/// a digit, nearest first, stopping where the previous sentence ends.
-fn words_before(tokens: &[&str], index: usize, count: usize) -> Vec<String> {
-    let mut words = Vec::new();
-    let labels = tokens[..index].iter().rev().filter(|token| token.chars().any(char::is_alphanumeric));
-    for token in labels.take(count) {
-        if token.ends_with(['.', ';', '!', '?']) {
-            break;
-        }
-        words.extend(label_words(token));
-    }
-    words
-}
-
-/// True when one of the eight words before `index` announces a secret.
-fn secret_announced(tokens: &[&str], index: usize) -> bool {
-    words_before(tokens, index, 8).iter().any(|word| {
-        SECRET_KEYWORDS.contains(&word.as_str()) || SECRET_CONTEXT_WORDS.contains(&word.as_str())
-    })
-}
-
-/// The print of a file or of a commit: hex digits only, of the length of
-/// a known digest, announced as such within four words (`sha256 <64 hex>`,
-/// `Empreinte SHA-256 du fichier : …`), and nothing nearby calling it a secret.
-fn public_print(core: &str, tokens: &[&str], index: usize) -> bool {
-    PRINT_HEX_LENGTHS.contains(&core.len())
-        && core.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && !secret_announced(tokens, index)
-        && words_before(tokens, index, 4).iter().any(|word| PRINT_WORDS.contains(&word.as_str()))
-}
-
-/// A model or package name with versions (`mmarco-mMiniLMv2-L12`): three
-/// parts or more, one a lowercase word of five letters or more, one a
-/// version code (`L12`, `v2`, `27B`), the others short and switching at
-/// most once between letters and digits. The groups of a random key
-/// (`Vkrs_4xaG_Ohq6_hsBA`) do not line up that way.
-fn versioned_name(core: &str) -> bool {
-    let parts: Vec<&str> = core.split(['-', '_', '.']).filter(|part| !part.is_empty()).collect();
-    let switches = |part: &str| {
-        let chars: Vec<char> = part.chars().collect();
-        chars
-            .windows(2)
-            .filter(|pair| pair[0].is_ascii_digit() != pair[1].is_ascii_digit())
-            .count()
-    };
-    let short_code =
-        |part: &&str| part.len() <= 10 && part.chars().all(|c| c.is_ascii_alphanumeric()) && switches(part) <= 1;
-    let lowercase_word = |part: &&str| part.len() >= 5 && part.chars().all(|c| c.is_ascii_lowercase());
-    let version_code = |part: &&str| {
-        let letters = part.chars().filter(char::is_ascii_alphabetic).count();
-        let digits = part.chars().filter(char::is_ascii_digit).count();
-        part.len() <= 5 && (1..=2).contains(&letters) && digits >= 1 && letters + digits == part.len() && switches(part) == 1
-    };
-    parts.len() >= 3
-        && parts.iter().all(|part| short_code(part) || made_of_words([*part]))
-        && parts.iter().any(lowercase_word)
-        && parts.iter().any(version_code)
 }
 
 /// Words joined by '+' or '/' (`BM25+vector`, `iOS+Android`): every part is
@@ -972,10 +905,7 @@ pub(crate) fn find_secret_value(content: &str) -> Option<String> {
             let core = token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c));
             // Identifiers never hold a password symbol: "account: x@y.com Hx9!kLm2" stays secret.
             let identifier_shape = core.chars().all(|c| c.is_alphanumeric() || "-_.".contains(c));
-            let harmless = names_identifier(&tokens, index)
-                || public_print(core, &tokens, index)
-                || (versioned_name(core) && !secret_announced(&tokens, index));
-            if identifier_shape && !has_secret_prefix(core) && harmless {
+            if identifier_shape && !has_secret_prefix(core) && names_identifier(&tokens, index) {
                 continue;
             }
             return Some(core.to_string());
@@ -1910,9 +1840,6 @@ mod tests {
             // Technical notes the detector used to seal (2026-10-23).
             "Modèle multilingual-e5-small via fastembed, cible x86_64-unknown-linux-musl ou wasm32-unknown-unknown.",
             "Rerank avec jina-reranker-v2 après BM25+vector, cartes avec hover:-translate-y-1.",
-            // Model names and file prints the detector sealed (2026-11-17).
-            "Mesure du 2026-11-17 : mmarco-mMiniLMv2-L12 en reclassement élargi, écarté ; ettin-32m reste candidat.",
-            "Reclasseurs cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 et ettin-reranker-32m-v1 comparés.",
             "Cookie SameSite=Lax, header stale-while-revalidate=60, FCM pour iOS+Android.",
             "FAISS pour C++/Python, charger via load() plutôt que onMount/$effect.",
             "D1 uuid bd40952d-15fc-434c-89af-f274846c5d25, migration 20260930120000_admin_guard.sql.",
@@ -1950,9 +1877,6 @@ mod tests {
             "Stripe lookup_key=sociomator_pro, Défaut=0, Sauvegardes *.bak-20261025-client".to_string(),
             format!("Profil Adobe CoatedFOGRA39.icc, webcredentials applinks:{}.com.soflution.app", "AB12CD345E"),
             format!("Bindings: AUTH_KV (id {hex}), WAF (ruleset {hex})"),
-            format!("model_quantized.onnx (268 407 694 octets, sha256 {hex}{hex}), tokenizer.json (sha256 {hex}{hex})"),
-            format!("Source : Horizon-Labs/multilingual-reranker-small, révision {hex}aabbccdd, Apache 2.0"),
-            format!("Empreinte SHA-256 du fichier : {hex}{hex}. MD5 {hex}."),
             "Coords : email [402,519] · mot de passe 402,519 · bouton [402,600]".to_string(),
             "Header x-apikey='env:cegid_loop' ou x-apikey='key:cegid_loop' lu au runtime".to_string(),
             "deepmerge (GHSA-gcqx-w48m-w2h4, low) et @hono/node-server (GHSA-rmxm-3fg6-px4f) corrigés".to_string(),
@@ -1970,27 +1894,6 @@ mod tests {
             format!("Cloudflare account token: {hex}"),
             format!("Supabase id 11112222-3333-4444-8555-666677778888, token {hex}"),
             "workspace aaaabbbb-cccc-4ddd-8eee-ffff00001111 pwd Ab12Cd34!x".to_string(),
-            // A print label does not excuse a value announced as a secret,
-            // and a key in dashed groups is not a versioned name.
-            format!("sha256 du token : {hex}{hex}"),
-            format!("Licence {}-{}-{}", "aB3xK9q2", "Zt7LmN4p", "Qr8Vw1Xy"),
-            // Found by the review of the first fix (2026-11-18): keys in
-            // groups, a print label in front of a key, a secret word further back.
-            format!("token {}-{}", "Ft84Popk", "GZKRnLXv"),
-            format!("clé API : {}_{}_{}_{}", "Vkrs", "4xaG", "Ohq6", "hsBA"),
-            format!("{}-{}-{}", "FewOz", "9Eivy", "zlQD8"),
-            format!("sha256 {}", "o5ICivijElZcHoaysRL5LSD9"),
-            format!("md5 {}", "o5ICivijElZcHoaysRL5LSD9"),
-            format!("révision {}", "o5ICivijElZcHoaysRL5LSD9"),
-            format!("Clé de licence : empreinte {hex}"),
-            format!("Le secret HMAC est le digest : {hex}"),
-            format!("Secret du webhook sha256 {hex}{hex}"),
-            format!("clé de signature (sha256) : {hex}{hex}"),
-            format!("Secret du build de prod : {}", "o5ICivijElZcHoaysRL5LSD9"),
-            format!("Compte MD : {}", "o5ICivijElZcHoaysRL5LSD9"),
-            format!("id2 {}", "o5ICivijElZcHoaysRL5LSD9"),
-            format!("{}-{}-{}-{}", "Paris", "2024", "Mdp", "Z9"),
-            format!("token du modèle {}-{}-{}", "mmarco", "mMiniLMv2", "L12"),
             stripe,
             format!("POWENS_CLIENT_ID=37447765. POWENS_CLIENT_{}=AbCdEf123456GhIjKl789", "SECRET"),
             "Secret posé : CF_API_KEY=\"AbCdEf123456GhIjKl789\"".to_string(),
