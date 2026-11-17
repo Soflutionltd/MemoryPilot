@@ -587,7 +587,28 @@ impl Database {
                                 *hit_session == session && span.is_none_or(|span| hit_index.abs_diff(index) <= span)
                             })
                         };
+                        // Every returned turn in rank order, and every marked
+                        // turn with its rank: enough to price a smaller or a
+                        // trimmed context without another search.
+                        let turn_of: HashMap<&str, &HaystackTurn> = haystack.iter().map(|turn| (turn.key.as_str(), turn)).collect();
+                        let returned: Vec<serde_json::Value> = ids
+                            .iter()
+                            .filter_map(|id| turn_of.get(id))
+                            .map(|turn| json!({ "key": turn.key, "role": turn.role, "chars": turn.content.chars().count(), "evidence": turn.evidence }))
+                            .collect();
+                        let marked: Vec<serde_json::Value> = haystack
+                            .iter()
+                            .filter(|turn| turn.evidence)
+                            .map(|turn| json!({
+                                "key": turn.key,
+                                "role": turn.role,
+                                "chars": turn.content.chars().count(),
+                                "rank": ids.iter().position(|id| *id == turn.key).map(|position| position + 1),
+                            }))
+                            .collect();
                         coverage_rows.push(json!({
+                            "returned": returned,
+                            "marked": marked,
                             "question_id": entry.get("question_id").and_then(|v| v.as_str()).unwrap_or(""),
                             "question_type": question_type,
                             "gold_sessions": answer_session_ids.len(),
