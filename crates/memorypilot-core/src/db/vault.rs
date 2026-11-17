@@ -627,7 +627,8 @@ fn is_email(core: &str) -> bool {
 const IDENTIFIER_WORDS: &[&str] = &[
     "id", "ids", "sid", "uuid", "guid", "account", "zone", "tag", "team", "project", "projet", "folder",
     "dossier", "parent", "doc", "kv", "d1", "namespace", "bucket", "database", "commit", "sha", "hash",
-    "ref", "item", "build", "workspace", "org", "ruleset", "rule",
+    "ref", "item", "build", "workspace", "org", "ruleset", "rule", "revision", "révision", "checksum",
+    "digest", "empreinte", "md",
 ];
 
 /// Words that make a nearby identifier word irrelevant: the value is a secret.
@@ -747,7 +748,9 @@ fn label_words(token: &str) -> Vec<String> {
 /// and none of them announces a secret.
 fn names_identifier(tokens: &[&str], index: usize) -> bool {
     let mut words = Vec::new();
-    for token in tokens[..index].iter().rev().take(3) {
+    // A lone `:` or `=` between the label and the value is not a word.
+    let labels = tokens[..index].iter().rev().filter(|token| token.chars().any(char::is_alphanumeric));
+    for token in labels.take(3) {
         if !words.is_empty() && token.ends_with(['.', ';', ',']) {
             break;
         }
@@ -756,7 +759,31 @@ fn names_identifier(tokens: &[&str], index: usize) -> bool {
     let secret = words.iter().any(|word| {
         SECRET_KEYWORDS.contains(&word.as_str()) || SECRET_CONTEXT_WORDS.contains(&word.as_str())
     });
-    !secret && words.iter().any(|word| IDENTIFIER_WORDS.contains(&word.as_str()))
+    // `sha256`, `sha1`, `md5`: the algorithm number is not part of the word.
+    !secret
+        && words
+            .iter()
+            .any(|word| IDENTIFIER_WORDS.contains(&word.trim_end_matches(|c: char| c.is_ascii_digit())))
+}
+
+/// A model or package name with versions (`mmarco-mMiniLMv2-L12-H384-v1`,
+/// `Qwen3-27B-UD`): several short parts that each switch at most once
+/// between letters and digits, one of them a real word. The parts of a
+/// random key (`aB3xK9q2-Zt7LmN4p`) mix letters and digits throughout.
+fn versioned_name(core: &str) -> bool {
+    let parts: Vec<&str> = core.split(['-', '_', '.']).filter(|part| !part.is_empty()).collect();
+    let short_code = |part: &&str| {
+        let chars: Vec<char> = part.chars().collect();
+        let switches = chars
+            .windows(2)
+            .filter(|pair| pair[0].is_ascii_digit() != pair[1].is_ascii_digit())
+            .count();
+        chars.len() <= 10 && chars.iter().all(char::is_ascii_alphanumeric) && switches <= 1
+    };
+    let real_word = |part: &&str| crate::secrets::camel_words(part).is_some_and(|(words, letters)| words >= 1 && letters >= 4);
+    parts.len() >= 2
+        && parts.iter().all(|part| short_code(part) || made_of_words([*part]))
+        && parts.iter().any(real_word)
 }
 
 /// Words joined by '+' or '/' (`BM25+vector`, `iOS+Android`): every part is
@@ -874,6 +901,7 @@ pub(crate) fn looks_secret(token: &str) -> bool {
         && !core.contains('/')
         && !decimal
         && !word_like
+        && !versioned_name(core)
         && (!separated || (has_upper && has_lower));
     // A long random part behind a prefix, even in lowercase (`sbp_<40 hex>`, `glpat-…`).
     let random_part = !core.contains('/') && core.split(separators).any(|part| {
@@ -1840,6 +1868,9 @@ mod tests {
             // Technical notes the detector used to seal (2026-10-23).
             "Modèle multilingual-e5-small via fastembed, cible x86_64-unknown-linux-musl ou wasm32-unknown-unknown.",
             "Rerank avec jina-reranker-v2 après BM25+vector, cartes avec hover:-translate-y-1.",
+            // Model names and file prints the detector sealed (2026-11-17).
+            "Mesure du 2026-11-17 : mmarco-mMiniLMv2-L12 en reclassement élargi, écarté ; ettin-32m reste candidat.",
+            "Reclasseurs cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 et Qwen3-Reranker-06B comparés.",
             "Cookie SameSite=Lax, header stale-while-revalidate=60, FCM pour iOS+Android.",
             "FAISS pour C++/Python, charger via load() plutôt que onMount/$effect.",
             "D1 uuid bd40952d-15fc-434c-89af-f274846c5d25, migration 20260930120000_admin_guard.sql.",
@@ -1877,6 +1908,9 @@ mod tests {
             "Stripe lookup_key=sociomator_pro, Défaut=0, Sauvegardes *.bak-20261025-client".to_string(),
             format!("Profil Adobe CoatedFOGRA39.icc, webcredentials applinks:{}.com.soflution.app", "AB12CD345E"),
             format!("Bindings: AUTH_KV (id {hex}), WAF (ruleset {hex})"),
+            format!("model_quantized.onnx (268 407 694 octets, sha256 {hex}{hex}), tokenizer.json (sha256 {hex}{hex})"),
+            format!("Source : Horizon-Labs/multilingual-reranker-small, révision {hex}aabbccdd, Apache 2.0"),
+            format!("Empreinte SHA-256 du fichier : {hex}{hex}. MD5 {hex}."),
             "Coords : email [402,519] · mot de passe 402,519 · bouton [402,600]".to_string(),
             "Header x-apikey='env:cegid_loop' ou x-apikey='key:cegid_loop' lu au runtime".to_string(),
             "deepmerge (GHSA-gcqx-w48m-w2h4, low) et @hono/node-server (GHSA-rmxm-3fg6-px4f) corrigés".to_string(),
@@ -1894,6 +1928,10 @@ mod tests {
             format!("Cloudflare account token: {hex}"),
             format!("Supabase id 11112222-3333-4444-8555-666677778888, token {hex}"),
             "workspace aaaabbbb-cccc-4ddd-8eee-ffff00001111 pwd Ab12Cd34!x".to_string(),
+            // A print label does not excuse a value announced as a secret,
+            // and a key in dashed groups is not a versioned name.
+            format!("sha256 du token : {hex}{hex}"),
+            format!("Licence {}-{}-{}", "aB3xK9q2", "Zt7LmN4p", "Qr8Vw1Xy"),
             stripe,
             format!("POWENS_CLIENT_ID=37447765. POWENS_CLIENT_{}=AbCdEf123456GhIjKl789", "SECRET"),
             "Secret posé : CF_API_KEY=\"AbCdEf123456GhIjKl789\"".to_string(),
