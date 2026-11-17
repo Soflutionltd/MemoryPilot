@@ -233,8 +233,7 @@ enum CrossRerankerState {
     Unavailable(String),
 }
 
-/// A loaded cross-encoder: jina-reranker-v2-base-multilingual, driven
-/// through `ort` directly.
+/// A loaded cross-encoder, driven through `ort` directly.
 enum Reranker {
     Ort(OrtReranker),
 }
@@ -262,19 +261,74 @@ const RERANK_MAX_TOKENS: usize = 512;
 
 struct OrtReranker {
     session: ort::session::Session,
-    tokenizer: crate::tokenizer::Unigram,
+    tokenizer: PairTokenizer,
     run_options: ort::session::RunOptions,
     needs_token_type_ids: bool,
+    /// `Some` when the graph stops at the encoder and the score is
+    /// computed here from the `[CLS]` hidden state.
+    head: Option<crate::rerank_head::ClsDenseHead>,
 }
 
-/// An XLM-R–family cross-encoder served through `ort`: Hugging Face repo
-/// plus the int8 graph inside it. All three share the same Unigram
-/// tokenizer and `<s> q </s></s> d </s>` pair template.
+/// A cross-encoder served through `ort`: Hugging Face repo, the int8
+/// graph inside it, and the tokenizer family its `tokenizer.json` needs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OrtRerankerSpec {
     pub repo: &'static str,
     pub onnx_file: &'static str,
     pub label: &'static str,
+    pub tokenizer: PairTokenizerKind,
+    pub output: RerankOutput,
+}
+
+/// What the ONNX graph of a cross-encoder returns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RerankOutput {
+    /// `logits`, one score per pair.
+    Logits,
+    /// `last_hidden_state` only: the scoring head ships apart in the
+    /// repository (`2_Dense`, `3_LayerNorm`, `4_Dense`).
+    HiddenStateWithHead,
+}
+
+/// Tokenizer family of a cross-encoder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PairTokenizerKind {
+    /// XLM-R Unigram, `<s> q </s></s> d </s>`.
+    XlmRoberta,
+    /// ModernBERT byte-level BPE, `[CLS] q [SEP] d [SEP]`.
+    ModernBert,
+}
+
+enum PairTokenizer {
+    XlmRoberta(crate::tokenizer::Unigram),
+    ModernBert(crate::tokenizer::ModernBertBpe),
+}
+
+impl PairTokenizer {
+    fn load(kind: PairTokenizerKind, path: &std::path::Path) -> Result<Self, String> {
+        match kind {
+            PairTokenizerKind::XlmRoberta => {
+                crate::tokenizer::Unigram::from_file(path).map(PairTokenizer::XlmRoberta)
+            }
+            PairTokenizerKind::ModernBert => {
+                crate::tokenizer::ModernBertBpe::from_file(path).map(PairTokenizer::ModernBert)
+            }
+        }
+    }
+
+    fn encode_pair(&self, query: &str, document: &str, max_tokens: usize) -> Vec<u32> {
+        match self {
+            PairTokenizer::XlmRoberta(tokenizer) => tokenizer.encode_pair(query, document, max_tokens),
+            PairTokenizer::ModernBert(tokenizer) => tokenizer.encode_pair(query, document, max_tokens),
+        }
+    }
+
+    fn pad_id(&self) -> u32 {
+        match self {
+            PairTokenizer::XlmRoberta(tokenizer) => tokenizer.pad_id(),
+            PairTokenizer::ModernBert(tokenizer) => tokenizer.pad_id(),
+        }
+    }
 }
 
 impl OrtReranker {
@@ -284,7 +338,7 @@ impl OrtReranker {
         // external data so the weights are memory-mapped instead.
         let graph_path = crate::onnx_external::externalized(spec.repo, spec.onnx_file, false)?;
         let tokenizer_path = crate::embedding::hf_file(spec.repo, "tokenizer.json", false)?;
-        let tokenizer = crate::tokenizer::Unigram::from_file(&tokenizer_path)
+        let tokenizer = PairTokenizer::load(spec.tokenizer, &tokenizer_path)
             .map_err(|error| format!("reranker tokenizer load: {}", error))?;
 
         use ort::session::builder::GraphOptimizationLevel;
@@ -311,11 +365,17 @@ impl OrtReranker {
             .set("memory.enable_memory_arena_shrinkage", "cpu:0")
             .map_err(|error| format!("ort arena shrinkage: {}", error))?;
 
+        let head = match spec.output {
+            RerankOutput::Logits => None,
+            RerankOutput::HiddenStateWithHead => Some(crate::rerank_head::ClsDenseHead::load(spec.repo)?),
+        };
+
         Ok(Self {
             session,
             tokenizer,
             run_options,
             needs_token_type_ids,
+            head,
         })
     }
 
@@ -382,7 +442,29 @@ impl OrtReranker {
             .session
             .run_with_options(inputs, &self.run_options)
             .map_err(|error| format!("ort run: {}", error))?;
-        let (out_shape, data) = outputs["logits"]
+        if let Some(head) = &self.head {
+            let hidden = outputs
+                .get("last_hidden_state")
+                .ok_or("the graph has no last_hidden_state output")?;
+            let (out_shape, data) = hidden
+                .try_extract_tensor::<f32>()
+                .map_err(|error| format!("last_hidden_state extract: {}", error))?;
+            let dims: Vec<i64> = out_shape.iter().copied().collect();
+            let hidden_size = head.width();
+            if dims != [batch as i64, width as i64, hidden_size as i64] {
+                return Err(format!(
+                    "last_hidden_state shape {:?}, expected [{}, {}, {}]",
+                    dims, batch, width, hidden_size
+                ));
+            }
+            // [CLS] is the first position of each row.
+            return data
+                .chunks_exact(width * hidden_size)
+                .map(|row| head.score(&row[..hidden_size]))
+                .collect();
+        }
+        let logits = outputs.get("logits").ok_or("the graph has no logits output")?;
+        let (out_shape, data) = logits
             .try_extract_tensor::<f32>()
             .map_err(|error| format!("logits extract: {}", error))?;
         let dims: Vec<i64> = out_shape.iter().copied().collect();
@@ -629,6 +711,35 @@ const JINA_V2_INT8: OrtRerankerSpec = OrtRerankerSpec {
     repo: "jinaai/jina-reranker-v2-base-multilingual",
     onnx_file: "onnx/model_int8.onnx",
     label: "jina-reranker-v2-base-multilingual int8",
+    tokenizer: PairTokenizerKind::XlmRoberta,
+    output: RerankOutput::Logits,
+};
+
+/// Lighter candidates, all Apache-2.0, selected with
+/// `MEMORYPILOT_RERANKER_MODEL` to measure them against the default. Their
+/// repositories ship one int8 graph per CPU family; these are the arm64
+/// ones. Their logits are on another scale than jina's, so the abstention
+/// threshold `MEMORYPILOT_TRUST_CROSS` is not calibrated for them.
+const MMARCO_L12_INT8: OrtRerankerSpec = OrtRerankerSpec {
+    repo: "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    onnx_file: "onnx/model_qint8_arm64.onnx",
+    label: "mmarco-mMiniLMv2-L12-H384-v1 int8 (multilingual, 118M)",
+    tokenizer: PairTokenizerKind::XlmRoberta,
+    output: RerankOutput::Logits,
+};
+const ETTIN_32M_INT8: OrtRerankerSpec = OrtRerankerSpec {
+    repo: "cross-encoder/ettin-reranker-32m-v1",
+    onnx_file: "onnx/model_qint8_arm64.onnx",
+    label: "ettin-reranker-32m-v1 int8 (English, 32M)",
+    tokenizer: PairTokenizerKind::ModernBert,
+    output: RerankOutput::HiddenStateWithHead,
+};
+const ETTIN_17M_INT8: OrtRerankerSpec = OrtRerankerSpec {
+    repo: "cross-encoder/ettin-reranker-17m-v1",
+    onnx_file: "onnx/model_qint8_arm64.onnx",
+    label: "ettin-reranker-17m-v1 int8 (English, 17M)",
+    tokenizer: PairTokenizerKind::ModernBert,
+    output: RerankOutput::HiddenStateWithHead,
 };
 
 enum RerankerChoice {
@@ -662,17 +773,28 @@ fn rerank_intra_threads() -> usize {
 
 fn cross_reranker_model() -> RerankerChoice {
     let requested = std::env::var("MEMORYPILOT_RERANKER_MODEL").unwrap_or_default();
-    let requested = requested.trim().to_ascii_lowercase();
-    if !matches!(
-        requested.as_str(),
-        "" | "jina" | "jina-v2" | "jina-v2-multilingual" | "jinaai/jina-reranker-v2-base-multilingual"
-    ) {
+    let spec = reranker_spec_from(&requested).unwrap_or_else(|| {
         eprintln!(
-            "[MemoryPilot] MEMORYPILOT_RERANKER_MODEL={} is no longer supported: only jina-reranker-v2-base-multilingual is.",
-            requested
+            "[MemoryPilot] MEMORYPILOT_RERANKER_MODEL={} is not a known cross-encoder (jina-v2, mmarco, ettin-32m, ettin-17m): using jina-reranker-v2-base-multilingual.",
+            requested.trim()
         );
+        JINA_V2_INT8
+    });
+    RerankerChoice::Ort(spec)
+}
+
+/// The cross-encoder a `MEMORYPILOT_RERANKER_MODEL` value names; `None`
+/// for a name that is not one of them. Empty means the default.
+fn reranker_spec_from(requested: &str) -> Option<OrtRerankerSpec> {
+    match requested.trim().to_ascii_lowercase().as_str() {
+        "" | "jina" | "jina-v2" | "jina-v2-multilingual" | "jinaai/jina-reranker-v2-base-multilingual" => {
+            Some(JINA_V2_INT8)
+        }
+        "mmarco" | "mmarco-l12" | "cross-encoder/mmarco-mminilmv2-l12-h384-v1" => Some(MMARCO_L12_INT8),
+        "ettin-32m" | "cross-encoder/ettin-reranker-32m-v1" => Some(ETTIN_32M_INT8),
+        "ettin-17m" | "cross-encoder/ettin-reranker-17m-v1" => Some(ETTIN_17M_INT8),
+        _ => None,
     }
-    RerankerChoice::Ort(JINA_V2_INT8)
 }
 
 fn truncate_document(content: &str) -> String {
@@ -899,6 +1021,40 @@ mod tests {
             .map(|(i, _)| i)
             .unwrap();
         assert_eq!(best, 11, "relevant snippet must rank first: {:?}", scores);
+    }
+
+    #[test]
+    fn reranker_model_names_select_their_cross_encoder() {
+        assert_eq!(reranker_spec_from(""), Some(JINA_V2_INT8));
+        assert_eq!(reranker_spec_from(" Jina-V2 "), Some(JINA_V2_INT8));
+        assert_eq!(reranker_spec_from("mmarco"), Some(MMARCO_L12_INT8));
+        assert_eq!(reranker_spec_from("ettin-32m"), Some(ETTIN_32M_INT8));
+        assert_eq!(reranker_spec_from("ettin-17m"), Some(ETTIN_17M_INT8));
+        assert_eq!(reranker_spec_from("bge-reranker-v2-m3"), None);
+    }
+
+    /// Each candidate loads and puts the relevant document first. Needs
+    /// the model files (network on first run).
+    #[test]
+    #[ignore]
+    fn candidate_cross_encoders_rank_the_relevant_document_first() {
+        let query = "which database does the project use";
+        let documents = vec![
+            "The team went hiking in the mountains last weekend.".to_string(),
+            "The project stores its data in a PostgreSQL database.".to_string(),
+            "Lunch is served at noon in the cafeteria.".to_string(),
+        ];
+        for spec in [MMARCO_L12_INT8, ETTIN_32M_INT8, ETTIN_17M_INT8] {
+            let mut model = OrtReranker::load(spec).expect(spec.label);
+            let scores = model.scores(query, &documents).expect(spec.label);
+            eprintln!("[candidate probe] {}: {:?}", spec.label, scores);
+            assert!(
+                scores[1] > scores[0] && scores[1] > scores[2],
+                "{}: {:?}",
+                spec.label,
+                scores
+            );
+        }
     }
 
     #[test]

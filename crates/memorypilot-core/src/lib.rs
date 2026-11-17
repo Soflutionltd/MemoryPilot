@@ -20,6 +20,7 @@ pub mod onepassword;
 pub mod onnx_external;
 pub mod pool;
 pub mod reader;
+mod rerank_head;
 pub mod reranking;
 pub mod secrets;
 pub mod session_capsule;

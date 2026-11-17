@@ -1,4 +1,4 @@
-//! Lean tokenizers for the two default ONNX models.
+//! Lean tokenizers for the ONNX models.
 //!
 //! The `tokenizers` crate is correct but memory-hungry: loading the
 //! jina/EuroBERT byte-level BPE (128k vocab, 280k merges) costs ~205 MB
@@ -146,6 +146,70 @@ impl ByteLevelBpe {
 const GPT2_PATTERN: &str =
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 
+/// A merge-list BPE vocabulary turned into tiktoken ranks: the 256 single
+/// bytes first, then one rank per merge in merge order, with the tables
+/// that map a rank back to the model id and to its bytes.
+struct MergeRanks {
+    bpe: tiktoken_rs::CoreBPE,
+    rank_to_id: Vec<u32>,
+    rank_bytes: Vec<Vec<u8>>,
+}
+
+impl MergeRanks {
+    fn build(vocab: &HashMap<String, u32>, merges: &[serde_json::Value]) -> Result<Self, String> {
+        let table = byte_level_decoder();
+        let decode = |token: &str| -> Option<Vec<u8>> {
+            token.chars().map(|ch| table.get(&ch).copied()).collect()
+        };
+
+        let rank_count = 256 + merges.len();
+        let mut encoder: rustc_hash::FxHashMap<Vec<u8>, u32> = Default::default();
+        encoder.reserve(rank_count);
+        let mut rank_to_id = vec![u32::MAX; rank_count];
+        let mut rank_bytes: Vec<Vec<u8>> = vec![Vec::new(); rank_count];
+
+        // Ranks 0..256: the single bytes, in byte order.
+        for (token, &id) in vocab {
+            if let Some(bytes) = decode(token) {
+                if bytes.len() == 1 {
+                    let rank = bytes[0] as usize;
+                    encoder.insert(bytes.clone(), rank as u32);
+                    rank_to_id[rank] = id;
+                    rank_bytes[rank] = bytes;
+                }
+            }
+        }
+        // Ranks 256..: one per merge, in merge order.
+        for (position, merge) in merges.iter().enumerate() {
+            let merged = match merge {
+                serde_json::Value::String(pair) => pair.replacen(' ', "", 1),
+                serde_json::Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part.as_str())
+                    .collect::<String>(),
+                _ => return Err("tokenizer.json merge entry has an unknown shape".into()),
+            };
+            let id = *vocab
+                .get(&merged)
+                .ok_or_else(|| format!("merge result {:?} missing from vocab", merged))?;
+            let bytes = decode(&merged)
+                .ok_or_else(|| format!("merge result {:?} is not byte-level encoded", merged))?;
+            let rank = 256 + position;
+            encoder.insert(bytes.clone(), rank as u32);
+            rank_to_id[rank] = id;
+            rank_bytes[rank] = bytes;
+        }
+        let specials: rustc_hash::FxHashMap<String, u32> = Default::default();
+        let bpe = tiktoken_rs::CoreBPE::new(encoder, specials, GPT2_PATTERN)
+            .map_err(|error| format!("BPE init: {}", error))?;
+        Ok(Self {
+            bpe,
+            rank_to_id,
+            rank_bytes,
+        })
+    }
+}
+
 /// RoBERTa's byte-level BPE. Unlike the tiktoken-style vocabularies
 /// above, its ids are frequency-sorted and carry no merge order, so the
 /// merge list is turned into ranks (`256 + position`), tiktoken runs on
@@ -189,51 +253,8 @@ impl MergeBpe {
         let file: File = serde_json::from_reader(reader)
             .map_err(|error| format!("parse {}: {}", path.display(), error))?;
 
-        let table = byte_level_decoder();
-        let decode = |token: &str| -> Option<Vec<u8>> {
-            token.chars().map(|ch| table.get(&ch).copied()).collect()
-        };
-
-        let rank_count = 256 + file.model.merges.len();
-        let mut encoder: rustc_hash::FxHashMap<Vec<u8>, u32> = Default::default();
-        encoder.reserve(rank_count);
-        let mut rank_to_id = vec![u32::MAX; rank_count];
-        let mut rank_bytes: Vec<Vec<u8>> = vec![Vec::new(); rank_count];
-
-        // Ranks 0..256: the single bytes, in byte order.
-        for (token, &id) in &file.model.vocab {
-            if let Some(bytes) = decode(token) {
-                if bytes.len() == 1 {
-                    let rank = bytes[0] as usize;
-                    encoder.insert(bytes.clone(), rank as u32);
-                    rank_to_id[rank] = id;
-                    rank_bytes[rank] = bytes;
-                }
-            }
-        }
-        // Ranks 256..: one per merge, in merge order.
-        for (position, merge) in file.model.merges.iter().enumerate() {
-            let merged = match merge {
-                serde_json::Value::String(pair) => pair.replacen(' ', "", 1),
-                serde_json::Value::Array(parts) => parts
-                    .iter()
-                    .filter_map(|part| part.as_str())
-                    .collect::<String>(),
-                _ => return Err("tokenizer.json merge entry has an unknown shape".into()),
-            };
-            let id = *file
-                .model
-                .vocab
-                .get(&merged)
-                .ok_or_else(|| format!("merge result {:?} missing from vocab", merged))?;
-            let bytes = decode(&merged)
-                .ok_or_else(|| format!("merge result {:?} is not byte-level encoded", merged))?;
-            let rank = 256 + position;
-            encoder.insert(bytes.clone(), rank as u32);
-            rank_to_id[rank] = id;
-            rank_bytes[rank] = bytes;
-        }
-        if rank_to_id[..256].iter().any(|&id| id == u32::MAX) {
+        let ranks = MergeRanks::build(&file.model.vocab, &file.model.merges)?;
+        if ranks.rank_to_id[..256].iter().any(|&id| id == u32::MAX) {
             return Err("vocab does not cover all 256 byte tokens".into());
         }
 
@@ -248,13 +269,10 @@ impl MergeBpe {
         let eos_id = special("</s>")?;
         let pad_id = special("<pad>")?;
 
-        let specials: rustc_hash::FxHashMap<String, u32> = Default::default();
-        let bpe = tiktoken_rs::CoreBPE::new(encoder, specials, GPT2_PATTERN)
-            .map_err(|error| format!("BPE init: {}", error))?;
         Ok(Self {
-            bpe,
-            rank_to_id,
-            rank_bytes,
+            bpe: ranks.bpe,
+            rank_to_id: ranks.rank_to_id,
+            rank_bytes: ranks.rank_bytes,
             bos_id,
             eos_id,
             pad_id,
@@ -292,6 +310,189 @@ impl MergeBpe {
     /// Model ids of `text`, no specials.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         self.encode_with_offsets(text).0
+    }
+}
+
+// ─── Byte-level BPE with added tokens (ModernBERT family: Ettin) ───
+
+/// One `added_tokens` entry of a `tokenizer.json`: text matched verbatim
+/// before the BPE runs. `lstrip` also swallows the whitespace before it.
+struct AddedToken {
+    content: String,
+    id: u32,
+    /// Matched on the NFC text rather than on the raw one.
+    normalized: bool,
+    lstrip: bool,
+}
+
+/// ModernBERT's tokenizer: added tokens (`[CLS]`, `[unused…]`, runs of
+/// spaces) cut out leftmost-longest, NFC normalisation, GPT-2 byte-level
+/// BPE on the rest, and the `[CLS] A [SEP] B [SEP]` pair template.
+/// Reproduces the `tokenizers` crate token-for-token (asserted in tests).
+pub struct ModernBertBpe {
+    ranks: MergeRanks,
+    /// Longest content first, so the first hit at a position is the
+    /// longest one.
+    added: Vec<AddedToken>,
+    cls_id: u32,
+    sep_id: u32,
+    pad_id: u32,
+}
+
+impl ModernBertBpe {
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            model: Model,
+            added_tokens: Vec<Added>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Model {
+            vocab: HashMap<String, u32>,
+            merges: Vec<serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Added {
+            content: String,
+            id: u32,
+            normalized: bool,
+            lstrip: bool,
+            rstrip: bool,
+            single_word: bool,
+        }
+
+        let reader = BufReader::new(
+            std::fs::File::open(path)
+                .map_err(|error| format!("open {}: {}", path.display(), error))?,
+        );
+        let file: File = serde_json::from_reader(reader)
+            .map_err(|error| format!("parse {}: {}", path.display(), error))?;
+
+        if let Some(unsupported) = file
+            .added_tokens
+            .iter()
+            .find(|added| added.rstrip || added.single_word)
+        {
+            return Err(format!(
+                "added token {:?} uses rstrip or single_word, which this tokenizer does not implement",
+                unsupported.content
+            ));
+        }
+        let special = |name: &str| -> Result<u32, String> {
+            file.added_tokens
+                .iter()
+                .find(|added| added.content == name)
+                .map(|added| added.id)
+                .ok_or_else(|| format!("tokenizer.json has no {} token", name))
+        };
+        let cls_id = special("[CLS]")?;
+        let sep_id = special("[SEP]")?;
+        let pad_id = special("[PAD]")?;
+
+        // The vocabulary leaves out the 13 bytes that never occur in
+        // UTF-8 (0xC0, 0xC1, 0xF5..=0xFF); every byte of a `&str` is covered.
+        let ranks = MergeRanks::build(&file.model.vocab, &file.model.merges)?;
+        let utf8_bytes = (0u8..=0xF4).filter(|byte| !matches!(byte, 0xC0 | 0xC1));
+        if utf8_bytes
+            .into_iter()
+            .any(|byte| ranks.rank_to_id[byte as usize] == u32::MAX)
+        {
+            return Err("vocab does not cover every byte that occurs in UTF-8".into());
+        }
+        let mut added: Vec<AddedToken> = file
+            .added_tokens
+            .into_iter()
+            .filter(|added| !added.content.is_empty())
+            .map(|added| AddedToken {
+                content: added.content,
+                id: added.id,
+                normalized: added.normalized,
+                lstrip: added.lstrip,
+            })
+            .collect();
+        added.sort_by_key(|token| std::cmp::Reverse(token.content.len()));
+
+        Ok(Self {
+            ranks,
+            added,
+            cls_id,
+            sep_id,
+            pad_id,
+        })
+    }
+
+    pub fn pad_id(&self) -> u32 {
+        self.pad_id
+    }
+
+    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
+        out.extend(
+            self.ranks
+                .bpe
+                .encode_ordinary(text)
+                .into_iter()
+                .map(|rank| self.ranks.rank_to_id[rank as usize]),
+        );
+    }
+
+    /// Cuts the added tokens of one class out of `text`, leftmost-longest:
+    /// their ids go to `out`, the text between them to `plain`.
+    fn cut_added(
+        &self,
+        text: &str,
+        normalized: bool,
+        out: &mut Vec<u32>,
+        plain: impl Fn(&str, &mut Vec<u32>),
+    ) {
+        let mut plain_start = 0;
+        let mut position = 0;
+        while position < text.len() {
+            let rest = &text[position..];
+            let hit = self
+                .added
+                .iter()
+                .find(|token| token.normalized == normalized && rest.starts_with(token.content.as_str()));
+            match hit {
+                Some(token) => {
+                    let mut before = &text[plain_start..position];
+                    if token.lstrip {
+                        before = before.trim_end();
+                    }
+                    plain(before, out);
+                    out.push(token.id);
+                    position += token.content.len();
+                    plain_start = position;
+                }
+                None => {
+                    position += rest.chars().next().map_or(1, char::len_utf8);
+                }
+            }
+        }
+        plain(&text[plain_start..], out);
+    }
+
+    /// As `tokenizers` does: the tokens matched on the raw text first
+    /// (`[CLS]`, `[MASK]`…), then NFC and the tokens matched on the
+    /// normalised text (runs of spaces), then the BPE.
+    fn encode_body(&self, text: &str, out: &mut Vec<u32>) {
+        self.cut_added(text, false, out, |raw, out| {
+            let normalized: String = raw.nfc().collect();
+            self.cut_added(&normalized, true, out, |plain, out| self.encode_plain(plain, out));
+        });
+    }
+
+    /// Cross-encoder input `[CLS] query [SEP] document [SEP]`, the
+    /// document truncated so the whole sequence fits in `max_tokens`.
+    pub fn encode_pair(&self, query: &str, document: &str, max_tokens: usize) -> Vec<u32> {
+        let mut ids = vec![self.cls_id];
+        self.encode_body(query, &mut ids);
+        ids.push(self.sep_id);
+        let document_start = ids.len();
+        self.encode_body(document, &mut ids);
+        let document_budget = max_tokens.saturating_sub(document_start + 1);
+        ids.truncate(document_start + document_budget);
+        ids.push(self.sep_id);
+        ids
     }
 }
 
@@ -562,6 +763,40 @@ mod tests {
             assert_eq!(ours.encode_pair(query, sample, 512), expected, "sample {:?}", sample);
         }
         let long = "mémoire longue ".repeat(400);
+        let expected = reference.encode((query, long.as_str()), true).unwrap().get_ids().to_vec();
+        let ids = ours.encode_pair(query, &long, 512);
+        assert_eq!(ids.len(), 512);
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn modernbert_bpe_matches_tokenizers_crate_on_pairs() {
+        let path = crate::embedding::hf_file("cross-encoder/ettin-reranker-17m-v1", "tokenizer.json", false)
+            .expect("ettin tokenizer.json");
+        let ours = ModernBertBpe::from_file(&path).expect("load");
+        let mut reference = tokenizers::Tokenizer::from_file(&path).expect("reference");
+        reference
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 512,
+                strategy: tokenizers::TruncationStrategy::OnlySecond,
+                ..Default::default()
+            }))
+            .unwrap();
+        let query = "how do I publish an Instagram post";
+        let added_tokens = [
+            "indented    code\n        deeper block",
+            "a literal [SEP] and [unused3] in the text, then a [MASK] and  [MASK]",
+            "contact |||EMAIL_ADDRESS||| or |||PHONE_NUMBER|||",
+        ];
+        for sample in SAMPLES.iter().chain(added_tokens.iter()) {
+            let expected = reference
+                .encode((query, *sample), true)
+                .unwrap()
+                .get_ids()
+                .to_vec();
+            assert_eq!(ours.encode_pair(query, sample, 512), expected, "sample {:?}", sample);
+        }
+        let long = "a long memory about the release ".repeat(400);
         let expected = reference.encode((query, long.as_str()), true).unwrap().get_ids().to_vec();
         let ids = ours.encode_pair(query, &long, 512);
         assert_eq!(ids.len(), 512);
