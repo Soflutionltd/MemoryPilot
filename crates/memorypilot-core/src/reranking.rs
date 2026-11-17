@@ -235,7 +235,7 @@ enum CrossRerankerState {
 
 /// A loaded cross-encoder, driven through `ort` directly.
 enum Reranker {
-    Ort(OrtReranker),
+    Ort(Box<OrtReranker>),
 }
 
 impl Reranker {
@@ -750,7 +750,7 @@ enum RerankerChoice {
 fn init_cross_reranker() -> CrossRerankerState {
     let result = match cross_reranker_model() {
         RerankerChoice::Ort(spec) => OrtReranker::load(spec)
-            .map(Reranker::Ort)
+            .map(|model| Reranker::Ort(Box::new(model)))
             .map_err(|error| format!("{} init: {}", spec.label, error)),
     };
     match result {
