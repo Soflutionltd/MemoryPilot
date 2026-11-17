@@ -34,6 +34,17 @@ pub struct ChatClient {
     sends_temperature: bool,
 }
 
+/// Seconds one request may take. Plain HTTP is only accepted on a loopback
+/// host, so it is a model running on this machine: reading a long prompt
+/// there takes minutes, where a hosted endpoint answers in seconds.
+fn request_timeout_secs(base: &str) -> u64 {
+    if base.starts_with("http://") {
+        1800
+    } else {
+        180
+    }
+}
+
 /// Anthropic's endpoint: `temperature` returns a 400 on its current models.
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 
@@ -44,7 +55,7 @@ impl ChatClient {
         let base = base_url.trim().trim_end_matches('/');
         validate_base_url(base)?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(180)))
+            .timeout_global(Some(Duration::from_secs(request_timeout_secs(base))))
             .http_status_as_error(false)
             .user_agent(format!("MemoryPilot/{}", env!("CARGO_PKG_VERSION")))
             .build()
@@ -219,6 +230,12 @@ mod tests {
         let cut = parse_completion(r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#)
             .expect("valid completion");
         assert!(cut.truncated);
+    }
+
+    #[test]
+    fn a_local_model_is_given_more_time_than_a_hosted_one() {
+        assert_eq!(request_timeout_secs("http://127.0.0.1:8089/v1"), 1800);
+        assert_eq!(request_timeout_secs("https://api.openai.com/v1"), 180);
     }
 
     #[test]
