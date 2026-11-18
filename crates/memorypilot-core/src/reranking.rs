@@ -106,12 +106,11 @@ pub fn rerank_cross_encoder_if_enabled(
         return None;
     }
 
-    let top_k = std::env::var("MEMORYPILOT_CROSS_RERANK_TOP_K")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(12)
-        .clamp(2, 64)
-        .min(results.len());
+    let top_k = rerank_width(
+        std::env::var("MEMORYPILOT_CROSS_RERANK_TOP_K").ok().as_deref(),
+        WIDE_SCOPE.with(|c| c.get()),
+    )
+    .min(results.len());
 
     let documents = results
         .iter()
@@ -428,6 +427,34 @@ fn is_confident_top(results: &[SearchResult]) -> bool {
 
 thread_local! {
     static FORCE_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WIDE_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Candidates the cross-encoder rescores by default, and in a wide rerank.
+const DEFAULT_RERANK_WIDTH: usize = 12;
+pub const WIDE_RERANK_WIDTH: usize = 64;
+
+/// Run `f` with the cross-encoder forced on and rescoring the first
+/// [`WIDE_RERANK_WIDTH`] candidates of every search it makes. Used by the
+/// compact search: the turns that hold the answer then sit high enough for
+/// a short context to keep them (LongMemEval-S, first 50 turns: every
+/// evidence turn present for 97.0% of the questions, 95.7% without).
+pub fn with_wide_rerank<T>(f: impl FnOnce() -> T) -> T {
+    let previous = WIDE_SCOPE.with(|c| c.replace(true));
+    let out = with_forced_rerank(f);
+    WIDE_SCOPE.with(|c| c.set(previous));
+    out
+}
+
+/// How many candidates the cross-encoder rescores: the wide width inside
+/// [`with_wide_rerank`], else `MEMORYPILOT_CROSS_RERANK_TOP_K` (2 to 64).
+fn rerank_width(raw: Option<&str>, wide: bool) -> usize {
+    if wide {
+        return WIDE_RERANK_WIDTH;
+    }
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RERANK_WIDTH)
+        .clamp(2, WIDE_RERANK_WIDTH)
 }
 
 /// Run `f` with the cross-encoder forced on for every search it makes
@@ -969,6 +996,21 @@ mod tests {
             let scores = model.scores(query, &documents).expect("scores");
             assert!(scores[1] > scores[0] && scores[1] > scores[2], "{}: {:?}", query, scores);
         }
+    }
+
+    #[test]
+    fn rerank_width_follows_the_setting_unless_wide() {
+        assert_eq!(rerank_width(None, false), 12);
+        assert_eq!(rerank_width(Some("24"), false), 24);
+        assert_eq!(rerank_width(Some("500"), false), 64);
+        assert_eq!(rerank_width(Some("0"), false), 2);
+        assert_eq!(rerank_width(Some("abc"), false), 12);
+        assert_eq!(rerank_width(Some("8"), true), 64);
+        assert!(!WIDE_SCOPE.with(|c| c.get()));
+        with_wide_rerank(|| {
+            assert!(WIDE_SCOPE.with(|c| c.get()) && forced_scope());
+        });
+        assert!(!WIDE_SCOPE.with(|c| c.get()) && !forced_scope());
     }
 
     #[test]

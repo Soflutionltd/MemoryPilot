@@ -300,7 +300,8 @@ fn all_tool_definitions() -> Value {
                     "project": { "type": ["string","null"] },
                     "kind": { "type": ["string","null"] },
                     "tags": { "type": ["array","null"], "items": { "type": "string" } },
-                    "answer": { "type": "boolean", "default": false, "description": "Run the extractive reader on the top-5 passages." }
+                    "answer": { "type": "boolean", "default": false, "description": "Run the extractive reader on the top-5 passages." },
+                    "compact": { "type": "boolean", "default": false, "description": "For building a context out of many results (limit 30 to 50): the reranker rescores the first 64 candidates, memories tagged `role:assistant` ranked after the third are cut to 150 characters (`cut: true`, full text with get_memory), and each result carries only id, content, kind, project and tags. Slower than a plain search." }
                 },
                 "required": ["query"]
             }
@@ -1599,24 +1600,28 @@ fn handle_search(db: &Database, args: &Value) -> Value {
     };
 
     let want_answer = args.get("answer").and_then(|v| v.as_bool()).unwrap_or(false);
+    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    match db.search_at(
-        chrono::Utc::now(),
-        query,
-        limit,
-        project,
-        kind,
-        tags.as_deref(),
-        wk_ref,
-    ) {
+    let now = chrono::Utc::now();
+    let found = if compact {
+        db.search_wide_at(now, query, limit, project, kind, tags.as_deref(), wk_ref)
+    } else {
+        db.search_at(now, query, limit, project, kind, tags.as_deref(), wk_ref)
+    };
+    match found {
         Ok((results, confidence)) => {
-            let mut output = json!({ "query": query, "count": results.len(),
-                "confidence": confidence,
-                "results": results.iter().map(|r| json!({
+            let listed: Vec<Value> = if compact {
+                compact_results(&results)
+            } else {
+                results.iter().map(|r| json!({
                     "id": r.memory.id, "content": r.memory.content, "kind": r.memory.kind,
                     "project": r.memory.project, "tags": r.memory.tags, "score": r.score, "importance": r.memory.importance,
                     "sources": r.sources,
-                })).collect::<Vec<_>>()
+                })).collect()
+            };
+            let mut output = json!({ "query": query, "count": results.len(),
+                "confidence": confidence,
+                "results": listed
             });
             if confidence.abstain {
                 output["note"] = json!(
@@ -1646,10 +1651,38 @@ fn handle_search(db: &Database, args: &Value) -> Value {
                 }
             }
             db.annotate_verification(&mut output);
+            if compact {
+                // A context is read by a model: no indentation to pay for.
+                return tool_result(&output.to_string());
+            }
             tool_result(&serde_json::to_string_pretty(&output).unwrap())
         }
         Err(e) => tool_error(&e),
     }
+}
+
+/// The results of a compact search: what the assistant said, past the
+/// first ranks, is cut short and marked, and only the fields a reader
+/// needs are kept.
+fn compact_results(results: &[crate::db::SearchResult]) -> Vec<Value> {
+    let options = crate::db::CompactOptions::default();
+    let cuts = crate::db::compact_cuts(results, options);
+    results
+        .iter()
+        .zip(cuts)
+        .map(|(result, cut)| {
+            let memory = &result.memory;
+            let shortened = if cut { crate::db::cut_text(&memory.content, options.chars) } else { None };
+            let mut entry = json!({
+                "id": memory.id, "content": shortened.as_deref().unwrap_or(&memory.content),
+                "kind": memory.kind, "project": memory.project, "tags": memory.tags,
+            });
+            if shortened.is_some() {
+                entry["cut"] = json!(true);
+            }
+            entry
+        })
+        .collect()
 }
 
 fn handle_get(db: &Database, args: &Value) -> Value {

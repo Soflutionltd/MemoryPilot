@@ -1,3 +1,4 @@
+use super::{compact_cuts, cut_text, CompactOptions, SearchConfidence, SearchResult};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,9 @@ pub struct LongMemEvalOptions {
     /// Keep one question out of this many within each question type (and
     /// among the abstention questions): a sample spread like the full set.
     pub every: Option<usize>,
+    /// The searches that feed a context (coverage and end-to-end) rescore
+    /// the first 64 candidates, as `search_memory` does with `compact`.
+    pub wide_rerank: bool,
 }
 
 /// Settings of the end-to-end evaluation (see [`crate::llm`]).
@@ -409,8 +413,10 @@ impl Database {
                         .unwrap_or_else(|| question_now.to_rfc3339());
                     let _ = tx.execute(
                         "INSERT INTO memories (id, content, kind, project, tags, source, importance, embedding, content_hash, created_at, updated_at)
-                         VALUES (?1, ?2, 'session', NULL, '[]', 'longmemeval', 3, ?3, ?4, ?5, ?5)",
-                        params![turn.key, turn.text, blob, hash, created_at],
+                         VALUES (?1, ?2, 'session', NULL, ?6, 'longmemeval', 3, ?3, ?4, ?5, ?5)",
+                        // The role tag is what a compact context keys on. It stays out
+                        // of the full-text row below, so the ranking does not see it.
+                        params![turn.key, turn.text, blob, hash, created_at, turn.tags_json()],
                     );
                     let _ = tx.execute(
                         "INSERT INTO memories_fts (rowid, content, tags, kind, project) VALUES ((SELECT rowid FROM memories WHERE id=?1), ?2, '[]', 'session', '')",
@@ -491,7 +497,7 @@ impl Database {
                 // A separate search for a larger context: the first ten, and
                 // the retrieval metrics computed on them, stay what they are.
                 let deeper = if e2e.context_turns > 10 {
-                    match db.search_at(question_now, question, e2e.context_turns, None, None, None, None) {
+                    match Self::lme_context_search(&db, options.wide_rerank, question_now, question, e2e.context_turns) {
                         Ok((deeper, _)) => Some(deeper),
                         Err(error) => {
                             cleanup_lme_db(&tmp_path);
@@ -501,16 +507,24 @@ impl Database {
                 } else {
                     None
                 };
-                let mut retrieved: Vec<&HaystackTurn> = deeper
+                let found: Vec<&SearchResult> = deeper
                     .as_ref()
                     .unwrap_or(&results)
                     .iter()
-                    .filter_map(|result| by_key.get(result.memory.id.as_str()).copied())
+                    .filter(|result| by_key.contains_key(result.memory.id.as_str()))
                     .collect();
+                let mut retrieved: Vec<&HaystackTurn> =
+                    found.iter().filter_map(|result| by_key.get(result.memory.id.as_str()).copied()).collect();
                 if e2e.neighbor_turns > 0 {
                     retrieved = with_neighbors(&retrieved, &by_key, e2e.neighbor_turns);
                 }
-                let trimmed: Option<Vec<HaystackTurn>> = e2e.assistant_trim.map(|trim| trim_assistant_turns(&retrieved, trim));
+                // The engine's own rule says which results a compact context
+                // shortens; the turn is then cut on its text without the date prefix.
+                let trimmed: Option<Vec<HaystackTurn>> = e2e.assistant_trim.map(|trim| {
+                    let ranked: Vec<SearchResult> = found.iter().map(|result| (*result).clone()).collect();
+                    let cuts = compact_cuts(&ranked, CompactOptions { full_top: trim.full_top, chars: trim.chars });
+                    trim_assistant_turns(&retrieved, &cuts, trim.chars)
+                });
                 if let Some(trimmed) = trimmed.as_ref() {
                     retrieved = trimmed.iter().collect();
                 }
@@ -583,7 +597,7 @@ impl Database {
             let result_ids: Vec<&str> = results.iter().map(|r| r.memory.id.as_str()).collect();
             if let Some(deepest) = options.coverage_depths.iter().copied().max() {
                 // A separate search: a larger limit may reorder the first ten.
-                match db.search_at(question_now, question, deepest, None, None, None, None) {
+                match Self::lme_context_search(&db, options.wide_rerank, question_now, question, deepest) {
                     Ok((deep, _)) => {
                         let ids: Vec<&str> = deep.iter().map(|r| r.memory.id.as_str()).collect();
                         let mut covered = serde_json::Map::new();
@@ -842,6 +856,7 @@ impl Database {
             "granularity": "turn",
             "embedding_model": crate::embedding::model_label(),
             "search_engine": "BM25 + cosine RRF (k=40) → cross-encoder → MMR → session fusion; temporal window; supersede links",
+            "context_rerank_width": if options.wide_rerank { json!(crate::reranking::WIDE_RERANK_WIDTH) } else { json!("default") },
             "supersede_pass": supersede_pass,
             "mmr_lambda": crate::diversity::lambda(),
             "metrics": {
@@ -956,6 +971,22 @@ impl Database {
             }
         }
         Ok(rejudge_report(e2e, results_path, source, &items, &verdicts, chat.sends_temperature()))
+    }
+
+    /// The search that feeds a context: wide rerank when asked, as
+    /// `search_memory` does with `compact`.
+    fn lme_context_search(
+        db: &Database,
+        wide_rerank: bool,
+        now: chrono::DateTime<Utc>,
+        question: &str,
+        limit: usize,
+    ) -> Result<(Vec<SearchResult>, SearchConfidence), String> {
+        if wide_rerank {
+            db.search_wide_at(now, question, limit, None, None, None, None)
+        } else {
+            db.search_at(now, question, limit, None, None, None, None)
+        }
     }
 
     fn lme_temporal_prefix(session_date: Option<&str>, question_date: Option<&str>) -> String {
@@ -1129,6 +1160,18 @@ struct HaystackTurn {
     evidence: bool,
 }
 
+impl HaystackTurn {
+    /// The `tags` column of the turn's memory: the assistant's turns carry
+    /// the tag a compact context keys on.
+    fn tags_json(&self) -> &'static str {
+        if self.role == "assistant" {
+            concat!("[\"", "role:assistant", "\"]")
+        } else {
+            "[]"
+        }
+    }
+}
+
 /// Every non-empty turn of a question's haystack, with the same
 /// `[date …] role: content` text the embedding cache is keyed on.
 fn haystack_turns(entry: &serde_json::Value) -> Vec<HaystackTurn> {
@@ -1285,28 +1328,21 @@ fn with_neighbors<'a>(
     out
 }
 
-/// Mark closing an assistant turn that was cut short.
-const CUT_MARK: &str = " [...]";
-
-/// The turns in the same rank order, the assistant ones ranked after
-/// `trim.full_top` cut to `trim.chars` characters, or left out at zero.
-fn trim_assistant_turns(retrieved: &[&HaystackTurn], trim: AssistantTrim) -> Vec<HaystackTurn> {
+/// The turns in the same rank order; the ones `cuts` marks are cut to
+/// `chars` characters, or left out at zero. A marked turn whose own text
+/// (without the date prefix) already fits stays whole.
+fn trim_assistant_turns(retrieved: &[&HaystackTurn], cuts: &[bool], chars: usize) -> Vec<HaystackTurn> {
     retrieved
         .iter()
-        .enumerate()
-        .filter_map(|(rank, turn)| {
-            if turn.role != "assistant" || rank < trim.full_top {
+        .zip(cuts)
+        .filter_map(|(turn, cut)| {
+            if !*cut {
                 return Some((*turn).clone());
             }
-            if trim.chars == 0 {
-                return None;
-            }
-            let content = turn.content.trim();
-            if content.chars().count() <= trim.chars {
+            if chars > 0 && turn.content.trim().chars().count() <= chars {
                 return Some((*turn).clone());
             }
-            let kept: String = content.chars().take(trim.chars).collect();
-            Some(HaystackTurn { content: format!("{}{}", kept.trim_end(), CUT_MARK), ..(*turn).clone() })
+            cut_text(&turn.content, chars).map(|content| HaystackTurn { content, ..(*turn).clone() })
         })
         .collect()
 }
@@ -1708,6 +1744,7 @@ fn qa_summary(scored: &[QaScore]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{Memory, CUT_MARK};
 
     #[test]
     fn squad_scoring_normalises_articles_and_punctuation() {
@@ -1801,16 +1838,48 @@ mod tests {
             turn("2023/05/04 (Thu) 09:00", "assistant", "Short."),
         ];
         let retrieved: Vec<&HaystackTurn> = turns.iter().collect();
+        // What the engine returns for these turns: the memory carries the
+        // dated text and the role tag.
+        let results: Vec<SearchResult> = turns
+            .iter()
+            .map(|turn| SearchResult {
+                memory: Memory {
+                    id: turn.key.clone(),
+                    content: format!("date: {} {}: {}", turn.session_date, turn.role, turn.content),
+                    kind: "session".into(),
+                    project: None,
+                    tags: serde_json::from_str(turn.tags_json()).expect("tags"),
+                    source: "longmemeval".into(),
+                    importance: 3,
+                    expires_at: None,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    metadata: None,
+                    last_accessed_at: None,
+                    access_count: 0,
+                },
+                score: 1.0,
+                sources: Vec::new(),
+            })
+            .collect();
 
-        let cut = trim_assistant_turns(&retrieved, AssistantTrim { full_top: 1, chars: 10 });
+        let cuts = compact_cuts(&results, CompactOptions { full_top: 1, chars: 10 });
+        assert_eq!(cuts, vec![false, false, true, true], "assistant memories after the first rank");
+        let cut = trim_assistant_turns(&retrieved, &cuts, 10);
         let contents: Vec<&str> = cut.iter().map(|turn| turn.content.as_str()).collect();
         let shortened = format!("{}{}", "é".repeat(10), CUT_MARK);
-        assert_eq!(contents, vec![long.as_str(), long.as_str(), shortened.as_str(), "Short."]);
+        assert_eq!(
+            contents,
+            vec![long.as_str(), long.as_str(), shortened.as_str(), "Short."],
+            "a turn whose own text fits stays whole, whatever its dated text weighs"
+        );
         assert_eq!(cut[2].session_date, "2023/05/03 (Wed) 09:00", "only the content changes");
 
-        let dropped = trim_assistant_turns(&retrieved, AssistantTrim { full_top: 1, chars: 0 });
+        let cuts = compact_cuts(&results, CompactOptions { full_top: 1, chars: 0 });
+        let dropped = trim_assistant_turns(&retrieved, &cuts, 0);
         let roles: Vec<&str> = dropped.iter().map(|turn| turn.role.as_str()).collect();
         assert_eq!(roles, vec!["assistant", "user"], "every assistant turn after the first rank is left out");
+        assert_eq!(turns[1].tags_json(), "[]");
     }
 
     #[test]

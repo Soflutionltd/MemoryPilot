@@ -57,6 +57,12 @@ pub fn lambda() -> f64 {
         .clamp(0.0, 1.0)
 }
 
+/// Results the diversity pass arranges; the ones after keep their
+/// relevance order. A default search returns ten, so it is unchanged. A
+/// deeper list is read as a context, where the pass over the whole list
+/// pushed down the turns that hold the answer (measured on LongMemEval-S).
+const DIVERSIFIED_HEAD: usize = 10;
+
 pub fn is_enabled() -> bool {
     !matches!(
         std::env::var("MEMORYPILOT_MMR").as_deref(),
@@ -97,7 +103,7 @@ pub fn rerank_mmr(results: &mut Vec<SearchResult>, vectors: &HashMap<String, Vec
     let mut max_similarity: Vec<f32> = vec![0.0; results.len()];
     update_similarities(0, &embeddings, &mut max_similarity);
 
-    while !remaining.is_empty() {
+    while !remaining.is_empty() && order.len() < DIVERSIFIED_HEAD {
         let mut best_position = 0;
         let mut best_value = f64::NEG_INFINITY;
         for (position, &candidate) in remaining.iter().enumerate() {
@@ -120,6 +126,8 @@ pub fn rerank_mmr(results: &mut Vec<SearchResult>, vectors: &HashMap<String, Vec
         order.push(picked);
         update_similarities(picked, &embeddings, &mut max_similarity);
     }
+    // Past the head, relevance order: `remaining` still is in it.
+    order.extend(remaining);
 
     let reordered: Vec<SearchResult> = {
         let mut slots: Vec<Option<SearchResult>> = results.drain(..).map(Some).collect();
@@ -237,6 +245,30 @@ mod tests {
         rerank_mmr(&mut results, &vectors);
         let ids: Vec<&str> = results.iter().map(|r| r.memory.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn past_the_head_results_keep_their_relevance_order() {
+        std::env::remove_var("MEMORYPILOT_MMR");
+        std::env::remove_var("MEMORYPILOT_MMR_LAMBDA");
+        // Fourteen results; all but the first two say the same thing.
+        let ids: Vec<String> = (0..14).map(|index| format!("m{:02}", index)).collect();
+        let mut results: Vec<SearchResult> =
+            ids.iter().enumerate().map(|(index, id)| result(id, 1.0 - index as f64 * 0.01)).collect();
+        let mut vectors = HashMap::new();
+        vectors.insert(ids[0].clone(), unit(&[1.0, 0.0, 0.0]));
+        vectors.insert(ids[1].clone(), unit(&[0.0, 1.0, 0.0]));
+        for id in &ids[2..] {
+            vectors.insert(id.clone(), unit(&[0.0, 0.0, 1.0]));
+        }
+        rerank_mmr(&mut results, &vectors);
+        let order: Vec<&str> = results.iter().map(|r| r.memory.id.as_str()).collect();
+        assert_eq!(order.len(), 14);
+        let tail: Vec<&str> = order[DIVERSIFIED_HEAD..].to_vec();
+        let mut sorted = tail.clone();
+        sorted.sort();
+        assert_eq!(tail, sorted, "the results after the head are in relevance order");
+        assert!(results.windows(2).all(|pair| pair[0].score >= pair[1].score));
     }
 
     #[test]

@@ -105,7 +105,7 @@ pub use memories::{add_memory_to, update_memory_in, WriteOutcome};
 pub use knowledge::rebuild_memory_links;
 pub use migrations::SCHEMA_VERSION;
 pub use project_admin::ProjectMoveReport;
-pub use search::{hybrid_search, ANN_BYPASS_THRESHOLD};
+pub use search::{compact_cuts, cut_text, hybrid_search, CompactOptions, ANN_BYPASS_THRESHOLD, CUT_MARK, ROLE_ASSISTANT_TAG};
 pub use benchmark_fr::{fr_scenarios, score_fr_queries, FrScenario};
 use ranking::RankingSignals;
 
