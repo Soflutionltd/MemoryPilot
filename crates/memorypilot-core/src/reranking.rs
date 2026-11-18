@@ -205,12 +205,10 @@ pub fn rerank_cross_encoder_if_enabled(
 
 /// Fusion ratio between the original RRF score and the cross encoder's
 /// relevance signal, both min-max normalised over the reranked window.
-/// Sweep of 0.45 / 0.6 / 0.75 / 0.9 / 1.0 with jina-reranker-v2 (v4.12,
-/// 119-question LongMemEval-S sample and `--benchmark-fr`): 0.6 gave the
-/// best LongMemEval R@1 (94.1% vs 93.3% at 0.45) and MRR (96.1% vs 95.6%)
-/// and lifted the French R@1 from 96.3% to 97.2%. Higher weights keep
-/// improving the French benchmark but lose LongMemEval questions, because
-/// MMR and session fusion run after this step.
+/// At 1.0 the window is ordered by the cross-encoder alone. Measured with
+/// multilingual-reranker-small: `--benchmark-fr` R@1 98.2% at 1.0 and
+/// 96.3% at 0.6; LongMemEval-S coverage with the first 50 turns, rerank
+/// over 64, 97.0% of the questions complete at 1.0.
 const DEFAULT_CROSS_WEIGHT: f64 = 1.0;
 
 /// `MEMORYPILOT_CROSS_RERANK_WEIGHT`, bounded to [0, 1]. A value that does
@@ -230,8 +228,14 @@ struct CrossScore {
 
 enum CrossRerankerState {
     Ready(Reranker),
-    Unavailable(String),
+    /// The model could not be loaded, and when that was tried.
+    Unavailable(String, std::time::Instant),
 }
+
+/// A failed load (no network at the first search) is tried again after
+/// this long, instead of leaving the search without rerank until the
+/// session is evicted.
+const UNAVAILABLE_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A loaded cross-encoder, driven through `ort` directly.
 enum Reranker {
@@ -561,7 +565,7 @@ fn looks_non_english(query: &str) -> bool {
 }
 
 /// Pool of cross-encoder model instances. Each instance owns its own
-/// ONNX session (the int8 jina-reranker-v2 is memory-mapped, 280 MB on disk),
+/// ONNX session (the int8 graph is memory-mapped, 268 MB on disk),
 /// so the default pool size is intentionally small (1). Throughput-bound
 /// workloads can opt in to 2 via `MEMORYPILOT_RERANK_POOL_SIZE=2`.
 /// Sessions are built on first use and released after
@@ -588,9 +592,13 @@ struct PooledReranker {
 
 impl PooledReranker {
     fn with_model<R>(&mut self, f: impl FnOnce(&mut Reranker) -> R) -> Option<R> {
-        match self.inner.get() {
+        let state = self.inner.get();
+        if matches!(state, CrossRerankerState::Unavailable(_, tried) if tried.elapsed() >= UNAVAILABLE_RETRY) {
+            *state = init_cross_reranker();
+        }
+        match state {
             CrossRerankerState::Ready(model) => Some(f(model)),
-            CrossRerankerState::Unavailable(error) => {
+            CrossRerankerState::Unavailable(error, _) => {
                 eprintln!("[reranker] cross-encoder unavailable: {}", error);
                 None
             }
@@ -651,12 +659,32 @@ fn init_cross_reranker() -> CrossRerankerState {
     let result = match cross_reranker_model() {
         RerankerChoice::Ort(spec) => OrtReranker::load(spec)
             .map(|model| Reranker::Ort(Box::new(model)))
-            .map_err(|error| format!("{} init: {}", spec.label, error)),
+            .map_err(|error| format!("{} init: {}{}", spec.label, error, discard_corrupt_files(spec))),
     };
     match result {
         Ok(model) => CrossRerankerState::Ready(model),
-        Err(error) => CrossRerankerState::Unavailable(error),
+        Err(error) => CrossRerankerState::Unavailable(error, std::time::Instant::now()),
     }
+}
+
+/// After a failed load: a cached file whose print no longer matches is
+/// removed, with the copy converted from it, so that the next attempt
+/// fetches it again. Returns what to add to the error message.
+fn discard_corrupt_files(spec: OrtRerankerSpec) -> String {
+    let mut notes = String::new();
+    for file in [&spec.graph, &spec.tokenizer] {
+        match crate::model_mirror::remove_if_corrupt(spec.mirror_tag, file) {
+            Ok(true) => notes.push_str(&format!("; cached {} was corrupt and is removed, it will be fetched again", file.name)),
+            Ok(false) => {}
+            Err(error) => notes.push_str(&format!("; cached {} could not be checked: {}", file.name, error)),
+        }
+    }
+    if !notes.is_empty() {
+        if let Err(error) = crate::onnx_external::remove_externalized(spec.mirror_tag) {
+            notes.push_str(&format!("; {}", error));
+        }
+    }
+    notes
 }
 
 /// Rerank runs on 12 short query/document pairs; two threads saturate

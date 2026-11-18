@@ -68,7 +68,7 @@ pub fn fts5_query_variants(query: &str) -> Vec<(String, &'static str)> {
 // All three feeding strategies (eager OR, penalised rank, candidate-only
 // for the vector lane) regressed precision on memorypilot-fr-v2 because
 // generic tech synonyms inflate BM25 noise on small corpora. The
-// cross-encoder (jina-v2-multilingual, mode `adaptive`) closes the same
+// cross-encoder (mode `adaptive`) closes the same
 // recall gap with a much better precision/latency trade-off, so the
 // dictionary lane was removed in favour of dead-code-free retrieval.
 // See git history for the experiment commits if a future iteration

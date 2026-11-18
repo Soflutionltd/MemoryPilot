@@ -234,8 +234,16 @@ pub fn externalize_model(source: &Path, graph_out: &Path, data_out: &Path) -> Re
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("mkdir {}: {}", parent.display(), error))?;
     }
-    let data_tmp = data_out.with_extension("onnx_data.part");
-    let graph_tmp = graph_out.with_extension("onnx.part");
+    // This conversion's own temporary files: two servers starting together
+    // (one per editor) would otherwise write into the same sidecar.
+    static CONVERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let suffix = format!(
+        "part-{}-{}",
+        std::process::id(),
+        CONVERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let data_tmp = data_out.with_extension(format!("onnx_data.{}", suffix));
+    let graph_tmp = graph_out.with_extension(format!("onnx.{}", suffix));
     let file = std::fs::File::create(&data_tmp)
         .map_err(|error| format!("create {}: {}", data_tmp.display(), error))?;
     let mut sidecar = Sidecar {
@@ -296,6 +304,17 @@ pub fn externalized_source(source: &Path, key: &str) -> Result<std::path::PathBu
     }
     externalize_model(source, &graph, &data)?;
     Ok(graph)
+}
+
+/// Removes the externalized copies kept under `key`, so that the next
+/// load converts the source again.
+pub fn remove_externalized(key: &str) -> Result<(), String> {
+    let dir = crate::embedding::fastembed_cache_dir().join("memorypilot-external").join(key);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove {}: {}", dir.display(), error)),
+    }
 }
 
 fn external_paths(key: &str, stem: &str) -> (std::path::PathBuf, std::path::PathBuf) {

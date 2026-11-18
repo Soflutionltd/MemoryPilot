@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/search-Hybrid_RRF_+_cross--encoder-blueviolet" alt="Hybrid RRF + cross-encoder"/>
   <img src="https://img.shields.io/badge/embeddings-jina--embeddings--v5--nano_(768--dim,_int8)-blue" alt="jina-embeddings-v5-text-nano-retrieval"/>
-  <img src="https://img.shields.io/badge/rerank-jina--v2--multilingual-9cf" alt="jina-v2-multilingual"/>
+  <img src="https://img.shields.io/badge/rerank-multilingual--reranker--small-9cf" alt="multilingual-reranker-small"/>
   <img src="https://img.shields.io/badge/tokens-5--10x_compression-brightgreen" alt="5-10x token savings"/>
   <img src="https://img.shields.io/badge/license-Source_Available-orange" alt="Source Available"/>
 </p>
@@ -189,7 +189,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | English only | Depends on API | Depends on LLM backend |
 | Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Knowledge graph (no validity window) | Basic graph (no temporal) | Temporal KG (Graphiti, core feature) |
 | GraphRAG | Auto entity extraction + graph traversal + combinatorial reranker | No | Partial (graph search lane) | No | Yes (LLM-based extraction) |
-| Cross-encoder rerank | jina-v2-multilingual (adaptive, ~250 ms) | No | No | No | No |
+| Cross-encoder rerank | multilingual-reranker-small (adaptive) | No | No | No | No |
 | Query-aware ranking | Preference/temporal/role/update/technical intent boosts | Hybrid v4 keyword + temporal boosts | RRF fusion only | Depends on API | Graph-distance scoring |
 | Corpus origin detection | AI transcript/codebase/notes/platform detection | v3.3.4 prep | No | No | No |
 | Agent/persona disambiguation | Agents are separate from real people | v3.3.4 prep | Hooks-based session scoping | No | Partial (entity nodes) |
@@ -321,7 +321,7 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 
 ## What's new in v4.11
 
-- **Jina models only, non-commercial use**: jina-embeddings-v5-text-nano-retrieval and jina-reranker-v2-base-multilingual are the only models (the e5, bge, gte and mmarco options are gone). Both are CC-BY-NC-4.0: see [Models: non-commercial use only](#models-non-commercial-use-only).
+- **Jina models only, non-commercial use**: jina-embeddings-v5-text-nano-retrieval and jina-reranker-v2-base-multilingual are the only models (the e5, bge, gte and mmarco options are gone). Both are CC-BY-NC-4.0: see [Models: non-commercial use only](#models-the-embedder-is-for-non-commercial-use-only).
 
 - **Fixes from the October 2026 audit** (each one has a regression test in `crates/memorypilot-core/src/db/audit_tests.rs`):
   - A search with `limit` of 25 or more (31 on temporal queries) panicked and stopped the process; the limit is now capped at 100 for every interface.
@@ -747,7 +747,8 @@ src/tokenizer.rs   — lean byte-level BPE (tiktoken ranks) and merge BPE tokeni
 src/onnx_external.rs — one-shot rewrite of embedded ONNX weights into a memory-mapped sidecar (ORT 1.28 keeps 3 copies otherwise)
 src/pool.rs        — lazily-built, idle-evicting pool shared by the embedder and reranker sessions
 src/db/consolidate.rs — embedding-based near-duplicate consolidation (daily + `consolidate_memories`)
-src/reranking.rs   — Cross-encoder rerank (jina-v2-multilingual), RerankPool, adaptive trigger, confidence gate
+src/reranking.rs   — Cross-encoder rerank (multilingual-reranker-small), RerankPool, adaptive trigger, confidence gate
+src/model_mirror.rs — model files served from a release of this repository, pinned by size and SHA-256
 src/ann.rs         — Persistent on-disk HNSW (usearch) with synchronous warm-up via `wait_for_ann_warm`
 src/fts.rs         — FTS5 query variants (prefix, phrase, NEAR) + Snowball stemming
 src/graph.rs       — Entity extraction (tech, files, components, people) + relation inference + graph traversal
@@ -783,7 +784,7 @@ config             — key/value store
 | `add_memory` latency | <1 ms (lazy embed) |
 | Embedding quality | Transformer 768-dim (jina-embeddings-v5-text-nano-retrieval int8, 100+ languages, 8k context) |
 | Backfill (1000 memories) | ~2 min in the background (model swap re-embed; `recall` stays interactive, ~1 s, while it runs) |
-| RAM (both models loaded, steady state) | ~370 MB on a fresh database, ~485 MB with 2 000 memories in the ANN index — almost all of it memory-mapped int8 weights (247 MB embedder + 280 MB reranker since v4.11, was 118 MB with mmarco) the OS can reclaim under pressure (was ~3.5 GB idle / ~7 GB peak in v4.3) |
+| RAM (both models loaded, steady state) | ~370 MB on a fresh database, ~485 MB with 2 000 memories in the ANN index — almost all of it memory-mapped int8 weights (247 MB embedder + 268 MB reranker) the OS can reclaim under pressure (was ~3.5 GB idle / ~7 GB peak in v4.3) |
 | RAM (idle) | ~130 MB: both ONNX sessions are released after `MEMORYPILOT_MODEL_IDLE_SECS` (default 600 s) without a query and rebuilt on the next one (~0.8 s once, ~0.3 s for the reranker alone) |
 | RAM (`--benchmark-fr`, peak) | 364 MB (was 7.05 GB) |
 | Read concurrency | 16 pooled connections per Database handle |
@@ -885,7 +886,7 @@ An older layout (everything at the root) keeps working. `MemoryPilot --migrate-l
 
 **Soflution Source Available License**: free to use, not to fork or modify. See [LICENSE](LICENSE) for details.
 
-### Models: non-commercial use only
+### Models: the embedder is for non-commercial use only
 
 MemoryPilot runs two models:
 

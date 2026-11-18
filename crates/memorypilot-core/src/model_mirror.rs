@@ -9,11 +9,15 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
 const MIRROR_REPO: &str = "Soflutionltd/MemoryPilot";
+
+/// A temporary file untouched for this long belongs to a download that
+/// was killed: a live one writes to its file all along.
+const STALE_PARTIAL: Duration = Duration::from_secs(3600);
 
 /// Tells apart the temporary files of the downloads of one process.
 static DOWNLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +42,7 @@ pub fn mirrored_file(tag: &str, file: &MirroredFile) -> Result<PathBuf, String> 
         return Ok(path);
     }
     std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {}", dir.display(), error))?;
+    remove_stale_partials(&dir, SystemTime::now());
     let mirror = format!("https://github.com/{}/releases/download/{}/{}", MIRROR_REPO, tag, file.name);
     let mut failures = Vec::new();
     for url in [mirror.as_str(), file.upstream] {
@@ -58,6 +63,9 @@ fn is_in_place(path: &Path, file: &MirroredFile) -> bool {
 fn download(url: &str, file: &MirroredFile, path: &Path) -> Result<(), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .https_only(true)
+        // No network must cost the search seconds, not the whole download budget.
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
         .timeout_global(Some(Duration::from_secs(1800)))
         .user_agent(concat!("MemoryPilot/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -69,6 +77,55 @@ fn download(url: &str, file: &MirroredFile, path: &Path) -> Result<(), String> {
     // One byte past the expected size, so a longer file is seen as such.
     let reader = response.body_mut().with_config().limit(file.bytes + 1).reader();
     store_verified(reader, file, path).map_err(|error| format!("{}: {}", url, error))
+}
+
+/// Removes the temporary files of `dir` left by a download that was
+/// killed before it could clean up.
+fn remove_stale_partials(dir: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let partial = entry.path().extension().is_some_and(|extension| extension.to_string_lossy().starts_with("part-"));
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| now.duration_since(modified).is_ok_and(|age| age >= STALE_PARTIAL));
+        if partial && stale {
+            // Best effort: a file that stays is only disk space.
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Checks the print of a file already in the cache and removes it when it
+/// does not match, so that the next call fetches it again. `Ok(true)`: a
+/// corrupt file was removed. Meant for when a model fails to load: hashing
+/// 268 MB on every start is not worth it.
+pub fn remove_if_corrupt(tag: &str, file: &MirroredFile) -> Result<bool, String> {
+    let path = crate::embedding::fastembed_cache_dir().join("memorypilot-mirror").join(tag).join(file.name);
+    remove_if_corrupt_at(&path, file)
+}
+
+fn remove_if_corrupt_at(path: &Path, file: &MirroredFile) -> Result<bool, String> {
+    let mut input = match std::fs::File::open(path) {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("open {}: {}", path.display(), error)),
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 16];
+    loop {
+        let read = input.read(&mut buffer).map_err(|error| format!("read {}: {}", path.display(), error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let print: String = hasher.finalize().iter().map(|byte| format!("{:02x}", byte)).collect();
+    if print == file.sha256 {
+        return Ok(false);
+    }
+    std::fs::remove_file(path).map_err(|error| format!("remove {}: {}", path.display(), error))?;
+    Ok(true)
 }
 
 /// Writes `reader` to `path` through a temporary file, kept only when the
@@ -144,6 +201,39 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&dir).expect("list").filter_map(Result::ok).map(|entry| entry.file_name()).collect();
         assert_eq!(left, vec![std::ffi::OsString::from(HELLO.name)], "no temporary file is left behind");
 
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_corrupt_cached_file_is_removed_and_a_sound_one_kept() {
+        let dir = std::env::temp_dir().join(format!("memorypilot-mirror-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(HELLO.name);
+        assert_eq!(remove_if_corrupt_at(&path, &HELLO), Ok(false), "nothing cached");
+        std::fs::write(&path, b"hello").expect("write");
+        assert_eq!(remove_if_corrupt_at(&path, &HELLO), Ok(false));
+        assert!(path.exists());
+        // Same size, other content: what the size check alone lets through.
+        std::fs::write(&path, b"jello").expect("write");
+        assert!(is_in_place(&path, &HELLO));
+        assert_eq!(remove_if_corrupt_at(&path, &HELLO), Ok(true));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn only_old_temporary_files_are_swept() {
+        let dir = std::env::temp_dir().join(format!("memorypilot-mirror-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let partial = dir.join("hello.part-1-0");
+        let model = dir.join(HELLO.name);
+        std::fs::write(&partial, b"he").expect("write");
+        std::fs::write(&model, b"hello").expect("write");
+        remove_stale_partials(&dir, SystemTime::now());
+        assert!(partial.exists(), "a download in progress keeps its file");
+        remove_stale_partials(&dir, SystemTime::now() + STALE_PARTIAL + Duration::from_secs(1));
+        assert!(!partial.exists());
+        assert!(model.exists(), "the model itself is never swept");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
