@@ -879,7 +879,7 @@ impl Database {
             "questions_abstention_evaluated": abs_total,
             "granularity": "turn",
             "embedding_model": crate::embedding::model_label(),
-            "search_engine": "BM25 + cosine RRF (k=40) → cross-encoder → MMR → session fusion; temporal window; supersede links",
+            "search_engine": if options.wide_rerank { "BM25 + cosine RRF (k=40) → cross-encoder over 64, kept in its order; temporal window; supersede links" } else { "BM25 + cosine RRF (k=40) → cross-encoder → MMR → session fusion; temporal window; supersede links" },
             "context_rerank_width": if options.wide_rerank { json!(crate::reranking::WIDE_RERANK_WIDTH) } else { json!("default") },
             "supersede_pass": supersede_pass,
             "mmr_lambda": crate::diversity::lambda(),
@@ -916,7 +916,7 @@ impl Database {
         }
 
         if let Some(e2e) = options.end_to_end.as_ref() {
-            report["end_to_end"] = end_to_end_report(e2e, &e2e_totals, selected.len());
+            report["end_to_end"] = end_to_end_report(e2e, &e2e_totals, selected.len(), options.wide_rerank, options.compact_counts);
         }
 
         Ok(report)
@@ -1647,7 +1647,7 @@ fn e2e_accuracy(outcomes: &[&EndToEndOutcome]) -> serde_json::Value {
     ))
 }
 
-fn end_to_end_report(e2e: &EndToEndOptions, totals: &EndToEndTotals, selected: usize) -> serde_json::Value {
+fn end_to_end_report(e2e: &EndToEndOptions, totals: &EndToEndTotals, selected: usize, wide: bool, counts: bool) -> serde_json::Value {
     let all: Vec<&EndToEndOutcome> = totals.outcomes.iter().collect();
     let answerable: Vec<&EndToEndOutcome> = all.iter().copied().filter(|o| !o.abstention).collect();
     let abstention: Vec<&EndToEndOutcome> = all.iter().copied().filter(|o| o.abstention).collect();
@@ -1668,16 +1668,22 @@ fn end_to_end_report(e2e: &EndToEndOptions, totals: &EndToEndTotals, selected: u
     json!({
         "protocol": "official LongMemEval prompts (run_generation.py history-chats, evaluate_qa.py judge); retrieved turns in flat-turn layout",
         "context": format!(
-            "top-{} turns returned by MemoryPilot search{}{}, oldest session first",
+            "top-{} turns returned by MemoryPilot search{}{}{}, oldest session first",
             e2e.context_turns.max(10),
+            match (wide, counts) {
+                (false, _) => String::new(),
+                (true, false) => ", compact: rerank over 64 kept in its order, two fifths more turns for a total or an order".to_string(),
+                (true, true) => ", compact: rerank over 64 kept in its order, twice the turns for a \"how many\", total or order question".to_string(),
+            },
             if e2e.neighbor_turns > 0 { format!(", each with up to {} turn(s) before and after it in its session, one block per session", e2e.neighbor_turns) } else { String::new() },
             match e2e.assistant_trim {
-                Some(AssistantTrim { full_top, chars: 0 }) => format!(", assistant turns ranked after the first {} left out", full_top),
-                Some(AssistantTrim { full_top, chars }) => format!(", assistant turns ranked after the first {} cut to {} characters", full_top, chars),
+                Some(AssistantTrim { full_top, chars: 0 }) => format!(", assistant turns ranked after the first {} (10 when the question asks what the assistant said) left out", full_top),
+                Some(AssistantTrim { full_top, chars }) => format!(", assistant turns ranked after the first {} (10 when the question asks what the assistant said) cut to {} characters", full_top, chars),
                 None => String::new(),
             }
         ),
-        "diversity_filter": crate::diversity::is_enabled(),
+        // A compact context keeps the reranker's order: no diversity pass.
+        "diversity_filter": !wide && crate::diversity::is_enabled(),
         "answer_max_tokens": e2e_answer_max_tokens(e2e),
         "base_url": e2e.base_url,
         "answer_model": e2e.answer_model,
@@ -2004,7 +2010,7 @@ mod tests {
             neighbor_turns: 0,
             assistant_trim: None,
         };
-        let report = end_to_end_report(&options, &totals, 5);
+        let report = end_to_end_report(&options, &totals, 5, false, false);
         assert_eq!(report["accuracy"], "2/4 (50.0%)");
         assert_eq!(report["accuracy_answerable"], "2/3 (66.7%)");
         assert_eq!(report["accuracy_abstention"], "0/1 (0.0%)");
