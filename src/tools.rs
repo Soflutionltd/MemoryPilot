@@ -1504,7 +1504,12 @@ fn handle_add(db: &Database, args: &Value) -> Value {
         .and_then(|v| v.as_str())
         .map(String::from)
         .or_else(|| {
-            auto_ttl.map(|days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339())
+            // The automatic expiry belongs to the automatic kind: a kind the
+            // caller chose (a decision, a fact) is not dated by what the text
+            // looks like.
+            auto_ttl
+                .filter(|_| user_kind.is_none())
+                .map(|days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339())
         });
     let expires_at = expires_at_owned.as_deref();
     let metadata = args.get("metadata").filter(|v| !v.is_null());
@@ -1920,6 +1925,9 @@ fn handle_update(db: &Database, args: &Value) -> Value {
     };
     let content = args.get("content").and_then(|v| v.as_str());
     let kind = args.get("kind").and_then(|v| v.as_str());
+    if let Some(kind) = kind.filter(|kind| !VALID_KINDS.contains(kind)) {
+        return tool_error(&format!("Invalid kind '{}'. Valid: {:?}", kind, VALID_KINDS));
+    }
     let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array()).map(|a| {
         a.iter()
             .filter_map(|v| v.as_str().map(String::from))
@@ -2994,6 +3002,51 @@ mod tests {
 
     fn text_of(response: &Value) -> Value {
         serde_json::from_str(response["content"][0]["text"].as_str().expect("text")).expect("json")
+    }
+
+    #[test]
+    fn a_kind_the_caller_chose_is_not_given_an_automatic_expiry() {
+        let dir = std::env::temp_dir().join(format!("mp-tools-ttl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Database::open_at(&dir.join("memory.db")).expect("db");
+        // A text that reads like a conversation is classified as a transcript, which expires.
+        let text = "user: on garde SQLite pour le stockage local, c'est tranché.";
+        let automatic = text_of(&handle_tool_call(&db, "add_memory", &json!({ "content": text })));
+        assert_eq!(automatic["kind"], "transcript");
+        assert!(automatic["expires_at"].is_string(), "the automatic kind keeps its expiry");
+        let chosen = text_of(&handle_tool_call(&db, "add_memory", &json!({
+            "content": "user: on garde Postgres pour le serveur, c'est tranché.",
+            "kind": "decision"
+        })));
+        assert_eq!(chosen["kind"], "decision");
+        assert!(chosen.get("expires_at").is_none_or(|value| value.is_null()), "a decision does not expire by itself");
+        let dated = text_of(&handle_tool_call(&db, "add_memory", &json!({
+            "content": "user: à revoir après la migration du schéma de facturation.",
+            "kind": "todo",
+            "expires_at": "2030-01-01T00:00:00Z"
+        })));
+        assert_eq!(dated["expires_at"], "2030-01-01T00:00:00Z", "an expiry the caller gave is kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn updating_a_memory_to_an_unknown_kind_is_refused_and_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("mp-tools-update-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Database::open_at(&dir.join("memory.db")).expect("db");
+        let added = text_of(&handle_tool_call(&db, "add_memory", &json!({ "content": "Le port du serveur de dev est 5173.", "kind": "fact" })));
+        let id = added["id"].as_str().expect("id");
+        let refused = handle_tool_call(&db, "update_memory", &json!({ "id": id, "kind": "decison", "content": "autre texte" }));
+        assert_eq!(refused["isError"], true);
+        assert!(refused["content"][0]["text"].as_str().expect("text").contains("Invalid kind 'decison'"));
+        let kept = text_of(&handle_tool_call(&db, "get_memory", &json!({ "id": id })));
+        assert_eq!(kept["kind"], "fact");
+        assert_eq!(kept["content"], "Le port du serveur de dev est 5173.");
+        let changed = text_of(&handle_tool_call(&db, "update_memory", &json!({ "id": id, "kind": "decision" })));
+        assert_eq!(changed["kind"], "decision");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
