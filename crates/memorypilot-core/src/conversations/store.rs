@@ -753,8 +753,8 @@ mod tests {
     #[test]
     fn reads_project_from_paths() {
         assert_eq!(
-            project_hints("cd ~/Cursor/App/Konta/apps/web puis /Users/a/Cursor/App/Clients/Laetitia-Vagner/x"),
-            vec!["Konta".to_string(), "Laetitia-Vagner".to_string()]
+            project_hints("cd ~/Cursor/App/Konta/apps/web puis /Users/a/Cursor/App/Clients/Atelier-Demo/x"),
+            vec!["Konta".to_string(), "Atelier-Demo".to_string()]
         );
     }
 

@@ -6,8 +6,8 @@
 //! to do all the work. This module computes a stemmed projection of any
 //! text that we then store **in addition** to the raw content (and that
 //! we emit as an extra FTS5 query variant), restoring lexical matches
-//! across morphological variants in French, Spanish, Italian, German
-//! and English.
+//! across morphological variants in French and English, the two
+//! languages it has a stemmer for.
 //!
 //! Design choices:
 //! - Stemming is deterministic and per-token. We split on Unicode word
