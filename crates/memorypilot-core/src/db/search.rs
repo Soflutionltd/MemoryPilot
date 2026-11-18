@@ -362,6 +362,15 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     // dictionary remains in `query_expansion.rs` for callers that
     // want it (CLI tools, HTTP debugging) and may resurface later
     // for very large corpora where the long tail dilutes naturally.
+    //
+    // A fourth one, the query's words in the other language from
+    // `lexicon` (30 rows, entering at rank 11), was measured on
+    // memorypilot-fr-v2 in November 2026: R@1 98.2% → 87.2%, R@5 100% →
+    // 95.4%. French technical memories are full of English words
+    // (release, deploy, cache), so the translated words match at random.
+    // The lexicon serves the conversation index only, where the lane has
+    // its own weight; here the encoder and the reranker, both
+    // multilingual, already bridge the two languages.
 
     // 2a. Optional ANN pre-filter. Marks candidates with `vector_ann` so the
     // explain output exposes which retrieval stage surfaced them. The full

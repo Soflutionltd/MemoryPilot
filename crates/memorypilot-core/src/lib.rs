@@ -15,6 +15,7 @@ pub mod fts;
 pub mod gc;
 pub mod graph;
 pub mod layout;
+pub mod lexicon;
 pub mod llm;
 pub mod onepassword;
 pub mod model_mirror;

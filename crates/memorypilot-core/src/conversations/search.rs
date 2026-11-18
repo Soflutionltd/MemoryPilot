@@ -6,6 +6,8 @@
 //! - fuzzy: vocabulary words one or two edits away, and adjacent words
 //!   glued together, for speech-to-text slips ("Gina" for Jina, "Memory
 //!   Pilot" for MemoryPilot);
+//! - translated: the query's words in the other language, French or
+//!   English, so a French question finds an English message by its words;
 //! - vector: the multilingual encoder MemoryPilot already ships.
 
 use super::store::{project_name, ConversationStore};
@@ -18,6 +20,9 @@ use std::sync::{Mutex, OnceLock};
 const RRF_K: f64 = 60.0;
 const LANE_DEPTH: usize = 300;
 const FUZZY_WEIGHT: f64 = 0.6;
+/// The same words in the other language (French and English): they find
+/// what was written in it, below what matches the words typed.
+const TRANSLATED_WEIGHT: f64 = 0.6;
 const VECTOR_WEIGHT: f64 = 1.0;
 const EXACT_WEIGHT: f64 = 1.0;
 /// A sub-agent's messages are the agent briefing itself: they describe
@@ -145,10 +150,16 @@ impl ConversationStore {
             add_lane(self.fts_ranked(&expression, None)?, EXACT_WEIGHT, "exact");
         }
         let fuzzy_terms = self.fuzzy_expansions(&terms)?;
-        let forms = term_forms(&terms, &fuzzy_terms);
+        let translated_terms = crate::lexicon::translated(&terms);
+        let other_spellings: Vec<(String, String)> = fuzzy_terms.iter().chain(&translated_terms).cloned().collect();
+        let forms = term_forms(&terms, &other_spellings);
         if !fuzzy_terms.is_empty() {
             let expression = or_expression(fuzzy_terms.iter().map(|(_, alt)| alt.as_str()));
             add_lane(self.fts_ranked(&expression, None)?, FUZZY_WEIGHT, "fuzzy");
+        }
+        if !translated_terms.is_empty() {
+            let expression = or_expression(translated_terms.iter().map(|(_, alt)| alt.as_str()));
+            add_lane(self.fts_ranked(&expression, None)?, TRANSLATED_WEIGHT, "translated");
         }
         if options.use_vectors {
             let query_vector = crate::embedding::embed_query(&options.query);
@@ -206,9 +217,11 @@ impl ConversationStore {
             .collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
 
+        // An extract is cut around the words typed, else around their counterparts.
+        let shown_terms: Vec<String> = terms.iter().cloned().chain(translated_terms.iter().map(|(_, alt)| alt.clone())).collect();
         let mut hits = Vec::new();
         for (conversation_id, score, matches) in ranked {
-            let Some(mut hit) = self.conversation_hit(&conversation_id, score, &matches, &rows, &terms)? else {
+            let Some(mut hit) = self.conversation_hit(&conversation_id, score, &matches, &rows, &shown_terms)? else {
                 continue;
             };
             if let Some(tool) = options.tool.as_deref() {
@@ -491,16 +504,24 @@ impl ConversationStore {
             add_lane(self.fts_ranked(&expression, Some(conversation_id))?, EXACT_WEIGHT);
         }
         let fuzzy_terms = self.fuzzy_expansions(&terms)?;
-        let forms = term_forms(&terms, &fuzzy_terms);
+        let translated_terms = crate::lexicon::translated(&terms);
+        let other_spellings: Vec<(String, String)> = fuzzy_terms.iter().chain(&translated_terms).cloned().collect();
+        let forms = term_forms(&terms, &other_spellings);
         if !fuzzy_terms.is_empty() {
             let expression = or_expression(fuzzy_terms.iter().map(|(_, alt)| alt.as_str()));
             add_lane(self.fts_ranked(&expression, Some(conversation_id))?, FUZZY_WEIGHT);
+        }
+        if !translated_terms.is_empty() {
+            let expression = or_expression(translated_terms.iter().map(|(_, alt)| alt.as_str()));
+            add_lane(self.fts_ranked(&expression, Some(conversation_id))?, TRANSLATED_WEIGHT);
         }
         if use_vectors && !query.trim().is_empty() {
             let query_vector = crate::embedding::embed_query(query);
             add_lane(self.vector_ranked(&query_vector, Some(conversation_id))?, VECTOR_WEIGHT);
         }
 
+        // An extract is cut around the words typed, else around their counterparts.
+        let shown_terms: Vec<String> = terms.iter().cloned().chain(translated_terms.iter().map(|(_, alt)| alt.clone())).collect();
         let ids: Vec<i64> = scores.keys().copied().collect();
         let rows = self.segment_rows(&ids)?;
         let mut ranked: Vec<(f64, i64)> = scores
@@ -521,7 +542,7 @@ impl ConversationStore {
                         message_id: id,
                         role: row.role.clone(),
                         at: row.at.clone(),
-                        snippet: snippet(&row.text, &terms, 320),
+                        snippet: snippet(&row.text, &shown_terms, 320),
                     })
                 })
                 .collect(),
@@ -787,6 +808,35 @@ mod tests {
         };
         assert_eq!(search(&[]), vec!["new".to_string()]);
         assert_eq!(search(&["planner"]), vec!["new".to_string(), "old".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_french_question_finds_an_english_message_by_its_words() {
+        let (store, dir) = store_with(
+            "bilingual",
+            &[
+                ("english", &[("user", "Reply to the thread: we still cannot add music to a scheduled Instagram post, only to reels")]),
+                ("french", &[("user", "Corrige la marge du bloc dans la page des réglages du compte")]),
+                ("other", &[("user", "The invoice export fails when the customer has no billing address")]),
+            ],
+        );
+        let ask = |query: &str| -> Vec<ConversationHit> {
+            let options = SearchOptions { query: query.to_string(), limit: 5, ..SearchOptions::default() };
+            store.search(&options).unwrap()
+        };
+        // Words alone, no vectors: nothing in common but the lexicon.
+        let found = ask("musique sur une publication programmée, réponse au fil");
+        assert_eq!(found.first().map(|hit| hit.conversation_id.as_str()), Some("english"), "{:?}", found.iter().map(|h| &h.conversation_id).collect::<Vec<_>>());
+        assert_eq!(found[0].matched_through, vec!["translated".to_string()]);
+        assert!(found[0].best_match.snippet.contains("music"));
+        // And the other way round.
+        assert_eq!(ask("account settings margin").first().map(|hit| hit.conversation_id.as_str()), Some("french"));
+        // Inside one conversation too.
+        let within = store.search_within("english", "musique programmée", 5, false).unwrap().unwrap();
+        assert_eq!(within.len(), 1);
+        // A query in the language of the text is unchanged by the lexicon.
+        assert_eq!(ask("invoice export billing").first().map(|hit| hit.conversation_id.as_str()), Some("other"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
