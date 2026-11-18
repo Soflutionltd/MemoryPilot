@@ -217,6 +217,29 @@ impl ConversationStore {
         let mut actions_at: Option<&str> = None;
         // Whether the text the current answer replaced was kept as a step.
         let mut previous_kept = false;
+        // The steps this conversation already holds, by the hashes of
+        // their parts. Cursor keeps one message under many ids (a long
+        // conversation: 1.5 million bubbles for 68,000 messages), and each
+        // copy would otherwise be kept as a step of its own. Answers are
+        // left out: the answer of an open turn becomes its step when the
+        // turn goes on, and must then be written.
+        let kept_steps: std::cell::RefCell<std::collections::HashSet<String>> = {
+            let mut statement = tx
+                .prepare("SELECT source_key, text_hash FROM segments WHERE conversation_id = ?1 AND role = 'step' ORDER BY source_key")
+                .map_err(|error| format!("Steps so far: {}", error))?;
+            let rows: Vec<(String, String)> = statement
+                .query_map([&source.root_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|error| format!("Steps so far: {}", error))?
+                .collect::<Result<_, _>>()
+                .map_err(|error| format!("Steps so far: {}", error))?;
+            // `key`, `key#p2`, `key#p3`… sort together and in order.
+            let mut whole: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+            for (key, hash) in &rows {
+                let step = key.split_once("#step").map(|(step, _)| step).unwrap_or(key);
+                whole.entry(step).or_default().push(hash);
+            }
+            std::cell::RefCell::new(whole.into_values().map(|hashes| hashes.join(",")).collect())
+        };
         let flush = |tx: &rusqlite::Transaction, turn: &Option<String>, answer: Option<&Message>, previous_kept: bool| -> Result<usize, String> {
             let Some(message) = answer else { return Ok(0) };
             let body = message.text.trim();
@@ -239,6 +262,11 @@ impl ConversationStore {
                 return Ok(0);
             }
             let key = format!("{}:{}:{}#step", source.tool, source.origin_id, message.key);
+            let hash = parts_signature(body, text::MAX_ANSWER_CHARS);
+            let known = !kept_steps.borrow_mut().insert(hash);
+            if known && !segment_exists(tx, &key)? {
+                return Ok(0);
+            }
             upsert_parts(tx, source, "step", &key, message.at.as_deref(), body, text::MAX_ANSWER_CHARS)
         };
         for message in messages {
@@ -247,6 +275,11 @@ impl ConversationStore {
                     actions.extend(message.actions.iter().map(String::as_str));
                     actions_at = actions_at.or(message.at.as_deref());
                     if message.text.trim().is_empty() {
+                        continue;
+                    }
+                    // The same text again (a copy of the message under
+                    // another id) replaces nothing.
+                    if answer.is_some_and(|previous| previous.text.trim() == message.text.trim()) {
                         continue;
                     }
                     // What was the latest text of the turn is now a step.
@@ -644,6 +677,20 @@ fn upsert_parts(
     Ok(written)
 }
 
+/// The hashes `upsert_parts` stores for the parts of `body`, joined: two
+/// long texts that begin alike and end differently are not the same.
+fn parts_signature(body: &str, max: usize) -> String {
+    let body = secrets::redact(body);
+    parts(&body, max).iter().map(|part| crate::db::content_hash(&secrets::redact(part))).collect::<Vec<_>>().join(",")
+}
+
+fn segment_exists(tx: &rusqlite::Transaction, key: &str) -> Result<bool, String> {
+    tx.query_row("SELECT 1 FROM segments WHERE source_key = ?1", [key], |_| Ok(()))
+        .optional()
+        .map(|found| found.is_some())
+        .map_err(|error| format!("Segment lookup: {}", error))
+}
+
 fn delete_segment(tx: &rusqlite::Transaction, key: &str) -> Result<(), String> {
     let id: Option<i64> = tx
         .query_row("SELECT id FROM segments WHERE source_key = ?1", [key], |row| row.get(0))
@@ -825,6 +872,68 @@ mod tests {
     }
 
     #[test]
+    fn a_message_stored_under_many_ids_is_kept_once() {
+        let dir = std::env::temp_dir().join(format!("mp-conv-copies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = ConversationStore::open(&dir.join("c.db")).unwrap();
+        let source = SourceConversation {
+            origin_id: "c1".to_string(),
+            root_id: "c1".to_string(),
+            tool: "cursor",
+            title: None,
+            workspace: None,
+            created_at: None,
+            version: "1".to_string(),
+            source_path: None,
+        };
+        let plan = format!("The plan for the export: one file per month, named by its period. {}", "Each file holds the entries of its month. ".repeat(5));
+        let answer = format!("The export is written and tested on three months of entries. {}", "Totals match the ledger. ".repeat(6));
+        // As Cursor stores a long conversation: each message under several ids.
+        let mut messages = vec![message("u1", Role::User, 1, "Écris l'export mensuel des écritures comptables")];
+        for copy in 0..40 {
+            messages.push(message(&format!("plan-{}", copy), Role::Assistant, 2, &plan));
+        }
+        for copy in 0..40 {
+            messages.push(message(&format!("answer-{}", copy), Role::Assistant, 3, &answer));
+        }
+        store.apply(&source, true, &messages, &[]).unwrap();
+        let count = |store: &ConversationStore, role: &str| stored(store).iter().filter(|row| row.0 == role).count();
+        assert_eq!(count(&store, "step"), 1, "the plan once: {:?}", stored(&store));
+        assert_eq!(count(&store, "assistant"), 1, "the answer once");
+        // More copies come with a later sync, and in a later turn.
+        let later = [
+            message("plan-90", Role::Assistant, 4, &plan),
+            message("answer-90", Role::Assistant, 5, &answer),
+            message("u2", Role::User, 6, "Ajoute le total par journal dans chaque fichier"),
+            message("plan-91", Role::Assistant, 7, &plan),
+            message("a2", Role::Assistant, 8, "The total per journal is added at the end of each file, after the entries of the month."),
+        ];
+        store.apply(&source, true, &later, &[]).unwrap();
+        assert_eq!(count(&store, "step"), 1, "no copy becomes a step: {:?}", stored(&store));
+        assert_eq!(count(&store, "assistant"), 2, "one answer per turn");
+        // Reading the same messages again changes nothing.
+        assert_eq!(store.apply(&source, true, &messages, &[]).unwrap(), 0);
+        assert_eq!(count(&store, "step"), 1);
+        // Two long texts that begin alike and end differently are two texts.
+        let opening = "Le plan détaillé de la migration, étape par étape. ".repeat(80);
+        let first = format!("{}Conclusion : on migre en une fois.", opening);
+        let second = format!("{}Conclusion : on migre en deux temps, par lots.", opening);
+        assert!(first.chars().count() > text::MAX_ANSWER_CHARS);
+        let revised = [
+            message("u3", Role::User, 9, "Détaille le plan de migration du schéma de facturation"),
+            message("long-1", Role::Assistant, 10, &first),
+            message("long-2", Role::Assistant, 11, &second),
+            message("a3", Role::Assistant, 12, "The two versions of the plan are above; the second one is the one I recommend for this schema."),
+        ];
+        store.apply(&source, true, &revised, &[]).unwrap();
+        let all: String = stored(&store).iter().filter(|row| row.0 == "step").map(|row| row.2.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(all.contains("on migre en une fois"), "the first version is kept");
+        assert!(all.contains("on migre en deux temps"), "and the revised one too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_turn_keeps_its_draft_its_actions_and_long_texts_whole() {
         let dir = std::env::temp_dir().join(format!("mp-conv-turn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -875,13 +984,14 @@ mod tests {
         assert_eq!(of("assistant").len(), 1);
         assert!(of("assistant")[0].2.starts_with("The post is published"));
         // A turn that ends on a word keeps its long text once, as a step.
+        let reply = format!("Here is the reply for the thread: the limit is confirmed by the vendor. {}", "It applies to every scheduled post. ".repeat(6));
         let ending = [
             message("u9", Role::User, 20, "Prépare la réponse pour le fil de discussion du forum"),
-            message("a9", Role::Assistant, 21, &draft),
+            message("a9", Role::Assistant, 21, &reply),
         ];
         store.apply(&source, true, &ending, &[]).unwrap();
         // The open turn is read again whole, as a sync does.
-        store.apply(&source, true, &[message("a9", Role::Assistant, 21, &draft), message("a10", Role::Assistant, 22, "Done.")], &[]).unwrap();
+        store.apply(&source, true, &[message("a9", Role::Assistant, 21, &reply), message("a10", Role::Assistant, 22, "Done.")], &[]).unwrap();
         let after = stored(&store);
         assert_eq!(after.iter().filter(|row| row.0 == "assistant").count(), 1, "the draft is no longer an answer");
         assert_eq!(after.iter().filter(|row| row.0 == "step").count(), 2);
