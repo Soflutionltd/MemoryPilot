@@ -217,11 +217,21 @@ fn final_order(
     crate::session_fusion::fuse_sessions(query, results, limit)
 }
 
+/// Finalists a wide rerank starts from. More than the cross-encoder
+/// rescores ([`crate::reranking::WIDE_RERANK_WIDTH`]): the cluster pass and
+/// the local rerank reorder the finalists before it, so a candidate fused
+/// just past that width can still climb into it, but only if it was kept.
+/// LongMemEval-S, first 50 turns of a compact search: every evidence turn
+/// present for 461 of 470 questions, 459 with a pool of 64, none lost, same
+/// latency.
+const WIDE_CANDIDATE_POOL: usize = 100;
+const _: () = assert!(WIDE_CANDIDATE_POOL <= MAX_SEARCH_LIMIT);
+
 /// Finalists a search keeps before the cross-encoder: `limit`, or at least
-/// the wide rerank width when a caller asked for a wide rerank.
+/// [`WIDE_CANDIDATE_POOL`] when a caller asked for a wide rerank.
 fn candidate_pool(limit: usize, wide: bool) -> usize {
     if wide {
-        limit.clamp(crate::reranking::WIDE_RERANK_WIDTH, MAX_SEARCH_LIMIT)
+        limit.clamp(WIDE_CANDIDATE_POOL, MAX_SEARCH_LIMIT)
     } else {
         limit
     }
@@ -950,11 +960,12 @@ mod pool_tests {
     }
 
     #[test]
-    fn a_wide_rerank_rescores_its_full_width_whatever_the_limit() {
+    fn a_wide_rerank_keeps_more_finalists_than_it_rescores_whatever_the_limit() {
         assert_eq!(candidate_pool(10, false), 10);
         assert_eq!(candidate_pool(50, false), 50);
-        assert_eq!(candidate_pool(30, true), 64);
-        assert_eq!(candidate_pool(50, true), 64);
-        assert_eq!(candidate_pool(80, true), 80);
+        assert_eq!(candidate_pool(30, true), 100);
+        assert_eq!(candidate_pool(50, true), 100);
+        assert_eq!(candidate_pool(100, true), 100);
+        assert!(candidate_pool(50, true) > crate::reranking::WIDE_RERANK_WIDTH);
     }
 }
