@@ -92,8 +92,19 @@ const ASSISTANT_QUERY_MARKERS: &[&str] = &[
 /// Whether `query` asks what the assistant said ("what did you suggest",
 /// "rappelle-moi ce que tu m'as conseillé").
 pub fn asks_about_assistant(query: &str) -> bool {
-    let lower = query.to_lowercase().replace('\u{2019}', "'");
-    ASSISTANT_QUERY_MARKERS.iter().any(|marker| lower.contains(marker))
+    let lower = query.to_lowercase().replace(['\u{2019}', '\u{02BC}'], "'");
+    ASSISTANT_QUERY_MARKERS.iter().any(|marker| contains_phrase(&lower, marker))
+}
+
+/// Whether `phrase` occurs in `text` as whole words: "did you" is in "what
+/// did you say" but not in "did your team ship".
+fn contains_phrase(text: &str, phrase: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric();
+    text.match_indices(phrase).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + phrase.len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
 }
 
 impl CompactOptions {
@@ -872,6 +883,14 @@ mod pool_tests {
         assert!(asks_about_assistant("Rappelle-moi ce que tu m\u{2019}as conseillé pour le voyage"));
         assert!(!asks_about_assistant("How many projects did I lead this year?"));
         assert!(!asks_about_assistant("Combien de projets ai-je menés cette année ?"));
+        // Whole words only.
+        assert!(asks_about_assistant("What did you say about the lease?"));
+        assert!(!asks_about_assistant("When did your team ship the release?"));
+        assert!(!asks_about_assistant("Did yourself or Sam book the hotel?"));
+        assert!(!asks_about_assistant("Is the bayou saidto be flooded?"));
+        // Other apostrophes and capitals.
+        assert!(asks_about_assistant("Qu\u{02BC}est-ce que TU M\u{02BC}AS conseillé ?"));
+        assert!(asks_about_assistant("RAPPELLE-MOI CE QUE tu as dit"));
         let defaults = CompactOptions::default();
         assert_eq!(defaults.for_query("What did you recommend for dinner?").full_top, 10);
         assert_eq!(defaults.for_query("Where did I park?"), defaults);
