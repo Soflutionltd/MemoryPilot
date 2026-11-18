@@ -87,7 +87,7 @@ fn open_db() -> Result<Database, String> {
 
 /// Where a hook file lives: next to `MEMORYPILOT_DB` when it is set (tests),
 /// else in `area` of the layout (state/ or logs/), whose folder is created.
-fn hook_path(area: memorypilot_core::layout::Area, name: &str) -> PathBuf {
+pub(crate) fn hook_path(area: memorypilot_core::layout::Area, name: &str) -> PathBuf {
     let path = match std::env::var("MEMORYPILOT_DB") {
         Ok(db) if !db.trim().is_empty() => Path::new(&db)
             .parent()
@@ -180,6 +180,9 @@ pub fn run_hook(event: &str, args: &[String]) {
         println!("{}", json!({}));
         return;
     }
+    if matches!(event, "session-start" | "sessionStart" | "SessionStart" | "user-prompt" | "userPromptSubmit" | "UserPromptSubmit") {
+        note_active_conversation(&agent, &payload);
+    }
     let output = match event {
         "session-start" | "sessionStart" | "SessionStart" => {
             if !claim_session_start(&hook_path(memorypilot_core::layout::Area::State, SESSION_MARKS_DIR), &payload) {
@@ -245,6 +248,20 @@ pub fn run_hook(event: &str, args: &[String]) {
         }
     };
     println!("{}", output);
+}
+
+/// Leaves the trace `find_conversation` reads to know which conversation
+/// its caller is in.
+fn note_active_conversation(agent: &str, payload: &Value) {
+    let Some(conversation) = conversation_id(payload) else { return };
+    crate::active_session::record(
+        &crate::active_session::state_path(),
+        &conversation,
+        first_workspace_root(payload).as_deref(),
+        agent,
+        &crate::active_session::own_ancestors(),
+        chrono::Utc::now(),
+    );
 }
 
 fn age_secs(path: &Path) -> Option<u64> {

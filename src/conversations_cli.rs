@@ -287,6 +287,12 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
         Err(error) => return tool_error(&error),
     };
     refresh(&mut store);
+    // The conversation the caller is in holds the question just asked:
+    // it is left out unless asked for.
+    let include_current = args.get("include_current").and_then(Value::as_bool).unwrap_or(false);
+    let current = (!include_current).then(|| text("current_conversation_id").or_else(calling_conversation)).flatten();
+    let is_current = |hit: &Value| current.is_some() && hit.get("conversation_id").and_then(Value::as_str) == current.as_deref();
+    let spare = usize::from(current.is_some());
 
     let mut hits = Vec::new();
     if let Some(reference) = reference.as_deref() {
@@ -296,7 +302,7 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
             "file"
         };
         let value = if kind == "commit" { reference.to_lowercase() } else { reference.to_string() };
-        let found = match store.by_reference(kind, &value, offset + limit + 1) {
+        let found = match store.by_reference(kind, &value, offset + limit + 1 + spare) {
             Ok(found) => found,
             Err(error) => return tool_error(&error),
         };
@@ -308,7 +314,7 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
     if let Some(query) = query.as_deref() {
         let options = SearchOptions {
             query: query.to_string(),
-            limit: offset + limit + 1,
+            limit: offset + limit + 1 + spare,
             tool: text("tool"),
             project: text("project"),
             after: text("after"),
@@ -334,14 +340,31 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
                 .collect();
         }
     }
+    let found = hits.len();
+    hits.retain(|hit| !is_current(hit));
+    let left_out = (hits.len() < found).then(|| current.clone()).flatten();
     let has_more = hits.len() > offset + limit;
     let page: Vec<Value> = hits.into_iter().skip(offset).take(limit).collect();
     let body = json!({
         "conversations": page,
         "next_offset": has_more.then_some(offset + limit),
+        "current_conversation_left_out": left_out,
         "related_memories": related_memories,
     });
     tool_result(&compact_json(body))
+}
+
+/// The conversation of the agent calling this server, from the trace its
+/// hooks leave.
+fn calling_conversation() -> Option<String> {
+    static ANCESTORS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let workspace = std::env::current_dir().ok().map(|dir| dir.to_string_lossy().into_owned());
+    crate::active_session::current(
+        &crate::active_session::state_path(),
+        ANCESTORS.get_or_init(crate::active_session::own_ancestors),
+        workspace.as_deref(),
+        chrono::Utc::now(),
+    )
 }
 
 /// Results go straight into the agent's context: no indentation, no
