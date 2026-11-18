@@ -399,6 +399,31 @@ pub fn handle_read_conversation(args: &Value) -> Value {
     }
 }
 
+/// `search_in_conversation`: the messages of one conversation that
+/// match a query, so a long conversation is searched, not paged through.
+pub fn handle_search_in_conversation(args: &Value) -> Value {
+    let Some(conversation_id) = args.get("conversation_id").and_then(Value::as_str) else {
+        return tool_error("conversation_id required");
+    };
+    let Some(query) = args.get("query").and_then(Value::as_str).map(str::trim).filter(|query| !query.is_empty()) else {
+        return tool_error("query required");
+    };
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 50) as usize;
+    let mut store = match ConversationStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return tool_error(&error),
+    };
+    refresh(&mut store);
+    match store.search_within(conversation_id, query, limit, true) {
+        Ok(None) => tool_error(&format!(
+            "No conversation {}: pass the full conversation_id returned by find_conversation",
+            conversation_id
+        )),
+        Ok(Some(messages)) => tool_result(&compact_json(json!({ "conversation_id": conversation_id, "messages": messages }))),
+        Err(error) => tool_error(&error),
+    }
+}
+
 fn value_after(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
 }

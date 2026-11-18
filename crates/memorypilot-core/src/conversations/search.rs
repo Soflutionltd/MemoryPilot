@@ -140,17 +140,17 @@ impl ConversationStore {
 
         let exact = exact_expression(&terms);
         if let Some(expression) = exact {
-            add_lane(self.fts_ranked(&expression)?, EXACT_WEIGHT, "exact");
+            add_lane(self.fts_ranked(&expression, None)?, EXACT_WEIGHT, "exact");
         }
         let fuzzy_terms = self.fuzzy_expansions(&terms)?;
         let forms = term_forms(&terms, &fuzzy_terms);
         if !fuzzy_terms.is_empty() {
             let expression = or_expression(fuzzy_terms.iter().map(|(_, alt)| alt.as_str()));
-            add_lane(self.fts_ranked(&expression)?, FUZZY_WEIGHT, "fuzzy");
+            add_lane(self.fts_ranked(&expression, None)?, FUZZY_WEIGHT, "fuzzy");
         }
         if options.use_vectors {
             let query_vector = crate::embedding::embed_query(&options.query);
-            add_lane(self.vector_ranked(&query_vector)?, VECTOR_WEIGHT, "vector");
+            add_lane(self.vector_ranked(&query_vector, None)?, VECTOR_WEIGHT, "vector");
         }
         if scores.is_empty() {
             return Ok(Vec::new());
@@ -235,14 +235,24 @@ impl ConversationStore {
         Ok(hits)
     }
 
-    fn fts_ranked(&self, expression: &str) -> Result<Vec<i64>, String> {
-        let mut statement = self
-            .conn
-            .prepare_cached("SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1 ORDER BY rank LIMIT ?2")
-            .map_err(|error| format!("FTS search: {}", error))?;
-        let rows = statement
-            .query_map(params![expression, LANE_DEPTH as i64], |row| row.get::<_, i64>(0))
-            .map_err(|error| format!("FTS search: {}", error))?;
+    /// Messages matching an FTS expression, best first; `within` keeps
+    /// only those of one conversation.
+    fn fts_ranked(&self, expression: &str, within: Option<&str>) -> Result<Vec<i64>, String> {
+        let sql = match within {
+            None => "SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+            Some(_) => {
+                "SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1
+                   AND rowid IN (SELECT id FROM segments WHERE conversation_id = ?3)
+                 ORDER BY rank LIMIT ?2"
+            }
+        };
+        let mut statement = self.conn.prepare_cached(sql).map_err(|error| format!("FTS search: {}", error))?;
+        let read = |row: &rusqlite::Row| row.get::<_, i64>(0);
+        let rows = match within {
+            None => statement.query_map(params![expression, LANE_DEPTH as i64], read),
+            Some(conversation) => statement.query_map(params![expression, LANE_DEPTH as i64, conversation], read),
+        }
+        .map_err(|error| format!("FTS search: {}", error))?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 
@@ -319,14 +329,18 @@ impl ConversationStore {
         Ok(vocabulary)
     }
 
-    fn vector_ranked(&self, query: &[f32]) -> Result<Vec<i64>, String> {
-        let mut statement = self
-            .conn
-            .prepare_cached("SELECT id, embedding FROM segments WHERE embed_state = 2")
-            .map_err(|error| format!("Vector scan: {}", error))?;
-        let rows = statement
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
-            .map_err(|error| format!("Vector scan: {}", error))?;
+    fn vector_ranked(&self, query: &[f32], within: Option<&str>) -> Result<Vec<i64>, String> {
+        let sql = match within {
+            None => "SELECT id, embedding FROM segments WHERE embed_state = 2",
+            Some(_) => "SELECT id, embedding FROM segments WHERE embed_state = 2 AND conversation_id = ?1",
+        };
+        let mut statement = self.conn.prepare_cached(sql).map_err(|error| format!("Vector scan: {}", error))?;
+        let read = |row: &rusqlite::Row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?));
+        let rows = match within {
+            None => statement.query_map([], read),
+            Some(conversation) => statement.query_map([conversation], read),
+        }
+        .map_err(|error| format!("Vector scan: {}", error))?;
         let mut scored: Vec<(f32, i64)> = rows
             .filter_map(Result::ok)
             .map(|(id, blob)| (crate::embedding::similarity_with_blob(query, &blob), id))
@@ -437,6 +451,73 @@ impl ConversationStore {
             files: refs("file")?,
             matched_through: Vec::new(),
         }))
+    }
+
+    /// The messages of one conversation that answer a query, best first:
+    /// the same three lanes as `search`, kept inside the conversation, so
+    /// a word can be found in thousands of messages without paging
+    /// through them. `None` when the conversation is not in the index.
+    pub fn search_within(
+        &self,
+        conversation_id: &str,
+        query: &str,
+        limit: usize,
+        use_vectors: bool,
+    ) -> Result<Option<Vec<MatchedMessage>>, String> {
+        let known: bool = self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)", [conversation_id], |row| row.get(0))
+            .map_err(|error| format!("Conversation lookup: {}", error))?;
+        if !known {
+            return Ok(None);
+        }
+        let limit = limit.clamp(1, 50);
+        let terms = text::query_terms(query);
+        let mut scores: HashMap<i64, f64> = HashMap::new();
+        let mut add_lane = |ranked: Vec<i64>, weight: f64| {
+            for (rank, id) in ranked.into_iter().enumerate() {
+                *scores.entry(id).or_default() += weight / (RRF_K + rank as f64 + 1.0);
+            }
+        };
+        if let Some(expression) = exact_expression(&terms) {
+            add_lane(self.fts_ranked(&expression, Some(conversation_id))?, EXACT_WEIGHT);
+        }
+        let fuzzy_terms = self.fuzzy_expansions(&terms)?;
+        let forms = term_forms(&terms, &fuzzy_terms);
+        if !fuzzy_terms.is_empty() {
+            let expression = or_expression(fuzzy_terms.iter().map(|(_, alt)| alt.as_str()));
+            add_lane(self.fts_ranked(&expression, Some(conversation_id))?, FUZZY_WEIGHT);
+        }
+        if use_vectors && !query.trim().is_empty() {
+            let query_vector = crate::embedding::embed_query(query);
+            add_lane(self.vector_ranked(&query_vector, Some(conversation_id))?, VECTOR_WEIGHT);
+        }
+
+        let ids: Vec<i64> = scores.keys().copied().collect();
+        let rows = self.segment_rows(&ids)?;
+        let mut ranked: Vec<(f64, i64)> = scores
+            .into_iter()
+            .filter_map(|(id, score)| {
+                let row = rows.get(&id)?;
+                (row.role != "title").then(|| (score * (1.0 + COVERAGE_WEIGHT * coverage(&forms, &row.text)), id))
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        Ok(Some(
+            ranked
+                .into_iter()
+                .take(limit)
+                .filter_map(|(_, id)| {
+                    let row = rows.get(&id)?;
+                    Some(MatchedMessage {
+                        message_id: id,
+                        role: row.role.clone(),
+                        at: row.at.clone(),
+                        snippet: snippet(&row.text, &terms, 320),
+                    })
+                })
+                .collect(),
+        ))
     }
 
     /// Messages of a conversation, oldest first. With `around` and no
@@ -614,5 +695,65 @@ mod tests {
         let expression = exact_expression(&["factures".to_string(), "revolut".to_string()]).unwrap();
         assert!(expression.contains("\"factures\""));
         assert!(expression.contains(" OR "));
+    }
+
+    fn store_with(name: &str, conversations: &[(&str, &[(&str, &str)])]) -> (ConversationStore, std::path::PathBuf) {
+        use super::super::{Message, Role, SourceConversation};
+        let dir = std::env::temp_dir().join(format!("mp-conv-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = ConversationStore::open(&dir.join("c.db")).unwrap();
+        for (id, messages) in conversations {
+            let source = SourceConversation {
+                origin_id: id.to_string(),
+                root_id: id.to_string(),
+                tool: "cursor",
+                title: None,
+                workspace: None,
+                created_at: None,
+                version: "1".to_string(),
+                source_path: None,
+            };
+            let messages: Vec<Message> = messages
+                .iter()
+                .enumerate()
+                .map(|(index, (role, text))| Message {
+                    key: format!("m{}", index),
+                    role: if *role == "user" { Role::User } else { Role::Assistant },
+                    at: Some(format!("2026-10-12T10:{:02}:00.000Z", index)),
+                    order: None,
+                    text: text.to_string(),
+                })
+                .collect();
+            store.apply(&source, true, &messages, &[]).unwrap();
+        }
+        (store, dir)
+    }
+
+    #[test]
+    fn a_word_is_found_inside_one_conversation_only() {
+        let (store, dir) = store_with(
+            "within",
+            &[
+                (
+                    "long",
+                    &[
+                        ("user", "Regarde pourquoi le carrousel Instagram plante au moment de la publication"),
+                        ("assistant", "Le carrousel plante parce que le conteneur n'est pas prêt quand on publie."),
+                        ("user", "Écris le message pour le forum des développeurs sur la musique des publications"),
+                        ("assistant", "Voici le message pour le forum : la musique manque sur une publication programmée."),
+                    ],
+                ),
+                ("other", &[("user", "La musique du générique est trop forte dans la vidéo de démonstration")]),
+            ],
+        );
+        let found = store.search_within("long", "musique forum", 10, false).unwrap().unwrap();
+        assert_eq!(found.len(), 2, "only the two messages of that conversation: {:?}", found);
+        assert!(found.iter().all(|message| message.snippet.to_lowercase().contains("musique")));
+        assert!(found.iter().all(|message| message.at.is_some() && message.message_id > 0));
+        assert_eq!(store.search_within("long", "musique", 1, false).unwrap().unwrap().len(), 1);
+        assert!(store.search_within("long", "comptabilité", 10, false).unwrap().unwrap().is_empty());
+        assert!(store.search_within("missing", "musique", 10, false).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
