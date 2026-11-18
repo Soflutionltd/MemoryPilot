@@ -24,38 +24,37 @@ const UNVERIFIED_WEIGHT: f64 = 0.6;
 /// "n'a jamais été envoyé" has both, "ne jamais utiliser" and "aucune
 /// erreur" have one.
 const FRENCH_DENIALS: &[&str] = &["aucun", "aucune", "jamais", "rien", "personne"];
-const FRENCH_AUXILIARIES: &[&str] =
-    &["n'a", "n'ont", "n'ai", "n'avons", "n'avait", "n'avaient", "n'est", "n'était", "n'y a", "n'y avait"];
-const ENGLISH_NEVER: &[&str] = &["never"];
-const ENGLISH_NEVER_AUXILIARIES: &[&str] = &["was", "were", "has", "have", "had", "did"];
+/// "n'a", not "n'est": "aucune erreur n'est apparue" describes a state,
+/// "aucune demande n'a été envoyée" denies an event.
+const FRENCH_AUXILIARIES: &[&str] = &["n'a", "n'ont", "n'ai", "n'avons", "n'avait", "n'avaient", "n'y a", "n'y avait"];
+/// "Never" next to its auxiliary: "the API never returned an error" tells
+/// how something behaves, "it was never sent" denies an event.
+const ENGLISH_NEVER: &[&str] =
+    &["was never", "were never", "has never", "have never", "had never", "never been", "never was", "never did"];
 const ENGLISH_NONE: &[&str] = &["no", "nothing", "nobody", "no one", "none"];
 const ENGLISH_NONE_AUXILIARIES: &[&str] = &["was", "were", "has been", "have been", "had been", "ever"];
 
-fn has_word(sentence: &str, phrase: &str) -> bool {
+/// Where `phrase` stands in `sentence` as whole words: "no" is in "no
+/// request" but not in "another".
+fn word_at(sentence: &str, phrase: &str) -> Option<usize> {
     let is_word = |c: char| c.is_alphanumeric() || c == '\'';
-    sentence.match_indices(phrase).any(|(start, _)| {
-        let before = sentence[..start].chars().next_back();
+    sentence.match_indices(phrase).map(|(start, _)| start).find(|start| {
+        let before = sentence[..*start].chars().next_back();
         let after = sentence[start + phrase.len()..].chars().next();
         !before.is_some_and(is_word) && !after.is_some_and(|c| c.is_alphanumeric())
     })
 }
 
 fn has_any(sentence: &str, phrases: &[&str]) -> bool {
-    phrases.iter().any(|phrase| has_word(sentence, phrase))
-}
-
-/// Where the first of `phrases` starts in `sentence`.
-fn first_word(sentence: &str, phrases: &[&str]) -> Option<usize> {
-    phrases.iter().filter(|phrase| has_word(sentence, phrase)).filter_map(|phrase| sentence.find(phrase)).min()
+    phrases.iter().any(|phrase| word_at(sentence, phrase).is_some())
 }
 
 /// "No request was sent" denies an event; "there was no error" describes
 /// a result: the denial has to come before the auxiliary.
 fn denies_before(sentence: &str, denials: &[&str], auxiliaries: &[&str]) -> bool {
-    match (first_word(sentence, denials), auxiliaries.iter().filter_map(|a| sentence.rfind(a)).max()) {
-        (Some(denial), Some(auxiliary)) => denial < auxiliary && has_any(sentence, auxiliaries),
-        _ => false,
-    }
+    let first_denial = denials.iter().filter_map(|denial| word_at(sentence, denial)).min();
+    let last_auxiliary = auxiliaries.iter().filter_map(|auxiliary| word_at(sentence, auxiliary)).max();
+    matches!((first_denial, last_auxiliary), (Some(denial), Some(auxiliary)) if denial < auxiliary)
 }
 
 /// Whether `content` states, in French or English, that something never
@@ -64,7 +63,7 @@ pub fn claims_an_absence(content: &str) -> bool {
     let text = content.to_lowercase().replace(['\u{2019}', '\u{02BC}'], "'");
     text.split(['.', '!', '?', '\n', ';', ':']).any(|sentence| {
         (has_any(sentence, FRENCH_DENIALS) && has_any(sentence, FRENCH_AUXILIARIES))
-            || (has_any(sentence, ENGLISH_NEVER) && has_any(sentence, ENGLISH_NEVER_AUXILIARIES))
+            || has_any(sentence, ENGLISH_NEVER)
             || denies_before(sentence, ENGLISH_NONE, ENGLISH_NONE_AUXILIARIES)
     })
 }
@@ -135,6 +134,11 @@ mod tests {
             "La demande a été envoyée à Meta le 12/10, réponse attendue.",
             "There is no rate limit on this endpoint.",
             "The build was green and there was no error.",
+            "Another change was made, no issue.",
+            "Aucune erreur n'est apparue au build.",
+            "Aucune migration n'est en attente.",
+            "Tous les tests passent, aucun n'est ignoré.",
+            "The API never returned an error, as the logs were clean.",
             "Le client n'a pas encore choisi la formule annuelle.",
         ] {
             assert!(!claims_an_absence(other), "{other}");

@@ -483,7 +483,7 @@ pub fn handle_search_in_conversation(args: &Value) -> Value {
         )),
         Ok(Some(messages)) => {
             let note = messages.is_empty().then_some(
-                "No message matches. The index keeps each request and the answers of the agent, cut when long: try other words or the other language before concluding it is not there.",
+                "No message matches. The index keeps each request, the answers and longer drafts of the agent and its actions: try other words or the other language before concluding it is not there.",
             );
             let coverage_warnings = store.coverage_warnings(Some(conversation_id), chrono::Utc::now());
             tool_result(&compact_json(json!({

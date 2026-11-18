@@ -465,6 +465,15 @@ mod tests {
         assert!(compact.contains("--- waiting on third parties ---"), "{compact}");
         assert!(compact.contains("[EXT] forum développeurs Meta: Musique sur une publication Instagram programmée (3 days without a reply)"), "{compact}");
 
+        // A request logged without a project waits in every recall, not in none.
+        let loose = NewExternalRequest { destination: "support de la banque", subject: "Accès à l'API de test", ..Default::default() };
+        let loose = db.log_external_request(&loose, &MemoryScope::default()).expect("loose");
+        let recall = db
+            .recall(Some("monapp"), None, None, RecallMode::Safe, false, true, &MemoryScope::default())
+            .expect("recall");
+        assert!(recall["compact"].as_str().expect("compact").contains("[EXT] support de la banque"));
+        db.update_external_request(&loose.id, Some("closed"), None, None).expect("close loose");
+
         db.update_external_request(&request.id, Some("closed"), None, None).expect("close");
         let recall = db
             .recall(Some("monapp"), None, None, RecallMode::Safe, false, true, &MemoryScope::default())

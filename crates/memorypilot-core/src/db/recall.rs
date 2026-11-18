@@ -786,7 +786,12 @@ impl Database {
             .collect();
         // What still waits for an answer from a third party, said first:
         // nobody thinks of asking for it.
-        let waiting = self.external_requests(proj_ref, true).unwrap_or_default();
+        let waiting: Vec<_> = self
+            .external_requests(None, true)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| proj_ref.is_none() || request.project.is_none() || request.project.as_deref() == proj_ref)
+            .collect();
         let waiting_lines = external::waiting_lines(&waiting, MAX_WAITING_RECALLED);
         if compact {
             let mut lines = Vec::new();

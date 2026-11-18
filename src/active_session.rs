@@ -112,9 +112,21 @@ pub fn current(
 /// The conversation of the agent calling this server, from the trace its
 /// hooks leave. `None` when no hook ran (an agent without hooks).
 pub fn calling_conversation() -> Option<String> {
+    // Over HTTP the caller is another machine or another process tree:
+    // nothing here says which conversation it is in.
+    if REMOTE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     static ANCESTORS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
     let workspace = std::env::current_dir().ok().map(|dir| dir.to_string_lossy().into_owned());
     current(&state_path(), ANCESTORS.get_or_init(own_ancestors), workspace.as_deref(), chrono::Utc::now())
+}
+
+static REMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the HTTP server: its callers are not found by their processes.
+pub fn set_remote_server() {
+    REMOTE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `metadata` with where a memory comes from: the conversation it is

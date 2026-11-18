@@ -90,11 +90,11 @@ Quality is one axis. The others decide what a memory costs on every conversation
 |---------|------------------:|------------------|
 | LLM calls per write | **0** | Dedup, entities, graph links and embeddings run locally |
 | LLM calls per search | **0** | Local encoder and reranker |
-| Tools exposed, default profile | 22 | `--footprint` |
-| Tool list, default profile | 17,692 characters, about 4,400 tokens | `--footprint` (tokens estimated at 4 characters each) |
-| Tools exposed, full profile | 70 | `MEMORYPILOT_TOOLS=full` |
-| Tool list, full profile | 34,954 characters, about 8,700 tokens | `--footprint` |
-| Server instructions | 2,258 characters, about 560 tokens | `--footprint` |
+| Tools exposed, default profile | 25 | `--footprint` |
+| Tool list, default profile | 22,033 characters, about 5,500 tokens | `--footprint` (tokens estimated at 4 characters each) |
+| Tools exposed, full profile | 74 | `MEMORYPILOT_TOOLS=full` |
+| Tool list, full profile | 39,959 characters, about 10,000 tokens | `--footprint` |
+| Server instructions | 2,736 characters, about 680 tokens | `--footprint` |
 | Runtime dependencies | none | One binary; no database server, no API key |
 
 For scale, as published by each project and read on 2026-11-16: Mem0, Zep, Graphiti, Letta, Supermemory and Hindsight call an LLM on every write; MemPalace does not. Tool counts: Cognee 6 by default, Mem0 11, Zep 12, ICM 32, MemPalace 47. Clients that defer tool schemas (Claude Code does by default) mostly pay for tool names and server instructions, so the count matters less there than on clients that load every schema.
@@ -212,7 +212,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | File watcher | Context boost from recent edits | No | Filesystem connector (`@agentmemory/fs-watcher`) | No | No |
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Confidence scoring | Embedding similarity | LLM-based merge |
 | HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
-| Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
+| Memory types | 15 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
 | MCP tools | 74 tools, 25 exposed by default (the rest behind `memory_admin`) | 47 tools | **65 tools** | N/A | Limited MCP server |
 | Hooks / event capture | SessionStart auto-recall for **Cursor, Claude Code and Codex**, per-prompt recall (Claude Code), conversation index at session end, opt-in Stop auto-ingest (incremental, distilled, agent narration filtered, secrets redacted) + file watcher | No | **12 named hooks** (Claude Code, Cursor, Codex, Copilot CLI…) | No | No |
 | Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |

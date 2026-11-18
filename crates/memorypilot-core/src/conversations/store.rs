@@ -105,8 +105,13 @@ impl ConversationStore {
         // comes from the folder or its repository, which the mentions
         // counted in the messages must not overrule.
         if conn.prepare("SELECT project_pinned FROM conversations LIMIT 0").is_err() {
-            conn.execute("ALTER TABLE conversations ADD COLUMN project_pinned INTEGER NOT NULL DEFAULT 0", [])
-                .map_err(|error| format!("Conversations schema (project_pinned): {}", error))?;
+            // Another process opening the index at the same moment may have added it first.
+            match conn.execute("ALTER TABLE conversations ADD COLUMN project_pinned INTEGER NOT NULL DEFAULT 0", []) {
+                Err(error) if !error.to_string().contains("duplicate column name") => {
+                    return Err(format!("Conversations schema (project_pinned): {}", error));
+                }
+                _ => {}
+            }
         }
         Ok(Self { conn })
     }
@@ -210,13 +215,22 @@ impl ConversationStore {
         let mut answer: Option<&Message> = None;
         let mut actions: Vec<&str> = Vec::new();
         let mut actions_at: Option<&str> = None;
-        let flush = |tx: &rusqlite::Transaction, turn: &Option<String>, answer: Option<&Message>| -> Result<usize, String> {
+        // Whether the text the current answer replaced was kept as a step.
+        let mut previous_kept = false;
+        let flush = |tx: &rusqlite::Transaction, turn: &Option<String>, answer: Option<&Message>, previous_kept: bool| -> Result<usize, String> {
             let Some(message) = answer else { return Ok(0) };
             let body = message.text.trim();
+            let key = format!("{}#answer", turn_key(turn));
             if body.chars().count() < MIN_ASSISTANT_CHARS {
+                // "Done." ends the turn: what stood as its answer was just
+                // kept as a step, and must not stay as the answer too.
+                if !body.is_empty() && previous_kept {
+                    for part in 0..MAX_PARTS {
+                        delete_segment(tx, &if part == 0 { key.clone() } else { format!("{}#p{}", key, part + 1) })?;
+                    }
+                }
                 return Ok(0);
             }
-            let key = format!("{}#answer", turn_key(turn));
             upsert_parts(tx, source, "assistant", &key, message.at.as_deref(), body, text::MAX_ANSWER_CHARS)
         };
         let step = |tx: &rusqlite::Transaction, message: &Message| -> Result<usize, String> {
@@ -236,12 +250,16 @@ impl ConversationStore {
                         continue;
                     }
                     // What was the latest text of the turn is now a step.
-                    if let Some(previous) = answer.replace(message) {
-                        written += step(&tx, previous)?;
-                    }
+                    previous_kept = match answer.replace(message) {
+                        Some(previous) => {
+                            written += step(&tx, previous)?;
+                            previous.text.trim().chars().count() >= MIN_STEP_CHARS
+                        }
+                        None => false,
+                    };
                 }
                 Role::User => {
-                    written += flush(&tx, &current_turn, answer.take())?;
+                    written += flush(&tx, &current_turn, answer.take(), std::mem::take(&mut previous_kept))?;
                     written += upsert_actions(&tx, source, &turn_key(&current_turn), actions_at.take(), &std::mem::take(&mut actions))?;
                     let key = format!("{}:{}:{}", source.tool, source.origin_id, message.key);
                     let body = text::typed_text(&message.text);
@@ -252,7 +270,7 @@ impl ConversationStore {
                 }
             }
         }
-        written += flush(&tx, &current_turn, answer.take())?;
+        written += flush(&tx, &current_turn, answer.take(), previous_kept)?;
         written += upsert_actions(&tx, source, &turn_key(&current_turn), actions_at, &actions)?;
 
         let mut blob = Vec::with_capacity(seen.len() * 8);
@@ -269,7 +287,8 @@ impl ConversationStore {
 
         tx.execute(
             "UPDATE conversations SET
-                message_count = (SELECT COUNT(*) FROM segments WHERE conversation_id = ?1 AND role IN ('user', 'assistant')),
+                message_count = (SELECT COUNT(*) FROM segments WHERE conversation_id = ?1 AND role IN ('user', 'assistant')
+                                 AND source_key NOT GLOB '*#p[0-9]*'),
                 updated_at = COALESCE((SELECT MAX(at) FROM segments WHERE conversation_id = ?1), updated_at),
                 project = CASE WHEN project_pinned = 1 THEN project ELSE COALESCE(
                     (SELECT value FROM refs WHERE conversation_id = ?1 AND kind = 'project'
@@ -855,6 +874,19 @@ mod tests {
         assert!(of("step")[0].2.starts_with("Here is the post"));
         assert_eq!(of("assistant").len(), 1);
         assert!(of("assistant")[0].2.starts_with("The post is published"));
+        // A turn that ends on a word keeps its long text once, as a step.
+        let ending = [
+            message("u9", Role::User, 20, "Prépare la réponse pour le fil de discussion du forum"),
+            message("a9", Role::Assistant, 21, &draft),
+        ];
+        store.apply(&source, true, &ending, &[]).unwrap();
+        // The open turn is read again whole, as a sync does.
+        store.apply(&source, true, &[message("a9", Role::Assistant, 21, &draft), message("a10", Role::Assistant, 22, "Done.")], &[]).unwrap();
+        let after = stored(&store);
+        assert_eq!(after.iter().filter(|row| row.0 == "assistant").count(), 1, "the draft is no longer an answer");
+        assert_eq!(after.iter().filter(|row| row.0 == "step").count(), 2);
+        let rows = stored(&store);
+        let of = |role: &str| -> Vec<&(String, String, String)> { rows.iter().filter(|row| row.0 == role && !row.1.contains("u9") && !row.1.contains("a9")).collect() };
         assert_eq!(of("action").len(), 1, "one list of actions per turn: {:?}", of("action"));
         assert_eq!(
             of("action")[0].2,
@@ -871,7 +903,7 @@ mod tests {
             .unwrap();
         assert_eq!(url, 1);
         let count: i64 = store.conn.query_row("SELECT message_count FROM conversations", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, (of("user").len() + 1) as i64, "requests and answers only");
+        assert_eq!(count, 3, "two requests and one answer, whatever their length");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

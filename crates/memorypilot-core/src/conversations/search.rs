@@ -230,12 +230,18 @@ impl ConversationStore {
                 }
             }
             if let Some(project) = options.project.as_deref() {
-                let wanted: Vec<String> =
-                    std::iter::once(project).chain(options.project_aliases.iter().map(String::as_str)).map(str::to_lowercase).collect();
+                // "My App", "my_app" and "my-app" are one name: a project is
+                // given in its canonical spelling, a folder is not.
+                let plain = |name: &str| -> String { name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect() };
+                let wanted: Vec<String> = std::iter::once(project)
+                    .chain(options.project_aliases.iter().map(String::as_str))
+                    .map(plain)
+                    .filter(|name| !name.is_empty())
+                    .collect();
                 let matches_project = [hit.project.as_deref(), hit.workspace.as_deref()]
                     .into_iter()
                     .flatten()
-                    .map(str::to_lowercase)
+                    .map(plain)
                     .any(|filed| wanted.iter().any(|name| filed.contains(name.as_str())));
                 if !matches_project {
                     continue;
@@ -475,7 +481,7 @@ impl ConversationStore {
     }
 
     /// The messages of one conversation that answer a query, best first:
-    /// the same three lanes as `search`, kept inside the conversation, so
+    /// the same lanes as `search`, kept inside the conversation, so
     /// a word can be found in thousands of messages without paging
     /// through them. `None` when the conversation is not in the index.
     pub fn search_within(
@@ -808,6 +814,10 @@ mod tests {
         };
         assert_eq!(search(&[]), vec!["new".to_string()]);
         assert_eq!(search(&["planner"]), vec!["new".to_string(), "old".to_string()]);
+        // A folder named with a space or an underscore is found by the project's canonical name.
+        store.set_identity("else", Some("Outil Interne"), None, true).unwrap();
+        let spaced = SearchOptions { query: "planificateur".to_string(), limit: 10, project: Some("outil-interne".to_string()), ..SearchOptions::default() };
+        assert_eq!(store.search(&spaced).unwrap().into_iter().map(|hit| hit.conversation_id).collect::<Vec<_>>(), vec!["else".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
