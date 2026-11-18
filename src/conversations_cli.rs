@@ -23,6 +23,15 @@ pub fn run_index(args: &[String]) {
     let mut store = open_store();
     let report = conversations::sync(&mut store, &SyncOptions { budget: None });
     println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+    // A conversation belongs to the project of its folder or repository,
+    // whatever the folder is called today.
+    match Database::open() {
+        Ok(db) => match store.assign_known_projects(&|folder| db.known_project_for_path(folder)) {
+            Ok(changed) => eprintln!("filed {} conversations under the project of their folder", changed),
+            Err(error) => eprintln!("⚠ {}", error),
+        },
+        Err(error) => eprintln!("⚠ projects not assigned: {}", error),
+    }
     if !args.iter().any(|a| a == "--no-embed") {
         let started = Instant::now();
         match conversations::embed_pending(&mut store, None) {
@@ -316,6 +325,7 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
             query: query.to_string(),
             limit: offset + limit + 1 + spare,
             tool: text("tool"),
+            project_aliases: text("project").map(|project| db.name_aliases(&project)).unwrap_or_default(),
             project: text("project"),
             after: text("after"),
             before: text("before"),

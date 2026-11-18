@@ -91,6 +91,13 @@ impl ConversationStore {
             ",
         )
         .map_err(|error| format!("Conversations schema: {}", error))?;
+        // Added after the first release of the index: set when the project
+        // comes from the folder or its repository, which the mentions
+        // counted in the messages must not overrule.
+        if conn.prepare("SELECT project_pinned FROM conversations LIMIT 0").is_err() {
+            conn.execute("ALTER TABLE conversations ADD COLUMN project_pinned INTEGER NOT NULL DEFAULT 0", [])
+                .map_err(|error| format!("Conversations schema (project_pinned): {}", error))?;
+        }
         Ok(Self { conn })
     }
 
@@ -230,10 +237,10 @@ impl ConversationStore {
             "UPDATE conversations SET
                 message_count = (SELECT COUNT(*) FROM segments WHERE conversation_id = ?1 AND role != 'title'),
                 updated_at = COALESCE((SELECT MAX(at) FROM segments WHERE conversation_id = ?1), updated_at),
-                project = COALESCE(
+                project = CASE WHEN project_pinned = 1 THEN project ELSE COALESCE(
                     (SELECT value FROM refs WHERE conversation_id = ?1 AND kind = 'project'
                      GROUP BY value ORDER BY COUNT(*) DESC LIMIT 1),
-                    project)
+                    project) END
              WHERE id = ?1",
             [&source.root_id],
         )
@@ -259,12 +266,43 @@ impl ConversationStore {
             .execute(
                 "UPDATE conversations SET
                     project = CASE WHEN ?4 THEN COALESCE(?2, project) ELSE COALESCE(project, ?2) END,
+                    project_pinned = CASE WHEN ?4 AND ?2 IS NOT NULL THEN 1 ELSE project_pinned END,
                     workspace = COALESCE(workspace, ?3)
                  WHERE id = ?1",
                 params![conversation_id, project, workspace, replace],
             )
             .map_err(|error| format!("Conversation identity: {}", error))?;
         Ok(changed > 0)
+    }
+
+    /// Files every conversation under the project its folder belongs to
+    /// (`known` answers from the registered folders, their former paths
+    /// and the repository's remote), instead of the name of the folder or
+    /// the paths its messages mention. Returns how many changed.
+    pub fn assign_known_projects(&mut self, known: &dyn Fn(&str) -> Option<String>) -> Result<usize, String> {
+        let folders: Vec<String> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT DISTINCT workspace FROM conversations WHERE workspace IS NOT NULL AND workspace != ''")
+                .map_err(|error| format!("Conversation folders: {}", error))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("Conversation folders: {}", error))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let mut changed = 0;
+        for folder in folders {
+            let Some(project) = known(&folder) else { continue };
+            changed += self
+                .conn
+                .execute(
+                    "UPDATE conversations SET project = ?2, project_pinned = 1
+                     WHERE workspace = ?1 AND (project IS NOT ?2 OR project_pinned = 0)",
+                    params![folder, project],
+                )
+                .map_err(|error| format!("Conversation project: {}", error))?;
+        }
+        Ok(changed)
     }
 
     pub fn pending_embeddings(&self, limit: usize) -> Result<Vec<(i64, String)>, String> {
@@ -625,6 +663,40 @@ mod tests {
                 ("assistant".to_string(), final_answer.to_string()),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_conversation_is_filed_under_the_project_of_its_folder() {
+        let dir = std::env::temp_dir().join(format!("mp-conv-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = ConversationStore::open(&dir.join("c.db")).unwrap();
+        let source = SourceConversation {
+            origin_id: "c1".to_string(),
+            root_id: "c1".to_string(),
+            tool: "cursor",
+            title: None,
+            workspace: Some("/Users/x/Cursor/App/Application/MonApp".to_string()),
+            created_at: None,
+            version: "1".to_string(),
+            source_path: None,
+        };
+        let first = message("u1", Role::User, 1, "Regarde ~/Cursor/App/Planner/lib pour la publication programmée");
+        store.apply(&source, true, &[first], &[]).unwrap();
+        let project = |store: &ConversationStore| -> Option<String> {
+            store.conn.query_row("SELECT project FROM conversations WHERE id = 'c1'", [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(project(&store).as_deref(), Some("Planner"), "the folder most mentioned, before the project is known");
+
+        let known = |folder: &str| folder.ends_with("/MonApp").then(|| "monapp".to_string());
+        assert_eq!(store.assign_known_projects(&known).unwrap(), 1);
+        assert_eq!(project(&store).as_deref(), Some("monapp"));
+        // A later message naming another folder does not move it back.
+        let later = message("u2", Role::User, 2, "Et ~/Cursor/App/Planner/website pour la page de tarifs");
+        store.apply(&SourceConversation { version: "2".to_string(), ..source }, true, &[later], &[]).unwrap();
+        assert_eq!(project(&store).as_deref(), Some("monapp"));
+        assert_eq!(store.assign_known_projects(&known).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

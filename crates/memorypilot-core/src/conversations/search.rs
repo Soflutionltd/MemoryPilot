@@ -34,6 +34,8 @@ pub struct SearchOptions {
     pub limit: usize,
     pub tool: Option<String>,
     pub project: Option<String>,
+    /// Other names of `project`: a conversation filed under any of them matches.
+    pub project_aliases: Vec<String>,
     pub after: Option<String>,
     pub before: Option<String>,
     pub use_vectors: bool,
@@ -211,11 +213,13 @@ impl ConversationStore {
                 }
             }
             if let Some(project) = options.project.as_deref() {
-                let wanted = project.to_lowercase();
+                let wanted: Vec<String> =
+                    std::iter::once(project).chain(options.project_aliases.iter().map(String::as_str)).map(str::to_lowercase).collect();
                 let matches_project = [hit.project.as_deref(), hit.workspace.as_deref()]
                     .into_iter()
                     .flatten()
-                    .any(|p| p.to_lowercase().contains(&wanted));
+                    .map(str::to_lowercase)
+                    .any(|filed| wanted.iter().any(|name| filed.contains(name.as_str())));
                 if !matches_project {
                     continue;
                 }
@@ -728,6 +732,36 @@ mod tests {
             store.apply(&source, true, &messages, &[]).unwrap();
         }
         (store, dir)
+    }
+
+    #[test]
+    fn a_project_filter_follows_its_other_names() {
+        let (mut store, dir) = store_with(
+            "aliases",
+            &[
+                ("old", &[("user", "Le planificateur doit publier les carrousels à l'heure prévue")]),
+                ("new", &[("user", "Le planificateur doit aussi publier les reels à l'heure prévue")]),
+                ("else", &[("user", "Le planificateur de tâches du serveur tourne toutes les heures")]),
+            ],
+        );
+        store.set_identity("old", Some("planner"), None, true).unwrap();
+        store.set_identity("new", Some("monapp"), None, true).unwrap();
+        store.set_identity("else", Some("infra"), None, true).unwrap();
+        let search = |aliases: &[&str]| -> Vec<String> {
+            let options = SearchOptions {
+                query: "planificateur publier".to_string(),
+                limit: 10,
+                project: Some("monapp".to_string()),
+                project_aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+                ..SearchOptions::default()
+            };
+            let mut ids: Vec<String> = store.search(&options).unwrap().into_iter().map(|hit| hit.conversation_id).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(search(&[]), vec!["new".to_string()]);
+        assert_eq!(search(&["planner"]), vec!["new".to_string(), "old".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

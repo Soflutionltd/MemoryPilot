@@ -213,7 +213,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Confidence scoring | Embedding similarity | LLM-based merge |
 | HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
-| MCP tools | 71 tools, 23 exposed by default (the rest behind `memory_admin`) | 47 tools | **65 tools** | N/A | Limited MCP server |
+| MCP tools | 72 tools, 23 exposed by default (the rest behind `memory_admin`) | 47 tools | **65 tools** | N/A | Limited MCP server |
 | Hooks / event capture | SessionStart auto-recall for **Cursor, Claude Code and Codex**, per-prompt recall (Claude Code), conversation index at session end, opt-in Stop auto-ingest (incremental, distilled, agent narration filtered, secrets redacted) + file watcher | No | **12 named hooks** (Claude Code, Cursor, Codex, Copilot CLI…) | No | No |
 | Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |
 | Language | Rust (single binary, zero deps) | Python (pip install) | TypeScript / Node (npm install) | SaaS | Python + Neo4j |
@@ -498,7 +498,7 @@ MemoryPilot --backfill
 MemoryPilot --backfill-force
 ```
 
-## MCP Tools (23 by default, 71 in the full profile)
+## MCP Tools (23 by default, 72 in the full profile)
 
 ### Core
 

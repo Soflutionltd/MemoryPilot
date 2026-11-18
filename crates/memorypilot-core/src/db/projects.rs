@@ -503,7 +503,10 @@ impl Database {
                 |r| r.get(0),
             )
             .unwrap_or(0);
+        let aliases = self.name_aliases(&canonical_name);
         Ok(Project {
+            remote: self.project_remote(&canonical_name),
+            aliases,
             name: canonical_name,
             path: project_root,
             description: description.map(String::from),
@@ -516,12 +519,12 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT p.name, p.path, p.description, p.created_at, COUNT(m.id) as cnt
+                "SELECT p.name, p.path, p.description, p.created_at, COUNT(m.id) as cnt, p.remote
              FROM projects p LEFT JOIN memories m ON m.project = p.name
              GROUP BY p.name ORDER BY cnt DESC",
             )
             .map_err(|e| format!("List projects: {}", e))?;
-        let projects = stmt
+        let mut projects: Vec<Project> = stmt
             .query_map([], |row| {
                 Ok(Project {
                     name: row.get(0)?,
@@ -529,12 +532,68 @@ impl Database {
                     description: row.get(2)?,
                     created_at: row.get(3)?,
                     memory_count: row.get(4)?,
+                    remote: row.get(5)?,
+                    aliases: Vec::new(),
                 })
             })
             .map_err(|e| format!("Projects: {}", e))?
             .filter_map(|r| r.ok())
             .collect();
+        for project in &mut projects {
+            project.aliases = self.name_aliases(&project.name);
+        }
         Ok(projects)
+    }
+
+    /// The names recorded as meaning `project`, in alphabetical order.
+    pub fn name_aliases(&self, project: &str) -> Vec<String> {
+        let Ok(mut statement) =
+            self.conn.prepare("SELECT alias FROM project_aliases WHERE kind = 'name' AND project = ?1 ORDER BY alias")
+        else {
+            return Vec::new();
+        };
+        statement.query_map(params![project], |row| row.get(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    /// The project a name given by a caller means: its canonical spelling,
+    /// then the project that name is an alias of. `None` for the global
+    /// scope. An alias wins over a project recreated under the same name,
+    /// as in `detect_project`.
+    pub fn resolve_project(&self, name: &str) -> Option<String> {
+        let mut current = Self::canonical_project_name(name)?;
+        // An alias may point to a project that was itself merged later.
+        for _ in 0..4 {
+            match self.project_for_alias("name", &current) {
+                Some(target) if target != current => current = target,
+                _ => break,
+            }
+        }
+        Some(current)
+    }
+
+    /// Records that `alias` is another name of `project`, so that reads
+    /// and writes under either name reach the same project. A name that
+    /// already holds memories is not an alias: it has to be merged.
+    pub fn add_name_alias(&self, alias: &str, project: &str) -> Result<Project, String> {
+        let alias = Self::canonical_project_name(alias).ok_or("alias: project name required")?;
+        let project = self.resolve_project(project).ok_or("project: project name required")?;
+        if alias == project {
+            return Err(format!("{} is already the name of the project", alias));
+        }
+        if !self.project_is_known(&project) {
+            return Err(format!("Unknown project {}: create it first (register_project or a first memory)", project));
+        }
+        if self.project_is_known(&alias) {
+            return Err(format!(
+                "{} is a project holding data: use merge_projects (source {}, target {}), which keeps the name as an alias",
+                alias, alias, project
+            ));
+        }
+        Self::add_project_alias(&self.conn, "name", &alias, &project)?;
+        self.list_projects()?
+            .into_iter()
+            .find(|listed| listed.name == project)
+            .ok_or_else(|| format!("Project {} has no row: register it with register_project", project))
     }
 
     /// The project already known for a folder: a registered folder, a former

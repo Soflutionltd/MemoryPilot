@@ -569,3 +569,37 @@ fn a_project_recreated_under_an_alias_is_reported_for_merge() {
     assert_eq!(same[0]["fix"]["args"]["source"], "ratatoskr");
     assert_eq!(same[0]["fix"]["args"]["target"], "courly");
 }
+
+#[test]
+fn a_name_alias_leads_reads_and_writes_to_one_project() {
+    let workspace = Workspace::new("manual-alias");
+    let db = workspace.open();
+    db.register_project("courly", &workspace.repository("App/courly", "git@github.com:acme/courly.git").to_string_lossy(), None)
+        .expect("register");
+    add(&db, "The sidebar lists accounts by unread count.", "fact", "courly");
+
+    let project = db.add_name_alias("Mail Client", "courly").expect("alias");
+    assert_eq!(project.aliases, vec!["mail-client".to_string()]);
+    assert_eq!(project.remote.as_deref(), Some("github.com/acme/courly"));
+    assert_eq!(db.resolve_project("mail client").as_deref(), Some("courly"));
+    assert_eq!(db.resolve_project("courly").as_deref(), Some("courly"));
+    assert_eq!(db.resolve_project("unrelated").as_deref(), Some("unrelated"));
+    assert_eq!(db.resolve_project("global"), None);
+    assert_eq!(db.list_projects().expect("projects")[0].aliases, vec!["mail-client".to_string()]);
+}
+
+#[test]
+fn a_name_holding_memories_is_merged_not_aliased() {
+    let workspace = Workspace::new("alias-refused");
+    let db = workspace.open();
+    seed_project(&db, "courly");
+    seed_project(&db, "ratatoskr");
+
+    let refused = db.add_name_alias("ratatoskr", "courly").expect_err("holds data");
+    assert!(refused.contains("merge_projects"), "{refused}");
+    assert!(db.add_name_alias("courly", "courly").is_err());
+    assert!(db.add_name_alias("mailer", "never-seen").expect_err("unknown").contains("Unknown project"));
+    // After the merge the old name is an alias, and an alias of it follows.
+    db.merge_projects("ratatoskr", "courly", false).expect("merge");
+    assert_eq!(db.resolve_project("Ratatoskr").as_deref(), Some("courly"));
+}
