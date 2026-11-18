@@ -18,18 +18,34 @@ fn open_store() -> ConversationStore {
     }
 }
 
-/// `--index-conversations [--no-embed]`: full catch-up, then embeddings.
+/// `--index-conversations [--no-embed] [--rebuild]`: full catch-up, then
+/// embeddings. `--rebuild` reads every conversation again from its source.
 pub fn run_index(args: &[String]) {
     let mut store = open_store();
+    if args.iter().any(|a| a == "--rebuild") {
+        match store.forget_what_was_read() {
+            Ok(origins) => eprintln!("rebuild: {} conversations and sub-agents will be read again", origins),
+            Err(error) => {
+                eprintln!("✗ {}", error);
+                std::process::exit(1);
+            }
+        }
+    }
     let report = conversations::sync(&mut store, &SyncOptions { budget: None });
     println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
     // A conversation belongs to the project of its folder or repository,
     // whatever the folder is called today.
     match Database::open() {
-        Ok(db) => match store.assign_known_projects(&|folder| db.known_project_for_path(folder)) {
-            Ok(changed) => eprintln!("filed {} conversations under the project of their folder", changed),
-            Err(error) => eprintln!("⚠ {}", error),
-        },
+        Ok(db) => {
+            match store.assign_known_projects(&|folder| db.known_project_for_path(folder)) {
+                Ok(changed) => eprintln!("filed {} conversations under the project of their folder", changed),
+                Err(error) => eprintln!("⚠ {}", error),
+            }
+            match db.record_submissions(&store) {
+                Ok(added) => eprintln!("recorded {} requests typed on third-party sites, to confirm", added),
+                Err(error) => eprintln!("⚠ {}", error),
+            }
+        }
         Err(error) => eprintln!("⚠ projects not assigned: {}", error),
     }
     if !args.iter().any(|a| a == "--no-embed") {

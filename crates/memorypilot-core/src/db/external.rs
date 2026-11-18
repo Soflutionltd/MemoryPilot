@@ -252,6 +252,45 @@ impl Database {
     }
 }
 
+impl Database {
+    /// What the conversation index found typed on a site known for
+    /// requests (`conversations::submissions`, plus the sites of the
+    /// `external_hosts` setting) becomes an external request to confirm,
+    /// once. Returns how many were added.
+    pub fn record_submissions(&self, store: &crate::conversations::ConversationStore) -> Result<usize, String> {
+        let mut hosts: Vec<String> =
+            crate::conversations::submissions::DEFAULT_HOSTS.iter().map(|host| host.to_string()).collect();
+        if let Some(more) = self.get_config("external_hosts") {
+            hosts.extend(
+                more.split(',').map(|host| host.trim().trim_start_matches("www.").to_lowercase()).filter(|host| !host.is_empty()),
+            );
+        }
+        let mut added = 0;
+        for submission in store.unreported_submissions(&hosts)? {
+            let request = submission.request.split_whitespace().collect::<Vec<_>>().join(" ");
+            let subject = crate::text::preview(&request, 140);
+            let project = submission.project.as_deref().and_then(|project| self.resolve_project(project));
+            let details = format!(
+                "Found in the actions of conversation {}: text was typed on {}. Not confirmed: check it was sent, then update or close it.",
+                submission.conversation_id, submission.host
+            );
+            let new = NewExternalRequest {
+                destination: &submission.host,
+                subject: if subject.is_empty() { "Request typed on this site" } else { &subject },
+                url: Some(&submission.url),
+                sent_at: submission.at.as_deref(),
+                project: project.as_deref(),
+                details: Some(&details),
+                detected: Some("session"),
+            };
+            self.log_external_request(&new, &MemoryScope::default())?;
+            store.mark_submission_reported(&submission.source_key)?;
+            added += 1;
+        }
+        Ok(added)
+    }
+}
+
 /// One line per request still waiting, for the recall of a session.
 pub(super) fn waiting_lines(requests: &[ExternalRequest], max: usize) -> Vec<String> {
     requests
@@ -339,6 +378,60 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].last_reply_at.as_deref(), Some("2026-11-20"));
         assert!(db.get_memory(&request.id).expect("get").expect("memory").content.contains("last reply 2026-11-20"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_post_typed_in_a_past_session_becomes_a_request_to_confirm_once() {
+        use crate::conversations::{ConversationStore, Message, Role, SourceConversation};
+        let (db, dir) = open("session");
+        let mut store = ConversationStore::open(&dir.join("conversations.db")).expect("store");
+        let source = SourceConversation {
+            origin_id: "c1".to_string(),
+            root_id: "c1".to_string(),
+            tool: "cursor",
+            title: None,
+            workspace: None,
+            created_at: None,
+            version: "1".to_string(),
+            source_path: None,
+        };
+        let turn = [
+            Message {
+                key: "u".to_string(),
+                role: Role::User,
+                at: Some("2026-10-12T10:00:00.000Z".to_string()),
+                order: None,
+                text: "Poste la question sur la musique d'une publication programmée dans leur communauté".to_string(),
+                actions: Vec::new(),
+            },
+            Message {
+                key: "a".to_string(),
+                role: Role::Assistant,
+                at: Some("2026-10-12T10:05:00.000Z".to_string()),
+                order: None,
+                text: String::new(),
+                actions: vec![
+                    "navigate: https://developers.facebook.com/community/threads/new/".to_string(),
+                    "form_input: Music on a scheduled Instagram post".to_string(),
+                ],
+            },
+        ];
+        store.apply(&source, true, &turn, &[]).expect("apply");
+
+        assert_eq!(db.record_submissions(&store).expect("record"), 1);
+        let waiting = db.external_requests(None, true).expect("pending");
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].destination, "developers.facebook.com");
+        assert_eq!(waiting[0].detected.as_deref(), Some("session"));
+        assert_eq!(waiting[0].sent_at, "2026-10-12T10:05:00.000Z");
+        assert!(waiting[0].subject.starts_with("Poste la question sur la musique"));
+        assert!(waiting_lines(&waiting, 5)[0].contains(", to confirm)"));
+
+        // Closed by the user, it is not proposed again at the next indexing.
+        db.update_external_request(&waiting[0].id, Some("closed"), None, None).expect("close");
+        assert_eq!(db.record_submissions(&store).expect("again"), 0);
+        assert_eq!(db.external_requests(None, false).expect("all").len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

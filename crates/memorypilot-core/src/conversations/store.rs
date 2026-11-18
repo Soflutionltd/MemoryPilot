@@ -100,6 +100,7 @@ impl ConversationStore {
         )
         .map_err(|error| format!("Conversations schema: {}", error))?;
         conn.execute_batch(super::coverage::SCHEMA).map_err(|error| format!("Conversations schema (coverage): {}", error))?;
+        conn.execute_batch(super::submissions::SCHEMA).map_err(|error| format!("Conversations schema (submissions): {}", error))?;
         // Added after the first release of the index: set when the project
         // comes from the folder or its repository, which the mentions
         // counted in the messages must not overrule.
@@ -142,7 +143,7 @@ impl ConversationStore {
 
     /// Writes one origin's new messages and marks `seen` as read, in one
     /// transaction so an interrupted sync never skips a message.
-    pub(super) fn apply(
+    pub(crate) fn apply(
         &mut self,
         source: &SourceConversation,
         is_main: bool,

@@ -15,6 +15,7 @@ pub mod cursor;
 pub mod imported;
 pub mod search;
 pub mod store;
+pub mod submissions;
 pub mod text;
 
 pub use search::{ConversationHit, ConversationMessage, SearchOptions};
