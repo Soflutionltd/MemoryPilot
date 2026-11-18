@@ -301,7 +301,7 @@ fn all_tool_definitions() -> Value {
                     "kind": { "type": ["string","null"] },
                     "tags": { "type": ["array","null"], "items": { "type": "string" } },
                     "answer": { "type": "boolean", "default": false, "description": "Run the extractive reader on the top-5 passages." },
-                    "compact": { "type": "boolean", "default": false, "description": "For building a context out of many results (limit 30 to 50): the reranker rescores the first 64 candidates, memories tagged `role:assistant` ranked after the third (the tenth when the query asks what the assistant said) are cut to 150 characters (`cut: true`, full text with get_memory), and each result carries only id, content, kind, project and tags. Slower than a plain search." }
+                    "compact": { "type": "boolean", "default": false, "description": "For building a context out of many results (limit 30 to 50): the reranker rescores the first 64 candidates, memories tagged `role:assistant` ranked after the third (the tenth when the query asks what the assistant said) are cut to 150 characters (`cut: true`, full text with get_memory), a query asking for a total or an order (\"in total\", \"order of\", \"dans quel ordre\") gets two fifths more results than `limit` (50 becomes 70), and each result carries only id, content, kind, project and tags. Slower than a plain search." }
                 },
                 "required": ["query"]
             }
@@ -1604,6 +1604,7 @@ fn handle_search(db: &Database, args: &Value) -> Value {
 
     let now = chrono::Utc::now();
     let found = if compact {
+        let limit = crate::db::compact_limit(query, limit);
         db.search_wide_at(now, query, limit, project, kind, tags.as_deref(), wk_ref)
     } else {
         db.search_at(now, query, limit, project, kind, tags.as_deref(), wk_ref)

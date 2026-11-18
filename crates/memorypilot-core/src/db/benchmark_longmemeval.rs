@@ -1,4 +1,4 @@
-use super::{compact_cuts, cut_text, CompactOptions, SearchConfidence, SearchResult};
+use super::{compact_cuts, compact_limit, cut_text, CompactOptions, SearchConfidence, SearchResult};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,21 @@ pub struct LongMemEvalOptions {
     /// The searches that feed a context (coverage and end-to-end) rescore
     /// the first 64 candidates, as `search_memory` does with `compact`.
     pub wide_rerank: bool,
+    /// Calibration of the compact depth: every "how many" question, a total
+    /// or an order gets twice `limit` (50 becomes 100) instead of the
+    /// engine's two fifths more for a total or an order alone.
+    pub compact_counts: bool,
+}
+
+/// Turns a compact context gets for `question`: the engine's depth, or the
+/// calibration one with `compact_counts`.
+fn compact_depth(question: &str, limit: usize, counts: bool) -> usize {
+    let lower = question.to_lowercase();
+    if counts && (super::search::asks_for_whole_set(question) || lower.contains("how many") || lower.contains("combien")) {
+        (limit * 2).min(super::search::MAX_SEARCH_LIMIT)
+    } else {
+        compact_limit(question, limit)
+    }
 }
 
 /// Settings of the end-to-end evaluation (see [`crate::llm`]).
@@ -497,7 +512,9 @@ impl Database {
                 // A separate search for a larger context: the first ten, and
                 // the retrieval metrics computed on them, stay what they are.
                 let deeper = if e2e.context_turns > 10 {
-                    match Self::lme_context_search(&db, options.wide_rerank, question_now, question, e2e.context_turns) {
+                    // A compact context gets the engine's own depth for this question.
+                    let turns = if options.wide_rerank { compact_depth(question, e2e.context_turns, options.compact_counts) } else { e2e.context_turns };
+                    match Self::lme_context_search(&db, options.wide_rerank, question_now, question, turns) {
                         Ok((deeper, _)) => Some(deeper),
                         Err(error) => {
                             cleanup_lme_db(&tmp_path);
@@ -597,6 +614,9 @@ impl Database {
             let result_ids: Vec<&str> = results.iter().map(|r| r.memory.id.as_str()).collect();
             if let Some(deepest) = options.coverage_depths.iter().copied().max() {
                 // A separate search: a larger limit may reorder the first ten.
+                // A compact search reaches deeper for a total or an order:
+                // the rows keep every returned turn, priced at that depth.
+                let deepest = if options.wide_rerank { compact_depth(question, deepest, options.compact_counts) } else { deepest };
                 match Self::lme_context_search(&db, options.wide_rerank, question_now, question, deepest) {
                     Ok((deep, _)) => {
                         let ids: Vec<&str> = deep.iter().map(|r| r.memory.id.as_str()).collect();
@@ -650,6 +670,8 @@ impl Database {
                             "question_type": question_type,
                             // Assistant turns a compact context keeps whole for this question.
                             "assistant_full_top": CompactOptions::default().for_query(question).full_top,
+                            // How many turns a compact context of 10 would get for it (10: no extension).
+                            "compact_depth_of_10": if options.wide_rerank { compact_depth(question, 10, options.compact_counts) } else { 10 },
                             "gold_sessions": answer_session_ids.len(),
                             "turns_returned": ids.len(),
                             "gold_sessions_found_at": covered,

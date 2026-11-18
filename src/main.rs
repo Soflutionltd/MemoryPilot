@@ -754,6 +754,8 @@ fn run_benchmark_longmemeval(args: &[String]) {
         // `--every 5`: one question in five within each type.
         every: args.windows(2).find(|w| w[0] == "--every").and_then(|w| w[1].parse().ok()),
         wide_rerank: compact,
+        // `--compact-counts`: calibration of the compact depth (see LongMemEvalOptions).
+        compact_counts: args.iter().any(|a| a == "--compact-counts"),
     };
     match db::Database::benchmark_longmemeval(dataset_path, options) {
         Ok(report) => {
@@ -1351,7 +1353,7 @@ fn print_help() {
     println!("  MemoryPilot --benchmark-longmemeval [PATH] [--limit N] [--min-r5 PCT] [--reader] [--e2e] [--coverage 10,20,30] [--every N]  LongMemEval retrieval benchmark (--coverage: every gold session within the first N turns, no LLM; --every: one question in N per type; with --e2e: --cot, --answer-max-tokens N, --context-turns N, --neighbors K, --assistant-full-top M [--assistant-chars K] (assistant turns ranked after the first M cut to K characters, left out without K); --rejudge FILE: grade again the answers saved by an --e2e run with --judge-model, no search and no reader call)");
     println!("      --reader  Extractive reader on the top 5, SQuAD-style exact match / F1 against the gold answer");
     println!("      --e2e     End-to-end accuracy: an LLM answers from the top 10, an LLM judge grades it (official LongMemEval prompts)");
-    println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot] [--compact] (context built as `search_memory` does with `compact`: rerank over 64, assistant turns after the third cut to 150 characters) [--reading-guide] (step-by-step prompt with our own reading instructions, not the official wording)", db::OFFICIAL_JUDGE_MODEL);
+    println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot] [--compact] (context built as `search_memory` does with `compact`: rerank over 64, assistant turns after the third cut to 150 characters, two fifths more turns for a total or an order) [--compact-counts] (calibration: twice the turns for every \"how many\", total or order question) [--reading-guide] (step-by-step prompt with our own reading instructions, not the official wording)", db::OFFICIAL_JUDGE_MODEL);
     println!("                API key from MEMORYPILOT_LLM_API_KEY or OPENAI_API_KEY; not needed for an http://localhost endpoint");
     println!("  MemoryPilot --benchmark-fr [--min-r5 PCT]  French retrieval benchmark (30 in-memory scenarios)");
     println!("  MemoryPilot --benchmark-concurrency [--clients N] [--queries-per-client N] [--seed-memories N]  Multi-client concurrent search throughput");

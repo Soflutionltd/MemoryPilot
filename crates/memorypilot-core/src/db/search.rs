@@ -107,6 +107,33 @@ fn contains_phrase(text: &str, phrase: &str) -> bool {
     })
 }
 
+/// Phrases of a query that needs every occurrence of something, a total or
+/// an order, in English and French, lowercased with a straight apostrophe.
+const WHOLE_SET_QUERY_MARKERS: &[&str] = &[
+    "total", "order of", "earliest", "en tout", "dans quel ordre", "ordre chronologique",
+    "du plus ancien", "le plus ancien", "la plus ancienne",
+];
+
+/// Whether `query` asks for a total or an order ("how much in total", "the
+/// order of the trips, from earliest to latest", "dans quel ordre").
+pub fn asks_for_whole_set(query: &str) -> bool {
+    let lower = query.to_lowercase().replace(['\u{2019}', '\u{02BC}'], "'");
+    WHOLE_SET_QUERY_MARKERS.iter().any(|marker| contains_phrase(&lower, marker))
+}
+
+/// Results a compact search returns for `query` when asked for `limit`: two
+/// fifths more (50 becomes 70) for a total or an order, whose evidence is
+/// spread over many turns. On LongMemEval-S that lifts 2 of 470 questions
+/// to complete for 3% more tokens on average (41 questions extended);
+/// extending every "how many" question too would cost 15% for 2 more.
+pub fn compact_limit(query: &str, limit: usize) -> usize {
+    if asks_for_whole_set(query) {
+        (limit * 7).div_ceil(5).min(MAX_SEARCH_LIMIT)
+    } else {
+        limit
+    }
+}
+
 impl CompactOptions {
     /// These options for `query`: when it asks what the assistant said, the
     /// reply that holds the answer is kept whole down to the tenth rank.
@@ -833,7 +860,7 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
 
 #[cfg(test)]
 mod pool_tests {
-    use super::{asks_about_assistant, candidate_pool, final_order, CompactOptions};
+    use super::{asks_about_assistant, asks_for_whole_set, candidate_pool, compact_limit, final_order, CompactOptions};
     use crate::db::{Memory, SearchResult};
     use std::collections::HashMap;
 
@@ -896,6 +923,20 @@ mod pool_tests {
         assert_eq!(defaults.for_query("Where did I park?"), defaults);
         let wider = CompactOptions { full_top: 20, chars: 150 };
         assert_eq!(wider.for_query("What did you recommend?").full_top, 20);
+    }
+
+    #[test]
+    fn a_total_or_an_order_gets_a_deeper_compact_list() {
+        assert!(asks_for_whole_set("How much did I spend in total on the bike?"));
+        assert!(asks_for_whole_set("What is the order of the three trips, from earliest to latest?"));
+        assert!(asks_for_whole_set("Dans quel ordre ai-je visité ces musées ?"));
+        assert!(!asks_for_whole_set("How many doctors did I visit?"));
+        assert!(!asks_for_whole_set("What did I order for dinner?"));
+        assert!(!asks_for_whole_set("Is the totality of the lease paid?"));
+        assert_eq!(compact_limit("How much in total?", 50), 70);
+        assert_eq!(compact_limit("How much in total?", 30), 42);
+        assert_eq!(compact_limit("How much in total?", 90), 100);
+        assert_eq!(compact_limit("Where did I park?", 50), 50);
     }
 
     #[test]
