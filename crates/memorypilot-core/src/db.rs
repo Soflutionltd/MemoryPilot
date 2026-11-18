@@ -39,6 +39,8 @@ mod conflicts;
 mod supersede;
 #[path = "db/verification.rs"]
 mod verification;
+#[path = "db/benchmark_usage.rs"]
+mod benchmark_usage;
 #[path = "db/external.rs"]
 mod external;
 pub use external::{ExternalRequest, NewExternalRequest, EXTERNAL_REQUEST_KIND, EXTERNAL_STATUSES};

@@ -172,6 +172,10 @@ fn main() {
         run_benchmark_longmemeval(&args);
         return;
     }
+    if args.iter().any(|a| a == "--benchmark-usage") {
+        run_benchmark_usage();
+        return;
+    }
     if args.iter().any(|a| a == "--benchmark-fr") {
         run_benchmark_fr(&args);
         return;
@@ -802,6 +806,26 @@ fn parse_percent(value: &str) -> Option<f64> {
     value.trim().trim_end_matches('%').parse::<f64>().ok()
 }
 
+/// `--benchmark-usage`: the failures met in real use, replayed. Exits
+/// with 2 when a case fails.
+fn run_benchmark_usage() {
+    eprintln!("[BenchUsage] Replaying real failures...");
+    match db::Database::benchmark_usage() {
+        Ok(report) => {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+            if report["passed"] != report["total"] {
+                eprintln!("✗ BenchUsage: {} of {} cases pass", report["passed"], report["total"]);
+                std::process::exit(2);
+            }
+            eprintln!("[BenchUsage] {} of {} cases pass", report["passed"], report["total"]);
+        }
+        Err(error) => {
+            eprintln!("✗ BenchUsage failed: {}", error);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_benchmark_fr(args: &[String]) {
     eprintln!("[BenchFR] Starting French retrieval benchmark...");
     eprintln!("Embedding engine: {}", embedding::model_label());
@@ -1357,6 +1381,7 @@ fn print_help() {
     println!("                [--answer-model M] [--judge-model M] (default {}) [--llm-base-url URL] (any OpenAI-compatible endpoint) [--cot] [--compact] (context built as `search_memory` does with `compact`: rerank over 64, assistant turns after the third cut to 150 characters, two fifths more turns for a total or an order) [--compact-counts] (calibration: twice the turns for every \"how many\", total or order question) [--reading-guide] (step-by-step prompt with our own reading instructions, not the official wording)", db::OFFICIAL_JUDGE_MODEL);
     println!("                API key from MEMORYPILOT_LLM_API_KEY or OPENAI_API_KEY; not needed for an http://localhost endpoint");
     println!("  MemoryPilot --benchmark-fr [--min-r5 PCT]  French retrieval benchmark (30 in-memory scenarios)");
+    println!("  MemoryPilot --benchmark-usage             Real failures replayed (requests sent to third parties, missing sessions, aliases, unverified claims)");
     println!("  MemoryPilot --benchmark-concurrency [--clients N] [--queries-per-client N] [--seed-memories N]  Multi-client concurrent search throughput");
     println!("  MemoryPilot --benchmark-latency [--queries N] [--seed-memories N] [--db PATH]  Cold/warm search latency");
     println!("  MemoryPilot --footprint      What a client pays before any call: tools, schema size, instructions, LLM calls per write (JSON)");
