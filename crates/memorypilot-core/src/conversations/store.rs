@@ -99,6 +99,7 @@ impl ConversationStore {
             ",
         )
         .map_err(|error| format!("Conversations schema: {}", error))?;
+        conn.execute_batch(super::coverage::SCHEMA).map_err(|error| format!("Conversations schema (coverage): {}", error))?;
         // Added after the first release of the index: set when the project
         // comes from the folder or its repository, which the mentions
         // counted in the messages must not overrule.

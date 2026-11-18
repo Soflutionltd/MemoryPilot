@@ -262,6 +262,12 @@ fn note_active_conversation(agent: &str, payload: &Value) {
         &crate::active_session::own_ancestors(),
         chrono::Utc::now(),
     );
+    // The index is told a session ran today, to say so if it never reads it.
+    if let Ok(store) = memorypilot_core::conversations::ConversationStore::open_default() {
+        if let Err(error) = store.record_activity(&conversation, agent, first_workspace_root(payload).as_deref(), chrono::Utc::now()) {
+            log(&format!("activity: {}", error));
+        }
+    }
 }
 
 fn age_secs(path: &Path) -> Option<u64> {

@@ -10,6 +10,7 @@
 pub mod actions;
 pub mod archive;
 pub mod claude;
+pub mod coverage;
 pub mod cursor;
 pub mod imported;
 pub mod search;
@@ -105,6 +106,7 @@ pub fn sync(store: &mut ConversationStore, options: &SyncOptions) -> SyncReport 
         sync_claude(store, &mut report, &over_budget);
     }
     report.elapsed_ms = started.elapsed().as_millis();
+    store.record_sync(&report, chrono::Utc::now());
     report
 }
 

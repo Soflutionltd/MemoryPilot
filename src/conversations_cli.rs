@@ -370,9 +370,11 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
     let note = page.is_empty().then_some(
         "Nothing found. This does not prove it never happened: a session may be missing from the index, or written in another language or with other words. Say it was not found, not that it does not exist.",
     );
+    let coverage_warnings = store.coverage_warnings(None, chrono::Utc::now());
     let body = json!({
         "conversations": page,
         "note": note,
+        "coverage_warnings": coverage_warnings,
         "next_offset": has_more.then_some(offset + limit),
         "current_conversation_left_out": left_out,
         "related_memories": related_memories,
@@ -472,7 +474,13 @@ pub fn handle_search_in_conversation(args: &Value) -> Value {
             let note = messages.is_empty().then_some(
                 "No message matches. The index keeps each request and the answers of the agent, cut when long: try other words or the other language before concluding it is not there.",
             );
-            tool_result(&compact_json(json!({ "conversation_id": conversation_id, "messages": messages, "note": note })))
+            let coverage_warnings = store.coverage_warnings(Some(conversation_id), chrono::Utc::now());
+            tool_result(&compact_json(json!({
+                "conversation_id": conversation_id,
+                "messages": messages,
+                "note": note,
+                "coverage_warnings": coverage_warnings,
+            })))
         }
         Err(error) => tool_error(&error),
     }

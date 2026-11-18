@@ -29,12 +29,7 @@ pub const MAX_USER_CHARS: usize = 3_000;
 pub const MAX_ANSWER_CHARS: usize = 3_000;
 pub const MAX_NOTES_CHARS: usize = 1_500;
 
-/// What the user actually typed in a turn.
-pub fn clean_user_text(raw: &str) -> String {
-    truncate_chars(&typed_text(raw), MAX_USER_CHARS)
-}
-
-/// `clean_user_text` at full length, for the archive.
+/// What the user actually typed in a turn, at full length.
 pub fn typed_text(raw: &str) -> String {
     if let Some(inner) = between(raw, "<user_query>", "</user_query>") {
         return inner.trim().to_string();
@@ -277,13 +272,13 @@ mod tests {
     #[test]
     fn keeps_only_the_user_query() {
         let raw = "<timestamp>Wednesday</timestamp>\n<user_query>\nLa facture 141 est-elle due ?\n</user_query>";
-        assert_eq!(clean_user_text(raw), "La facture 141 est-elle due ?");
+        assert_eq!(typed_text(raw), "La facture 141 est-elle due ?");
     }
 
     #[test]
     fn strips_injected_blocks_without_user_query() {
         let raw = "<system_reminder>ignore</system_reminder>Relance le build <attached_files a=\"1\">x</attached_files>";
-        assert_eq!(clean_user_text(raw), "Relance le build");
+        assert_eq!(typed_text(raw), "Relance le build");
     }
 
     #[test]
