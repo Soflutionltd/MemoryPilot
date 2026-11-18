@@ -39,6 +39,9 @@ mod conflicts;
 mod supersede;
 #[path = "db/verification.rs"]
 mod verification;
+#[path = "db/unverified.rs"]
+mod unverified;
+pub use unverified::{claims_an_absence, is_unverified, metadata_for_claim, UNVERIFIED};
 
 /// Whether sealed credentials are decrypted on read (default no:
 /// `MEMORYPILOT_SECRETS=reveal`, or `MEMORYPILOT_HTTP_SECRETS=on` over HTTP).

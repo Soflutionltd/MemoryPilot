@@ -161,10 +161,13 @@ impl Database {
             .as_ref()
             .map(|p| format!(" | proj:{}", p))
             .unwrap_or_default();
+        // An unconfirmed "this never happened" must not read as a fact.
+        let unverified = if unverified::is_unverified(mem) { " unverified" } else { "" };
         format!(
-            "[{}:{}] {}{}{}{}",
+            "[{}:{}{}] {}{}{}{}",
             kind_short,
             mem.importance,
+            unverified,
             truncated.replace('\n', " "),
             id_str,
             tags_str,
@@ -549,9 +552,11 @@ impl Database {
                         } else {
                             0
                         };
+                    // An unconfirmed absence weighs like the least important memory.
+                    let importance = if unverified::is_unverified(&memory) { 1 } else { memory.importance };
                     let score = project_match
                         + (hint_overlap * 4)
-                        + (memory.importance * 2)
+                        + (importance * 2)
                         + memory.access_count.min(5);
                     (score, memory)
                 })

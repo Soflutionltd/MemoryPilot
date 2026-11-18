@@ -888,12 +888,12 @@ fn all_tool_definitions() -> Value {
         },
         {
             "name": "resolve_memory",
-            "description": "Record the lifecycle of a bug, problem or todo: open, resolved or verified, with the commit that fixed it and a note. Resolved and verified bugs leave the project brain; open clears a previous resolution.",
+            "description": "Record the lifecycle of a bug, problem or todo: open, resolved or verified, with the commit that fixed it and a note. Resolved and verified bugs leave the project brain; open clears a previous resolution. Also confirms a claim: a memory stating that something never happened is stored as unverified and ranks lower until it is set to verified here (or set a memory to unverified when it was written without proof).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
-                    "status": { "type": "string", "enum": ["open", "resolved", "verified"] },
+                    "status": { "type": "string", "enum": ["open", "resolved", "verified", "unverified"] },
                     "commit": { "type": "string", "description": "SHA of the fixing commit" },
                     "note": { "type": "string" }
                 },
@@ -1357,6 +1357,9 @@ fn handle_add(db: &Database, args: &Value) -> Value {
         });
     let expires_at = expires_at_owned.as_deref();
     let metadata = args.get("metadata").filter(|v| !v.is_null());
+    // "This never happened" is kept as an unconfirmed claim, not as a fact.
+    let claim_metadata = crate::db::metadata_for_claim(kind, content, metadata);
+    let metadata = claim_metadata.as_ref().or(metadata);
     let scope = scope_from_args(args);
 
     match db.add_memory(
@@ -1395,6 +1398,9 @@ fn handle_add_bulk(db: &Database, args: &Value) -> Value {
             if item.expires_at.is_none() {
                 item.expires_at = auto_ttl.map(|days| (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339());
             }
+        }
+        if let Some(metadata) = crate::db::metadata_for_claim(&item.kind, &item.content, item.metadata.as_ref()) {
+            item.metadata = Some(metadata);
         }
         if item.importance.is_none() {
             item.importance = Some(auto_imp);
@@ -1646,11 +1652,17 @@ fn handle_search(db: &Database, args: &Value) -> Value {
             let listed: Vec<Value> = if compact {
                 compact_results(query, &results)
             } else {
-                results.iter().map(|r| json!({
-                    "id": r.memory.id, "content": r.memory.content, "kind": r.memory.kind,
-                    "project": r.memory.project, "tags": r.memory.tags, "score": r.score, "importance": r.memory.importance,
-                    "sources": r.sources,
-                })).collect()
+                results.iter().map(|r| {
+                    let mut entry = json!({
+                        "id": r.memory.id, "content": r.memory.content, "kind": r.memory.kind,
+                        "project": r.memory.project, "tags": r.memory.tags, "score": r.score, "importance": r.memory.importance,
+                        "sources": r.sources,
+                    });
+                    if crate::db::is_unverified(&r.memory) {
+                        entry["status"] = json!(crate::db::UNVERIFIED);
+                    }
+                    entry
+                }).collect()
             };
             let mut output = json!({ "query": query, "count": results.len(),
                 "confidence": confidence,
@@ -1658,7 +1670,7 @@ fn handle_search(db: &Database, args: &Value) -> Value {
             });
             if confidence.abstain {
                 output["note"] = json!(
-                    "No stored memory answers this query with confidence; treat the results as loosely related context, not as an answer."
+                    "No stored memory answers this query with confidence; treat the results as loosely related context, not as an answer. Finding nothing does not prove that nothing happened: sessions may be missing from the index. Do not store 'it never happened' as a fact; say it was not found."
                 );
             }
             if want_answer && !confidence.abstain {
@@ -1712,6 +1724,9 @@ fn compact_results(query: &str, results: &[crate::db::SearchResult]) -> Vec<Valu
             });
             if shortened.is_some() {
                 entry["cut"] = json!(true);
+            }
+            if crate::db::is_unverified(memory) {
+                entry["status"] = json!(crate::db::UNVERIFIED);
             }
             entry
         })
@@ -2615,9 +2630,9 @@ pub fn footprint() -> Value {
 }
 
 pub fn server_instructions() -> String {
-    let mut text = String::from("CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials.");
+    let mut text = String::from("CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials.\n4. A search that finds nothing proves nothing: sessions may be missing from the index. Never store 'it never happened' or 'nothing was sent' as a fact; say it was not found, and where you looked.");
     if let Some(line) = crate::agent_skills::agents_dir().and_then(|root| crate::agent_skills::instructions_line(&root)) {
-        text.push_str("\n4. ");
+        text.push_str("\n5. ");
         text.push_str(&line);
     }
     text
@@ -2764,6 +2779,34 @@ mod tests {
 
     fn text_of(response: &Value) -> Value {
         serde_json::from_str(response["content"][0]["text"].as_str().expect("text")).expect("json")
+    }
+
+    #[test]
+    fn a_claim_that_nothing_happened_is_stored_and_shown_as_unverified() {
+        let dir = std::env::temp_dir().join(format!("mp-tools-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Database::open_at(&dir.join("memory.db")).expect("db");
+        let claim = "Musique des publications : aucune demande n'a jamais été envoyée au forum des développeurs.";
+        let added = text_of(&handle_tool_call(&db, "add_memory", &json!({ "content": claim, "kind": "fact", "project": "monapp" })));
+        assert_eq!(added["metadata"]["status"], "unverified", "{added}");
+        let id = added["id"].as_str().expect("id");
+        let fetched = text_of(&handle_tool_call(&db, "get_memory", &json!({ "id": id })));
+        assert_eq!(fetched["verification"]["status"], "unverified", "{fetched}");
+
+        let bulk = json!({ "memories": [
+            { "content": "Nothing was posted on the partner forum about scheduled posts.", "kind": "note", "project": "monapp" },
+            { "content": "The partner forum post about scheduled posts was sent on 12 October.", "kind": "note", "project": "monapp" },
+        ] });
+        handle_tool_call(&db, "add_memories", &bulk);
+        let listed = text_of(&handle_tool_call(&db, "list_memories", &json!({ "project": "monapp" }))).to_string();
+        assert_eq!(listed.matches("\"status\":\"unverified\"").count(), 2, "{listed}");
+
+        // Confirmed by someone, it is a fact again.
+        handle_tool_call(&db, "resolve_memory", &json!({ "id": id, "status": "verified" }));
+        let confirmed = text_of(&handle_tool_call(&db, "get_memory", &json!({ "id": id })));
+        assert_eq!(confirmed["verification"]["status"], "verified", "{confirmed}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

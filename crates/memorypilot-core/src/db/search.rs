@@ -785,6 +785,7 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
 
     crate::reranking::rerank_local(query, &mut results);
     let cross_score = crate::reranking::rerank_cross_encoder_if_enabled(query, &mut results);
+    unverified::demote_unverified(&mut results);
 
     // Reserve candidates enter below the weakest finalist, in RRF
     // order; only MMR can lift one into the top-`limit`.

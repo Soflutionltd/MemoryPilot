@@ -54,7 +54,7 @@ const RESOLVED_MARKERS: &[&str] = &[
     "resolved",
     "patched",
 ];
-pub(crate) const STATUSES: &[&str] = &["open", "resolved", "verified"];
+pub(crate) const STATUSES: &[&str] = &["open", "resolved", "verified", super::unverified::UNVERIFIED];
 const CLOSED_STATUSES: &[&str] = &["resolved", "verified"];
 const REPO_CACHE_TTL: Duration = Duration::from_secs(60);
 const ANNOTATION_BUDGET: Duration = Duration::from_millis(1500);
@@ -181,6 +181,10 @@ impl Database {
     /// nothing to report (no repository, nothing cited changed). With
     /// `detail`, always answers and lists more commits.
     pub fn verification(&self, memory: &Memory, detail: bool) -> Option<Value> {
+        // A status somebody stored needs no repository to be reported.
+        if super::unverified::is_unverified(memory) {
+            return Some(super::unverified::unverified_report());
+        }
         if !detail && !self.verification_enabled() {
             return None;
         }

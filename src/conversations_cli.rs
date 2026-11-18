@@ -355,8 +355,13 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
     let left_out = (hits.len() < found).then(|| current.clone()).flatten();
     let has_more = hits.len() > offset + limit;
     let page: Vec<Value> = hits.into_iter().skip(offset).take(limit).collect();
+    // An empty answer is read as "it never happened" unless told otherwise.
+    let note = page.is_empty().then_some(
+        "Nothing found. This does not prove it never happened: a session may be missing from the index, or written in another language or with other words. Say it was not found, not that it does not exist.",
+    );
     let body = json!({
         "conversations": page,
+        "note": note,
         "next_offset": has_more.then_some(offset + limit),
         "current_conversation_left_out": left_out,
         "related_memories": related_memories,
@@ -452,7 +457,12 @@ pub fn handle_search_in_conversation(args: &Value) -> Value {
             "No conversation {}: pass the full conversation_id returned by find_conversation",
             conversation_id
         )),
-        Ok(Some(messages)) => tool_result(&compact_json(json!({ "conversation_id": conversation_id, "messages": messages }))),
+        Ok(Some(messages)) => {
+            let note = messages.is_empty().then_some(
+                "No message matches. The index keeps each request and the answers of the agent, cut when long: try other words or the other language before concluding it is not there.",
+            );
+            tool_result(&compact_json(json!({ "conversation_id": conversation_id, "messages": messages, "note": note })))
+        }
         Err(error) => tool_error(&error),
     }
 }
