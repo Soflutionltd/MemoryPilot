@@ -105,6 +105,33 @@ impl Database {
     }
 }
 
+/// The ranked finalists cut back to `limit`. A wide list is read whole, in
+/// the reranker's order: diversity and session fusion push the turn that
+/// holds the answer, often the assistant reply right after the matching
+/// question, below the ranks a compact context keeps whole, and gain
+/// nothing at 40 or 50 results (LongMemEval-S, first 50 turns: every
+/// evidence turn present and whole for 97.0% of the questions, 93.8% with
+/// them). A default search still spreads its head over distinct sources.
+fn final_order(
+    query: &str,
+    mut results: Vec<SearchResult>,
+    vectors: &std::collections::HashMap<String, Vec<f32>>,
+    limit: usize,
+    wide: bool,
+) -> Vec<SearchResult> {
+    if wide {
+        results.truncate(limit);
+        return results;
+    }
+    crate::diversity::rerank_mmr(&mut results, vectors);
+    // The MMR reserve must not leak into session fusion: fusion only
+    // sees a pool wider than `limit` when the query asked for it.
+    if !crate::session_fusion::should_expand_candidates(query) {
+        results.truncate(limit);
+    }
+    crate::session_fusion::fuse_sessions(query, results, limit)
+}
+
 /// Finalists a search keeps before the cross-encoder: `limit`, or at least
 /// the wide rerank width when a caller asked for a wide rerank.
 fn candidate_pool(limit: usize, wide: bool) -> usize {
@@ -510,13 +537,14 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     // distinct candidate can still displace a near-duplicate.
     // A wide rerank needs that many finalists to rescore, whatever the
     // limit: the list is cut back to `limit` once they are ordered.
-    let pool = candidate_pool(limit, crate::reranking::wide_scope());
+    let wide = crate::reranking::wide_scope();
+    let pool = candidate_pool(limit, wide);
     let session_candidate_limit = if crate::session_fusion::should_expand_candidates(query) {
         (pool * 3).min(30).max(pool)
     } else {
         pool
     };
-    let mmr_reserve_limit = if crate::diversity::is_enabled() {
+    let mmr_reserve_limit = if !wide && crate::diversity::is_enabled() {
         (pool * crate::diversity::pool_multiplier()).min(24).max(pool)
     } else {
         0
@@ -720,13 +748,7 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
         _ => 0.0,
     };
 
-    crate::diversity::rerank_mmr(&mut results, &finalist_vectors);
-    // The MMR reserve must not leak into session fusion: fusion only
-    // sees a pool wider than `limit` when the query asked for it.
-    if !crate::session_fusion::should_expand_candidates(query) {
-        results.truncate(limit);
-    }
-    results = crate::session_fusion::fuse_sessions(query, results, limit);
+    results = final_order(query, results, &finalist_vectors, limit, wide);
 
     let confidence = if results.is_empty() {
         SearchConfidence::none()
@@ -753,7 +775,49 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
 
 #[cfg(test)]
 mod pool_tests {
-    use super::candidate_pool;
+    use super::{candidate_pool, final_order};
+    use crate::db::{Memory, SearchResult};
+    use std::collections::HashMap;
+
+    fn turn(id: &str, score: f64) -> SearchResult {
+        SearchResult {
+            memory: Memory {
+                id: id.to_string(),
+                content: String::new(),
+                kind: "fact".to_string(),
+                project: None,
+                tags: Vec::new(),
+                source: "test".to_string(),
+                importance: 3,
+                expires_at: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+                metadata: None,
+                last_accessed_at: None,
+                access_count: 0,
+            },
+            score,
+            sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_wide_list_keeps_the_reranker_order() {
+        std::env::remove_var("MEMORYPILOT_MMR");
+        // Three turns of one session first, then one turn of six others.
+        let ids = ["a__t0", "a__t1", "a__t2", "b__t0", "c__t0", "d__t0", "e__t0", "f__t0", "g__t0"];
+        let results: Vec<SearchResult> =
+            ids.iter().enumerate().map(|(index, id)| turn(id, 1.0 - index as f64 * 0.01)).collect();
+        // "what did" makes session fusion run on a default search.
+        let query = "what did I do last week";
+        let wide = final_order(query, results.clone(), &HashMap::new(), 5, true);
+        let order: Vec<&str> = wide.iter().map(|r| r.memory.id.as_str()).collect();
+        assert_eq!(order, ids[..5].to_vec(), "the session's turns stay where the reranker put them");
+        let default = final_order(query, results, &HashMap::new(), 5, false);
+        let order: Vec<&str> = default.iter().map(|r| r.memory.id.as_str()).collect();
+        assert_eq!(order.len(), 5);
+        assert_ne!(order, ids[..5].to_vec(), "a default search still spreads over sessions");
+    }
 
     #[test]
     fn a_wide_rerank_rescores_its_full_width_whatever_the_limit() {
