@@ -525,6 +525,7 @@ fn all_tool_definitions() -> Value {
                 "properties": {
                     "conversation_id": { "type": "string" },
                     "message_id": { "type": ["integer","null"] },
+                    "at": { "type": ["string","null"], "description": "Centre the page on this moment (RFC 3339), e.g. metadata.origin.at of a memory with its origin.conversation_id, to read what was said when it was written" },
                     "offset": { "type": "integer", "default": 0, "minimum": 0 },
                     "limit": { "type": "integer", "default": 6, "minimum": 1, "maximum": 50 }
                 },
@@ -1394,6 +1395,13 @@ fn handle_add(db: &Database, args: &Value) -> Value {
     // "This never happened" is kept as an unconfirmed claim, not as a fact.
     let claim_metadata = crate::db::metadata_for_claim(kind, content, metadata);
     let metadata = claim_metadata.as_ref().or(metadata);
+    // Where it comes from: the conversation it is written in.
+    let origin_metadata = crate::active_session::with_origin(
+        metadata,
+        crate::active_session::calling_conversation().as_deref(),
+        chrono::Utc::now(),
+    );
+    let metadata = origin_metadata.as_ref().or(metadata);
     let scope = scope_from_args(args);
 
     match db.add_memory(
@@ -1424,8 +1432,12 @@ fn handle_add_bulk(db: &Database, args: &Value) -> Value {
         Some(items) if !items.is_empty() => items,
         _ => return tool_error("memories array is required and cannot be empty"),
     };
+    let conversation = crate::active_session::calling_conversation();
     // Same auto-classification as add_memory when kind or importance is omitted.
     for (item, raw) in items.iter_mut().zip(raw_items.iter()) {
+        if let Some(metadata) = crate::active_session::with_origin(item.metadata.as_ref(), conversation.as_deref(), chrono::Utc::now()) {
+            item.metadata = Some(metadata);
+        }
         let (auto_imp, auto_kind, auto_ttl) = crate::gc::auto_classify(&item.content);
         if raw.get("kind").and_then(|v| v.as_str()).is_none() {
             item.kind = auto_kind.to_string();

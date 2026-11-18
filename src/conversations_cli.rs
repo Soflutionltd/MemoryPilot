@@ -315,7 +315,7 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
     // The conversation the caller is in holds the question just asked:
     // it is left out unless asked for.
     let include_current = args.get("include_current").and_then(Value::as_bool).unwrap_or(false);
-    let current = (!include_current).then(|| text("current_conversation_id").or_else(calling_conversation)).flatten();
+    let current = (!include_current).then(|| text("current_conversation_id").or_else(crate::active_session::calling_conversation)).flatten();
     let is_current = |hit: &Value| current.is_some() && hit.get("conversation_id").and_then(Value::as_str) == current.as_deref();
     let spare = usize::from(current.is_some());
 
@@ -398,19 +398,6 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
     tool_result(&compact_json(body))
 }
 
-/// The conversation of the agent calling this server, from the trace its
-/// hooks leave.
-fn calling_conversation() -> Option<String> {
-    static ANCESTORS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-    let workspace = std::env::current_dir().ok().map(|dir| dir.to_string_lossy().into_owned());
-    crate::active_session::current(
-        &crate::active_session::state_path(),
-        ANCESTORS.get_or_init(crate::active_session::own_ancestors),
-        workspace.as_deref(),
-        chrono::Utc::now(),
-    )
-}
-
 /// Results go straight into the agent's context: no indentation, no
 /// empty fields.
 fn compact_json(mut value: Value) -> String {
@@ -455,6 +442,14 @@ pub fn handle_read_conversation(args: &Value) -> Value {
     let store = match ConversationStore::open_default() {
         Ok(store) => store,
         Err(error) => return tool_error(&error),
+    };
+    // `at`: the page around a moment, as recorded in the origin of a memory.
+    let message_id = match (message_id, args.get("at").and_then(Value::as_str)) {
+        (None, Some(at)) => match store.message_at(conversation_id, at) {
+            Ok(found) => found,
+            Err(error) => return tool_error(&error),
+        },
+        (message_id, _) => message_id,
     };
     match store.read(conversation_id, message_id, offset, limit) {
         Ok((messages, _)) if messages.is_empty() && offset == 0 => tool_error(&format!(

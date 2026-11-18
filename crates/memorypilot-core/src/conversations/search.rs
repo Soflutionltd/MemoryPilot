@@ -10,7 +10,7 @@
 
 use super::store::{project_name, ConversationStore};
 use super::text;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -579,6 +579,25 @@ impl ConversationStore {
         Ok((messages, has_more.then_some(start + limit)))
     }
 
+    /// The last message of a conversation said at or before `at` (RFC
+    /// 3339), else its first one: where to read to see what was being
+    /// said at that moment.
+    pub fn message_at(&self, conversation_id: &str, at: &str) -> Result<Option<i64>, String> {
+        let moment = super::fold_timestamp(at).ok_or_else(|| format!("at: expected an RFC 3339 date, got '{}'", at))?;
+        let find = |sql: &str| -> Result<Option<i64>, String> {
+            self.conn
+                .query_row(sql, params![conversation_id, moment], |row| row.get(0))
+                .optional()
+                .map_err(|error| format!("Message at: {}", error))
+        };
+        match find(
+            "SELECT id FROM segments WHERE conversation_id = ?1 AND role != 'title' AND at <= ?2 ORDER BY at DESC, id DESC LIMIT 1",
+        )? {
+            Some(id) => Ok(Some(id)),
+            None => find("SELECT id FROM segments WHERE conversation_id = ?1 AND role != 'title' AND ?2 IS NOT NULL ORDER BY COALESCE(at, ''), id LIMIT 1"),
+        }
+    }
+
     /// Conversations that mention a commit, a file or an address (kind
     /// `url`: any address containing `value`, so a site name is enough).
     pub fn by_reference(&self, kind: &str, value: &str, limit: usize) -> Result<Vec<(String, i64)>, String> {
@@ -837,6 +856,16 @@ mod tests {
         assert_eq!(store.search_within("long", "musique", 1, false).unwrap().unwrap().len(), 1);
         assert!(store.search_within("long", "comptabilité", 10, false).unwrap().unwrap().is_empty());
         assert!(store.search_within("missing", "musique", 10, false).unwrap().is_none());
+
+        // Reading at a moment lands on the message being said then.
+        let at = |moment: &str| -> Option<String> {
+            let id = store.message_at("long", moment).unwrap()?;
+            store.read("long", Some(id), 0, 1).unwrap().0.first().map(|message| message.text.clone())
+        };
+        assert!(at("2026-10-12T10:02:30Z").unwrap().starts_with("Écris le message pour le forum"));
+        assert!(at("2026-01-01T00:00:00Z").unwrap().starts_with("Regarde pourquoi le carrousel"), "before the first: the first");
+        assert!(store.message_at("long", "hier").is_err());
+        assert_eq!(store.message_at("missing", "2026-10-12T10:02:30Z").unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

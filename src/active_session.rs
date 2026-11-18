@@ -109,6 +109,30 @@ pub fn current(
         .map(|entry| entry.conversation_id.clone())
 }
 
+/// The conversation of the agent calling this server, from the trace its
+/// hooks leave. `None` when no hook ran (an agent without hooks).
+pub fn calling_conversation() -> Option<String> {
+    static ANCESTORS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let workspace = std::env::current_dir().ok().map(|dir| dir.to_string_lossy().into_owned());
+    current(&state_path(), ANCESTORS.get_or_init(own_ancestors), workspace.as_deref(), chrono::Utc::now())
+}
+
+/// `metadata` with where a memory comes from: the conversation it is
+/// written in and when, so that a fact can be traced back to what was
+/// said (`read_conversation` with `at`). An origin already given is kept.
+pub fn with_origin(metadata: Option<&serde_json::Value>, conversation: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> Option<serde_json::Value> {
+    let conversation = conversation?;
+    if metadata.and_then(|m| m.get("origin")).is_some() {
+        return None;
+    }
+    let mut object = match metadata {
+        Some(serde_json::Value::Object(object)) => object.clone(),
+        _ => serde_json::Map::new(),
+    };
+    object.insert("origin".into(), serde_json::json!({ "conversation_id": conversation, "at": now.to_rfc3339() }));
+    Some(serde_json::Value::Object(object))
+}
+
 /// The chain of parents of `pid` in a `pid ppid` table, nearest first.
 fn chain(table: &str, pid: u32) -> Vec<u32> {
     let parents: std::collections::HashMap<u32, u32> = table
@@ -190,6 +214,18 @@ mod tests {
         assert_eq!(current(&path, &[60], Some("/work/other"), now), None);
         assert_eq!(current(&path, &[], None, now), None);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_memory_is_stamped_with_the_conversation_it_is_written_in() {
+        let now = chrono::Utc::now();
+        let stamped = with_origin(Some(&serde_json::json!({ "location": "src/main.rs" })), Some("conv-1"), now).expect("stamped");
+        assert_eq!(stamped["origin"]["conversation_id"], "conv-1");
+        assert_eq!(stamped["origin"]["at"], now.to_rfc3339());
+        assert_eq!(stamped["location"], "src/main.rs");
+        assert_eq!(with_origin(None, None, now), None, "no known conversation, nothing added");
+        let given = serde_json::json!({ "origin": { "conversation_id": "other" } });
+        assert_eq!(with_origin(Some(&given), Some("conv-1"), now), None, "an origin given by the caller is kept");
     }
 
     #[test]
