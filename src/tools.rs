@@ -301,7 +301,7 @@ fn all_tool_definitions() -> Value {
                     "kind": { "type": ["string","null"] },
                     "tags": { "type": ["array","null"], "items": { "type": "string" } },
                     "answer": { "type": "boolean", "default": false, "description": "Run the extractive reader on the top-5 passages." },
-                    "compact": { "type": "boolean", "default": false, "description": "For building a context out of many results (limit 30 to 50): the reranker rescores the first 64 candidates, memories tagged `role:assistant` ranked after the third are cut to 150 characters (`cut: true`, full text with get_memory), and each result carries only id, content, kind, project and tags. Slower than a plain search." }
+                    "compact": { "type": "boolean", "default": false, "description": "For building a context out of many results (limit 30 to 50): the reranker rescores the first 64 candidates, memories tagged `role:assistant` ranked after the third (the tenth when the query asks what the assistant said) are cut to 150 characters (`cut: true`, full text with get_memory), and each result carries only id, content, kind, project and tags. Slower than a plain search." }
                 },
                 "required": ["query"]
             }
@@ -1611,7 +1611,7 @@ fn handle_search(db: &Database, args: &Value) -> Value {
     match found {
         Ok((results, confidence)) => {
             let listed: Vec<Value> = if compact {
-                compact_results(&results)
+                compact_results(query, &results)
             } else {
                 results.iter().map(|r| json!({
                     "id": r.memory.id, "content": r.memory.content, "kind": r.memory.kind,
@@ -1664,8 +1664,8 @@ fn handle_search(db: &Database, args: &Value) -> Value {
 /// The results of a compact search: what the assistant said, past the
 /// first ranks, is cut short and marked, and only the fields a reader
 /// needs are kept.
-fn compact_results(results: &[crate::db::SearchResult]) -> Vec<Value> {
-    let options = crate::db::CompactOptions::default();
+fn compact_results(query: &str, results: &[crate::db::SearchResult]) -> Vec<Value> {
+    let options = crate::db::CompactOptions::default().for_query(query);
     let cuts = crate::db::compact_cuts(results, options);
     results
         .iter()

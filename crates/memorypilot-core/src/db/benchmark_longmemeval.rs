@@ -522,7 +522,7 @@ impl Database {
                 // shortens; the turn is then cut on its text without the date prefix.
                 let trimmed: Option<Vec<HaystackTurn>> = e2e.assistant_trim.map(|trim| {
                     let ranked: Vec<SearchResult> = found.iter().map(|result| (*result).clone()).collect();
-                    let cuts = compact_cuts(&ranked, CompactOptions { full_top: trim.full_top, chars: trim.chars });
+                    let cuts = compact_cuts(&ranked, CompactOptions { full_top: trim.full_top, chars: trim.chars }.for_query(question));
                     trim_assistant_turns(&retrieved, &cuts, trim.chars)
                 });
                 if let Some(trimmed) = trimmed.as_ref() {
@@ -648,6 +648,8 @@ impl Database {
                             "marked": marked,
                             "question_id": entry.get("question_id").and_then(|v| v.as_str()).unwrap_or(""),
                             "question_type": question_type,
+                            // Assistant turns a compact context keeps whole for this question.
+                            "assistant_full_top": CompactOptions::default().for_query(question).full_top,
                             "gold_sessions": answer_session_ids.len(),
                             "turns_returned": ids.len(),
                             "gold_sessions_found_at": covered,

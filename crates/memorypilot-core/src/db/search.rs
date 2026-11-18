@@ -61,6 +61,53 @@ impl Default for CompactOptions {
     }
 }
 
+/// Ranks within which assistant memories stay whole when the query asks
+/// what the assistant said. On LongMemEval-S (first 50 turns, wide rerank)
+/// such a reply ranked 4 to 10 for 5 of the 14 questions left incomplete.
+const ASSISTANT_QUERY_FULL_TOP: usize = 10;
+
+/// Phrases of a query about what the assistant said, in English and French,
+/// lowercased with a straight apostrophe.
+const ASSISTANT_QUERY_MARKERS: &[&str] = &[
+    "you said", "you told", "you suggested", "you recommended", "you mentioned",
+    "you gave", "you provided", "you listed", "you shared", "you explained",
+    "you described", "you wrote", "you came up", "you helped", "you offered",
+    "you proposed", "you made", "did you", "your suggestion", "your recommendation",
+    "your answer", "your response", "your advice", "your list", "remind me what",
+    "remind me of", "remind me which", "remind me the", "we discussed", "we talked",
+    "we chatted", "we spoke", "our conversation", "our chat", "our discussion",
+    "our previous", "previous conversation", "last conversation", "earlier conversation",
+    "previous chat", "last chat", "earlier chat",
+    "tu m'as", "m'as-tu", "m'avez-vous", "tu as dit", "tu as mentionné", "tu as suggéré", "tu as conseillé",
+    "tu as recommandé", "tu as proposé", "tu as donné", "tu as écrit", "tu as expliqué",
+    "vous m'avez", "vous avez dit", "vous avez mentionné", "vous avez suggéré",
+    "vous avez conseillé", "vous avez recommandé", "vous avez proposé", "ta réponse",
+    "ta suggestion", "ta recommandation", "ton conseil", "tes conseils", "votre réponse",
+    "votre suggestion", "votre recommandation", "vos conseils", "rappelle-moi ce que",
+    "rappelez-moi ce que", "notre conversation", "notre discussion", "notre échange",
+    "on a parlé", "on a discuté", "nous avons parlé", "nous avons discuté",
+    "conversation précédente", "dernière conversation",
+];
+
+/// Whether `query` asks what the assistant said ("what did you suggest",
+/// "rappelle-moi ce que tu m'as conseillé").
+pub fn asks_about_assistant(query: &str) -> bool {
+    let lower = query.to_lowercase().replace('\u{2019}', "'");
+    ASSISTANT_QUERY_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+impl CompactOptions {
+    /// These options for `query`: when it asks what the assistant said, the
+    /// reply that holds the answer is kept whole down to the tenth rank.
+    pub fn for_query(self, query: &str) -> Self {
+        if asks_about_assistant(query) {
+            Self { full_top: self.full_top.max(ASSISTANT_QUERY_FULL_TOP), ..self }
+        } else {
+            self
+        }
+    }
+}
+
 /// For each result, in rank order, whether a compact context shortens it:
 /// an assistant memory ranked after the first `full_top` and longer than
 /// `chars` characters.
@@ -775,7 +822,7 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
 
 #[cfg(test)]
 mod pool_tests {
-    use super::{candidate_pool, final_order};
+    use super::{asks_about_assistant, candidate_pool, final_order, CompactOptions};
     use crate::db::{Memory, SearchResult};
     use std::collections::HashMap;
 
@@ -817,6 +864,19 @@ mod pool_tests {
         let order: Vec<&str> = default.iter().map(|r| r.memory.id.as_str()).collect();
         assert_eq!(order.len(), 5);
         assert_ne!(order, ids[..5].to_vec(), "a default search still spreads over sessions");
+    }
+
+    #[test]
+    fn a_query_about_the_assistant_keeps_its_replies_whole_further_down() {
+        assert!(asks_about_assistant("Can you remind me what you suggested for the trip?"));
+        assert!(asks_about_assistant("Rappelle-moi ce que tu m\u{2019}as conseillé pour le voyage"));
+        assert!(!asks_about_assistant("How many projects did I lead this year?"));
+        assert!(!asks_about_assistant("Combien de projets ai-je menés cette année ?"));
+        let defaults = CompactOptions::default();
+        assert_eq!(defaults.for_query("What did you recommend for dinner?").full_top, 10);
+        assert_eq!(defaults.for_query("Where did I park?"), defaults);
+        let wider = CompactOptions { full_top: 20, chars: 150 };
+        assert_eq!(wider.for_query("What did you recommend?").full_top, 20);
     }
 
     #[test]
