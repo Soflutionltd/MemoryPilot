@@ -76,8 +76,7 @@ Evaluated on the 470 answerable questions of [LongMemEval-S](https://arxiv.org/a
 | System | QA accuracy | Context per question | Setup | Source |
 |--------|------------:|---------------------:|-------|--------|
 | Recallium (closed) | 98.4% | 12,600 tokens | Claude Opus 5.5 in an agentic harness, gpt-4o judge, whole sessions as the retrieval unit | [recallium.ai/benchmarks](https://recallium.ai/benchmarks), read 2026-11-17 |
-| **MemoryPilot, compact** | **97.2% (486/500)** | **6,047 tokens** | Claude Opus 5.5 as reader, gpt-4o-2024-08-06 judge, one search per question, no LLM call at write time | This repo, [`benchmarks/results/longmemeval-s`](benchmarks/results/longmemeval-s) |
-| **MemoryPilot, full turns** | **97.0% (485/500)** | 15,497 tokens | Same reader and judge, 50 turns returned whole | This repo, same folder |
+| **MemoryPilot** | **97.2% (486/500)** | **6,047 tokens** | Claude Opus 5.5 as reader, gpt-4o-2024-08-06 judge, one search per question, no LLM call at write time | This repo, [`benchmarks/results/longmemeval-s`](benchmarks/results/longmemeval-s) |
 | Maximem Synap | 95.6% | 7,400 tokens | Gemini 3.8 Flash as reader, gpt-4o judge | [maximem.ai/evals](https://www.maximem.ai/evals), read 2026-11-17 |
 | Mastra (observational memory) | 94.87% | not published | see source | [mastra.ai research](https://mastra.ai/research/observational-memory), read 2026-11-17 |
 | Hindsight | 94.6% | not published | see source | [vectorize-io/hindsight-benchmarks](https://github.com/vectorize-io/hindsight-benchmarks/blob/main/README.md), read 2026-11-17 |
@@ -86,20 +85,20 @@ Evaluated on the 470 answerable questions of [LongMemEval-S](https://arxiv.org/a
 | Zep / Graphiti (2025 paper) | 63.8% / 71.2% | not published | gpt-4o-mini / gpt-4o as reader, GPT-4o judge | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956), Table 2 |
 | Supermemory | 85.2% / 84.6% | not published | gemini-3-pro / gpt-5 as reader, LongMemEval-S, 500 questions | [supermemory.ai research](https://supermemory.ai/research/longmembench/), read 2026-11-16 |
 
-**MemoryPilot's end-to-end run (2026-11-18, `main` after v4.13.0).** All 500 questions, abstention included. MemoryPilot indexes each haystack turn by turn with no LLM call, answers one `search_memory` per question, and the 50 turns it returns go to the reader in the official LongMemEval prompt (`run_generation.py`, chain of thought on). The official judge prompts (`evaluate_qa.py`) grade the answers with `gpt-4o-2024-08-06` at temperature 0. In compact mode, assistant turns ranked after the third are cut to 150 characters, which brings the prompt from 15,497 to 6,047 tokens per question (measured: 3,023,706 prompt tokens over 500 questions) without losing accuracy.
+**MemoryPilot's end-to-end run (2026-11-18, `main` after v4.13.0).** All 500 questions, abstention included. MemoryPilot indexes each haystack turn by turn with no LLM call, answers one `search_memory` per question, and the 50 turns it returns go to the reader in the official LongMemEval prompt (`run_generation.py`, chain of thought on). The official judge prompts (`evaluate_qa.py`) grade the answers with `gpt-4o-2024-08-06` at temperature 0. The search is a compact one: assistant turns ranked after the third are cut to 150 characters, which keeps the prompt at 6,047 tokens per question (measured: 3,023,706 prompt tokens over 500 questions).
 
-| Question type | Compact (6,047 tokens) | Full turns (15,497 tokens) |
-|---------------|-----------------------:|---------------------------:|
-| knowledge-update (78) | 76 | 78 |
-| multi-session (133) | 124 | 126 |
-| single-session-assistant (56) | 56 | 54 |
-| single-session-preference (30) | 30 | 30 |
-| single-session-user (70) | 69 | 69 |
-| temporal-reasoning (133) | 131 | 128 |
-| **All (500)** | **486 (97.2%)** | **485 (97.0%)** |
-| of which abstention (30) | 27 | 30 |
+| Question type | Correct |
+|---------------|--------:|
+| knowledge-update (78) | 76 |
+| multi-session (133) | 124 |
+| single-session-assistant (56) | 56 |
+| single-session-preference (30) | 30 |
+| single-session-user (70) | 69 |
+| temporal-reasoning (133) | 131 |
+| **All (500)** | **486 (97.2%)** |
+| of which abstention (30) | 27 |
 
-Every answer and every verdict is in [`benchmarks/results/longmemeval-s`](benchmarks/results/longmemeval-s): for each mode, the run itself (search metrics, the reader's 500 answers, token counts) and the same answers graded by the official judge. The dataset is [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (MIT). To reproduce, with an API key in `MEMORYPILOT_LLM_API_KEY`:
+Every answer and every verdict is in [`benchmarks/results/longmemeval-s`](benchmarks/results/longmemeval-s): the run itself (search metrics, the reader's 500 answers, token counts) and the same answers graded by the official judge. The folder also holds an earlier run with the 50 turns returned whole (485/500 at 15,497 tokens per question). The dataset is [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (MIT). To reproduce, with an API key in `MEMORYPILOT_LLM_API_KEY`:
 
 ```bash
 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --e2e --cot --answer-max-tokens 1500 --context-turns 50 --compact --llm-base-url https://api.anthropic.com/v1 --answer-model claude-opus-5-5 --judge-model claude-haiku-5-5 > run.json
@@ -109,7 +108,7 @@ MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --e2e 
 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --rejudge run.json --llm-base-url https://api.openai.com/v1 > run-gpt4o.json
 ```
 
-Limits of this measure: one run per mode (the two modes differ by one question, which is within what a second run would move); the settings (50 turns, cut at 150 characters after rank 3) were chosen on this same question set, not on a held-out split; nobody outside this project has rerun it. The compact mode is on `main` and ships with the release after v4.13.0.
+Limits of this measure: a single run; the settings (50 turns, cut at 150 characters after rank 3) were chosen on this same question set, not on a held-out split; nobody outside this project has rerun it. The compact mode is on `main` and ships with the release after v4.13.0.
 
 > All figures are published by their own authors, none was reproduced independently, and the two tables cannot be compared with each other. On answer accuracy MemoryPilot is second to Recallium's published score and uses about half its context; on session-level recall MemoryPilot posts the highest published local score, by a margin smaller than the gap between this metric and a plain BM25 baseline. The protocol to settle a comparison: same 470 questions, same hardware, every system run by the same script, reporting `recall_any@5`, `recall_all@5`, turn-level evidence recall and end-to-end QA accuracy with a fixed reader and judge.
 
