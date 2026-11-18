@@ -7,7 +7,7 @@ const VALID_KINDS: &[&str] = crate::db::MEMORY_KINDS;
 
 // ─── Tool profile ────────────────────────────────────────────────────────
 // Every conversation loads the full tool list into the model's context
-// (51 tools ≈ 24 KB ≈ 6 000 tokens). The "core" profile exposes the tools
+// (74 tools ≈ 46 KB ≈ 11 500 tokens). The "core" profile exposes the tools
 // used day to day and routes everything else through `memory_admin`, so
 // nothing is lost. `MEMORYPILOT_TOOLS=full` or set_config tools_profile=full
 // restores the full list.
@@ -103,7 +103,9 @@ pub fn tool_definitions() -> Value {
                 "args": { "type": ["object","null"], "description": "Arguments of the action" }
             },
             "required": ["action"]
-        }
+        },
+        // It routes to every other action, the ones that remove included.
+        "annotations": annotations("Other MemoryPilot actions", Effect::Changes)
     }));
     json!({ "tools": core })
 }
@@ -137,7 +139,121 @@ fn handle_memory_admin(db: &Database, args: &Value) -> Value {
     handle_tool_call(db, action, &inner)
 }
 
+/// What a tool does to the store, as MCP tool annotations state it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Effect {
+    /// Reads only: nothing the user stored is changed.
+    Reads,
+    /// Adds or marks, never replaces or removes what was stored.
+    Adds,
+    /// May replace, merge, hide or remove what was stored.
+    Changes,
+}
+
+/// The title and effect of every tool. Clients show the title and decide
+/// from the effect whether to ask before a call (a directory listing
+/// requires both on each tool).
+const TOOL_ANNOTATIONS: &[(&str, &str, Effect)] = &[
+    ("recall", "Recall context", Effect::Reads),
+    ("remember_working", "Remember for this session", Effect::Adds),
+    ("recall_working", "Recall session notes", Effect::Reads),
+    ("clear_working", "Clear session notes", Effect::Changes),
+    ("add_memory", "Add a memory", Effect::Adds),
+    ("add_memories", "Add several memories", Effect::Adds),
+    ("add_transcript", "Add a transcript", Effect::Adds),
+    ("ingest_session", "Ingest a session", Effect::Adds),
+    ("search_memory", "Search memories", Effect::Reads),
+    ("get_memory", "Get a memory", Effect::Reads),
+    ("update_memory", "Update a memory", Effect::Changes),
+    ("delete_memory", "Delete a memory", Effect::Changes),
+    ("list_archived", "List archived memories", Effect::Reads),
+    ("restore_memory", "Restore an archived memory", Effect::Adds),
+    ("list_memories", "List memories", Effect::Reads),
+    ("get_project_context", "Get project context", Effect::Reads),
+    ("get_project_brain", "Get project brain", Effect::Reads),
+    ("register_project", "Register a project", Effect::Adds),
+    ("merge_projects", "Merge two projects", Effect::Changes),
+    ("rename_project", "Rename a project", Effect::Changes),
+    ("log_external_request", "Log a request sent to a third party", Effect::Adds),
+    ("pending_external", "List requests awaiting an answer", Effect::Reads),
+    ("add_project_alias", "Add a project alias", Effect::Adds),
+    ("find_conversation", "Find a past conversation", Effect::Reads),
+    ("ingest_conversation", "Index a conversation", Effect::Adds),
+    ("read_conversation", "Read a past conversation", Effect::Reads),
+    ("search_in_conversation", "Search inside a conversation", Effect::Reads),
+    ("list_projects", "List projects", Effect::Reads),
+    ("get_stats", "Get statistics", Effect::Reads),
+    ("benchmark_recall", "Benchmark recall quality", Effect::Reads),
+    ("benchmark_search", "Benchmark search quality", Effect::Reads),
+    ("get_global_prompt", "Get the global prompt", Effect::Reads),
+    ("export_memories", "Export memories", Effect::Reads),
+    ("export_session", "Export a session", Effect::Reads),
+    ("set_config", "Change a setting", Effect::Changes),
+    ("migrate_v1", "Import version 1 memories", Effect::Adds),
+    ("cleanup_expired", "Remove expired memories", Effect::Changes),
+    ("compact_memories", "Compress old memories", Effect::Changes),
+    ("run_gc", "Run garbage collection", Effect::Changes),
+    ("toggle_auto_lint", "Turn self-healing on or off", Effect::Adds),
+    ("get_file_context", "Get memories for recent files", Effect::Reads),
+    ("kg_add", "Add a knowledge triple", Effect::Adds),
+    ("kg_invalidate", "End a knowledge triple", Effect::Changes),
+    ("kg_query", "Query the knowledge graph", Effect::Reads),
+    ("kg_timeline", "Show an entity timeline", Effect::Reads),
+    ("kg_stats", "Get knowledge graph statistics", Effect::Reads),
+    ("pin_memory", "Pin a memory", Effect::Adds),
+    ("unpin_memory", "Unpin a memory", Effect::Adds),
+    ("find_related", "Find related memories", Effect::Reads),
+    ("bulk_delete", "Delete several memories", Effect::Changes),
+    ("get_memory_health", "Check memory health", Effect::Reads),
+    ("dedupe_report", "Report duplicate memories", Effect::Reads),
+    ("consolidate_memories", "Merge duplicate memories", Effect::Changes),
+    ("analyze_corpus", "Analyze a text", Effect::Reads),
+    ("recall_episode", "Recall an episode", Effect::Reads),
+    ("get_episode", "Get an episode", Effect::Reads),
+    ("list_episodes", "List episodes", Effect::Reads),
+    ("rebuild_episodes", "Rebuild episode summaries", Effect::Adds),
+    ("archive_transcripts", "Archive old transcripts", Effect::Changes),
+    ("get_user_profile", "Get the user profile", Effect::Reads),
+    ("extract_skills", "Extract recurring procedures", Effect::Adds),
+    ("rate_skill", "Rate a skill", Effect::Adds),
+    ("supersede_outdated", "Hide outdated memories", Effect::Changes),
+    ("unsupersede", "Show a hidden memory again", Effect::Adds),
+    ("verify_memory", "Verify a memory against Git", Effect::Adds),
+    ("project_facts", "List project facts", Effect::Reads),
+    ("resolve_memory", "Record the status of a memory", Effect::Adds),
+    ("reveal_secret", "Reveal a stored credential", Effect::Reads),
+    ("repair_index", "Repair the search index", Effect::Adds),
+    ("find_conflicts", "Find conflicting memories", Effect::Reads),
+    ("list_skills", "List learned skills", Effect::Reads),
+    ("get_skill", "Get a learned skill", Effect::Reads),
+    ("list_agent_skills", "List agent skills", Effect::Reads),
+    ("get_agent_skill", "Read an agent skill", Effect::Reads),
+];
+
+/// The `annotations` object of a tool: its title, whether it only reads,
+/// and for a tool that writes, whether it can replace or remove.
+fn annotations(title: &str, effect: Effect) -> Value {
+    match effect {
+        Effect::Reads => json!({ "title": title, "readOnlyHint": true }),
+        Effect::Adds => json!({ "title": title, "readOnlyHint": false, "destructiveHint": false }),
+        Effect::Changes => json!({ "title": title, "readOnlyHint": false, "destructiveHint": true }),
+    }
+}
+
 fn all_tool_definitions() -> Value {
+    let mut definitions = bare_tool_definitions();
+    if let Some(tools) = definitions["tools"].as_array_mut() {
+        for tool in tools {
+            let known = TOOL_ANNOTATIONS.iter().find(|(name, _, _)| tool["name"].as_str() == Some(name));
+            if let Some((_, title, effect)) = known {
+                tool["annotations"] = annotations(title, *effect);
+            }
+        }
+    }
+    definitions
+}
+
+fn bare_tool_definitions() -> Value {
     json!({ "tools": [
         {
             "name": "recall",
@@ -2878,6 +2994,34 @@ mod tests {
 
     fn text_of(response: &Value) -> Value {
         serde_json::from_str(response["content"][0]["text"].as_str().expect("text")).expect("json")
+    }
+
+    #[test]
+    fn every_tool_states_its_title_and_whether_it_reads_or_removes() {
+        let all = all_tool_definitions();
+        let tools = all["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), TOOL_ANNOTATIONS.len(), "one annotation per tool, none left over");
+        for tool in tools {
+            let name = tool["name"].as_str().expect("name");
+            let annotations = &tool["annotations"];
+            assert!(annotations["title"].as_str().is_some_and(|title| !title.is_empty()), "{} has no title", name);
+            let reads = annotations["readOnlyHint"].as_bool().unwrap_or_else(|| panic!("{} has no readOnlyHint", name));
+            assert_eq!(annotations["destructiveHint"].is_boolean(), !reads, "{}: a tool that writes says whether it removes", name);
+        }
+        let effect = |name: &str| all["tools"].as_array().expect("tools").iter().find(|t| t["name"] == name).expect("tool")["annotations"].clone();
+        assert_eq!(effect("search_memory")["readOnlyHint"], true);
+        assert_eq!(effect("add_memory")["destructiveHint"], false);
+        assert_eq!(effect("delete_memory")["destructiveHint"], true);
+        assert_eq!(effect("bulk_delete")["destructiveHint"], true);
+    }
+
+    #[test]
+    fn the_admin_tool_is_announced_as_able_to_remove() {
+        let definitions = tool_definitions();
+        let admin = definitions["tools"].as_array().expect("tools").iter().find(|t| t["name"] == "memory_admin").expect("memory_admin");
+        assert_eq!(admin["annotations"]["readOnlyHint"], false);
+        assert_eq!(admin["annotations"]["destructiveHint"], true);
+        assert!(definitions["tools"].as_array().expect("tools").iter().all(|t| t["annotations"]["title"].is_string()));
     }
 
     #[test]
