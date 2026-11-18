@@ -123,7 +123,7 @@ Quality is one axis. The others decide what a memory costs on every conversation
 | Tools exposed, default profile | 25 | `--footprint` |
 | Tool list, default profile | 23,919 characters, about 6,000 tokens | `--footprint` (tokens estimated at 4 characters each) |
 | Tools exposed, full profile | 74 | `MEMORYPILOT_TOOLS=full` |
-| Tool list, full profile | 45,839 characters, about 11,500 tokens | `--footprint` |
+| Tool list, full profile | 45,809 characters, about 11,500 tokens | `--footprint` |
 | Server instructions | 2,736 characters, about 680 tokens | `--footprint` |
 | Runtime dependencies | none | One binary; no database server, no API key |
 

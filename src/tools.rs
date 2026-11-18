@@ -171,7 +171,7 @@ const TOOL_ANNOTATIONS: &[(&str, &str, Effect)] = &[
     ("list_memories", "List memories", Effect::Reads),
     ("get_project_context", "Get project context", Effect::Reads),
     ("get_project_brain", "Get project brain", Effect::Reads),
-    ("register_project", "Register a project", Effect::Adds),
+    ("register_project", "Register a project", Effect::Changes),
     ("merge_projects", "Merge two projects", Effect::Changes),
     ("rename_project", "Rename a project", Effect::Changes),
     ("log_external_request", "Log a request sent to a third party", Effect::Adds),
@@ -200,8 +200,8 @@ const TOOL_ANNOTATIONS: &[(&str, &str, Effect)] = &[
     ("kg_query", "Query the knowledge graph", Effect::Reads),
     ("kg_timeline", "Show an entity timeline", Effect::Reads),
     ("kg_stats", "Get knowledge graph statistics", Effect::Reads),
-    ("pin_memory", "Pin a memory", Effect::Adds),
-    ("unpin_memory", "Unpin a memory", Effect::Adds),
+    ("pin_memory", "Pin a memory", Effect::Changes),
+    ("unpin_memory", "Unpin a memory", Effect::Changes),
     ("find_related", "Find related memories", Effect::Reads),
     ("bulk_delete", "Delete several memories", Effect::Changes),
     ("get_memory_health", "Check memory health", Effect::Reads),
@@ -211,16 +211,16 @@ const TOOL_ANNOTATIONS: &[(&str, &str, Effect)] = &[
     ("recall_episode", "Recall an episode", Effect::Reads),
     ("get_episode", "Get an episode", Effect::Reads),
     ("list_episodes", "List episodes", Effect::Reads),
-    ("rebuild_episodes", "Rebuild episode summaries", Effect::Adds),
+    ("rebuild_episodes", "Rebuild episode summaries", Effect::Changes),
     ("archive_transcripts", "Archive old transcripts", Effect::Changes),
     ("get_user_profile", "Get the user profile", Effect::Reads),
     ("extract_skills", "Extract recurring procedures", Effect::Adds),
     ("rate_skill", "Rate a skill", Effect::Adds),
     ("supersede_outdated", "Hide outdated memories", Effect::Changes),
     ("unsupersede", "Show a hidden memory again", Effect::Adds),
-    ("verify_memory", "Verify a memory against Git", Effect::Adds),
+    ("verify_memory", "Verify a memory against Git", Effect::Reads),
     ("project_facts", "List project facts", Effect::Reads),
-    ("resolve_memory", "Record the status of a memory", Effect::Adds),
+    ("resolve_memory", "Record the status of a memory", Effect::Changes),
     ("reveal_secret", "Reveal a stored credential", Effect::Reads),
     ("repair_index", "Repair the search index", Effect::Adds),
     ("find_conflicts", "Find conflicting memories", Effect::Reads),
@@ -3013,6 +3013,10 @@ mod tests {
         assert_eq!(effect("add_memory")["destructiveHint"], false);
         assert_eq!(effect("delete_memory")["destructiveHint"], true);
         assert_eq!(effect("bulk_delete")["destructiveHint"], true);
+        // Overwriting a field of what is stored (a path, tags, a status) is a change, not an addition.
+        for name in ["register_project", "pin_memory", "unpin_memory", "resolve_memory", "rebuild_episodes"] {
+            assert_eq!(effect(name)["destructiveHint"], true, "{}", name);
+        }
     }
 
     #[test]
