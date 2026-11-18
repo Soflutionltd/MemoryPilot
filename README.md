@@ -184,7 +184,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 |---------|-----------------|----------------|------------------|------|----------------|
 | LongMemEval | **99.1%** R@5 (v4.2, recall_any) | 98.4% R@5 (held-out split) | 95.2% R@5 | 94.4% QA accuracy (not comparable) | 63.8% QA accuracy (not comparable) |
 | LongMemEval MRR | **94.9%** | not published | 88.2% | not published | not published |
-| Search | Hybrid BM25 + jina-embeddings-v5-nano RRF (768-dim, int8) + adaptive jina-reranker-v2 cross-encoder | ChromaDB cosine (all-MiniLM-L6-v2) | BM25 + vector + graph (RRF) | Vector search (cloud API) | Temporal KG traversal + vector |
+| Search | Hybrid BM25 + jina-embeddings-v5-nano RRF (768-dim, int8) + adaptive multilingual-reranker-small cross-encoder | ChromaDB cosine (all-MiniLM-L6-v2) | BM25 + vector + graph (RRF) | Vector search (cloud API) | Temporal KG traversal + vector |
 | Embeddings | jina-embeddings-v5-text-nano-retrieval (100+ languages, 8k context, local ONNX) | all-MiniLM-L6-v2 (English only) | all-MiniLM-L6-v2 (English only) | OpenAI API calls (external) | OpenAI / cloud LLM extraction |
 | Multilingual | **100+ languages native (FR, EN, ES, DE, JA, ZH...)** | English only | English only | Depends on API | Depends on LLM backend |
 | Knowledge Graph | Temporal triples with validity + confidence | Temporal triples (SQLite) | Knowledge graph (no validity window) | Basic graph (no temporal) | Temporal KG (Graphiti, core feature) |
@@ -702,16 +702,16 @@ MemoryPilot --help                   # Show help
 |----------|---------|--------|
 | `MEMORYPILOT_CROSS_RERANK` | `adaptive` | `1`/`always` to force rerank on every query, `0`/`off` to disable. Adaptive rerank fires on hard / non-English queries. |
 | `MEMORYPILOT_CROSS_RERANK_TOP_K` | `12` | Number of candidates the cross-encoder rescores. |
-| `MEMORYPILOT_CROSS_RERANK_WEIGHT` | `0.6` | Fusion weight given to the cross-encoder score against the RRF score, bounded to 0-1. Sweep 0.45 / 0.6 / 0.75 / 0.9 / 1.0 (v4.12, jina-reranker-v2, 119-question LongMemEval-S sample, Apple M2 Max): 0.6 has the best LongMemEval R@1 (94.1%, 93.3% at 0.45) and MRR (96.1%, 95.6% at 0.45), and raises `--benchmark-fr` R@1 from 96.3% to 97.2%. Higher weights help the French benchmark further but lose LongMemEval questions. |
+| `MEMORYPILOT_CROSS_RERANK_WEIGHT` | `1.0` | Fusion weight given to the cross-encoder score against the RRF score, bounded to 0-1. At `1.0` the reranked candidates are ordered by the cross-encoder alone. Measured with multilingual-reranker-small (Apple M2 Max): `--benchmark-fr` R@1 98.2% at 1.0 and 96.3% at 0.6. |
 | `MEMORYPILOT_RERANK_POOL_SIZE` | `1` | Number of cross-encoder ONNX sessions kept hot. `2` helps only under heavy concurrent load; each extra session costs ~140 MB. |
 | `MEMORYPILOT_EMBED_POOL_SIZE` | `1` | Number of embedding ONNX sessions in the pool. A second jina session adds ~250 MB and only pays off under heavy concurrent writes. |
 | `MEMORYPILOT_EMBED_THREADS` | `min(4, cores)` | ONNX intra-op threads for the embedder. `MEMORYPILOT_RERANK_THREADS` (default `min(2, cores)`) does the same for the cross-encoder. |
-| `MEMORYPILOT_RERANKER_MODEL` | `jina-v2` | `jina-reranker-v2-base-multilingual` int8 (280 MB, memory-mapped, CC-BY-NC-4.0), the only cross-encoder since v4.11. On `--benchmark-fr` it scores R@1 97.2%, R@5 100%, MRR 98.0% (mmarco, the previous default: 96.3%, 99.1%, 97.6%), for a slower rerank. Four Apache-2.0 models can be selected to measure them against it: `horizon-small` (Horizon-Labs multilingual-reranker-small, 47 languages), `mmarco` (mmarco-mMiniLMv2-L12, multilingual), `ettin-32m` and `ettin-17m` (ettin-reranker, English only); the last three use the arm64 int8 graphs, and `MEMORYPILOT_TRUST_CROSS` is not calibrated for any of them. |
+| `MEMORYPILOT_RERANKER_MODEL` | `horizon-small` | Horizon Labs' `multilingual-reranker-small` int8 (268 MB, memory-mapped, Apache-2.0, 47 languages), the only cross-encoder. Its files are fetched from the `model-horizon-small-v1` release of this repository, checked against a pinned SHA-256, with the publisher's pinned revision as a fallback. |
 | `MEMORYPILOT_MODEL_IDLE_SECS` | `600` | Idle time after which the embedder and reranker sessions are dropped to free memory (~250 MB). `0` keeps them resident (benchmarks). |
 | `MEMORYPILOT_CONSOLIDATE` | `on` | Daily embedding-based consolidation of near-duplicate ephemeral memories (cosine ≥ 0.95 and word overlap ≥ 0.6, same project, newest kept), followed by the supersede pass (see v4.6). `off` disables it; `consolidate_memories` runs it on demand. |
 | `MEMORYPILOT_MMR` / `MEMORYPILOT_MMR_LAMBDA` | `on` / `0.4` | MMR diversity over the finalists. `0` disables; λ = 1.0 is pure relevance, 0.0 pure diversity. `MEMORYPILOT_MMR_FLOOR` (`0.55`) is the cosine below which two candidates are not considered redundant. |
 | `MEMORYPILOT_TEMPORAL` | `on` | Query-time date window boost/demotion. `0` disables (date entities are still extracted at ingest). |
-| `MEMORYPILOT_ABSTAIN_COSINE` / `MEMORYPILOT_TRUST_CROSS` | `0.35` / `1.0` | Below the cosine floor a search reports `confidence.abstain = true` unless the cross-encoder logit on the top hit reaches the trust value. |
+| `MEMORYPILOT_ABSTAIN_COSINE` / `MEMORYPILOT_TRUST_CROSS` | `0.35` / `-2.0` | Below the cosine floor a search reports `confidence.abstain = true` unless the cross-encoder logit on the top hit reaches the trust value. |
 | `MEMORYPILOT_READER_NULL_MARGIN` | `0` | Extractive reader: the span logit must beat the model's no-answer logit by this much. Negative values answer more often (`−3` → 92/100 answered, 3/7 abstentions still caught on LongMemEval-S@100). |
 | `MEMORYPILOT_AUTO_UPDATE` | `on` | `0`/`off` stops the server from checking for and installing new releases (see [Automatic updates](#automatic-updates)). `MemoryPilot update` still works by hand. |
 | `MEMORYPILOT_EMBED_MODEL` | `jina` | `jina-embeddings-v5-text-nano-retrieval` int8 (768-dim), the only embedder since v4.11. `jina-q4` = its 4-bit variant (140 MB download, faster queries, about 1 pp lower R@5 and 3 pp lower MRR on FR). The database records which model produced its vectors; a database built with another model is re-embedded once in the background at next start (BM25 keeps answering meanwhile). |
@@ -743,7 +743,7 @@ src/db/transcript.rs — Transcript/session ingestion and local-only distillatio
 src/tools.rs       — 41 MCP tool definitions + handlers
 src/protocol.rs    — JSON-RPC types
 src/embedding.rs   — jina-embeddings-v5 via ONNX Runtime (fastembed for legacy models), EmbedPool, two-tier query cache
-src/tokenizer.rs   — lean byte-level BPE (tiktoken ranks) and Unigram tokenizers, ~65 MB instead of ~535 MB with the `tokenizers` crate
+src/tokenizer.rs   — lean byte-level BPE (tiktoken ranks) and merge BPE tokenizers, a fraction of the memory of the `tokenizers` crate
 src/onnx_external.rs — one-shot rewrite of embedded ONNX weights into a memory-mapped sidecar (ORT 1.28 keeps 3 copies otherwise)
 src/pool.rs        — lazily-built, idle-evicting pool shared by the embedder and reranker sessions
 src/db/consolidate.rs — embedding-based near-duplicate consolidation (daily + `consolidate_memories`)
@@ -812,7 +812,7 @@ config             — key/value store
 - **KG query expansion**: post-retrieval scoring boost from knowledge graph related terms (+4% per entity, cap 15%)
 - **Temporal recency**: gentle +5% for memories from last 3 days, decaying over 30 days
 - **Importance tiebreaker**: ±3% per level — never overrides relevance signal
-- **Adaptive cross-encoder reranking** (jina-v2-multilingual via FastEmbed ONNX, default ON): triggers on hard / non-English queries, fuses with the RRF score at a tunable 0.45 weight, drops cleanly to BM25+RRF on easy English queries to stay under 30 ms. Pool of N sessions (`MEMORYPILOT_RERANK_POOL_SIZE`) absorbs concurrent load.
+- **Adaptive cross-encoder reranking** (multilingual-reranker-small via ONNX Runtime, default ON): triggers on hard / non-English queries, orders the reranked candidates by its score (tunable weight), drops cleanly to BM25+RRF on easy English queries to stay under 30 ms. Pool of N sessions (`MEMORYPILOT_RERANK_POOL_SIZE`) absorbs concurrent load.
 - **Confidence gate**: skips rerank when the top-1 RRF score is already ≥ 25 % above top-3 (latent path; active when force-rerank is enabled)
 - **Auto-compaction**: GC triggers automatically when memory count > 500, debounced to once per 5 minutes
 - **Memory capsules**: old low-importance memories compressed into ~100-200 token summaries (5-10x savings)
@@ -860,7 +860,7 @@ MEMORYPILOT_CROSS_RERANK=1 MemoryPilot --benchmark-longmemeval benchmarks/longme
 MEMORYPILOT_CROSS_RERANK_WEIGHT=0.70 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json  # bias more toward the cross-encoder score
 ```
 
-The cross-encoder is `jina-reranker-v2-base-multilingual`. Validated full-run results on the 470 evaluable LongMemEval-S questions (v4.2, session-level recall_any): with the rerank off, **98.7% R@5**, **95.1% NDCG@10**, **93.6% MRR**, ~28 ms average search latency; adaptive mode reaches **99.1% R@5**, **96.0% NDCG@10**, **94.9% MRR**, ~900 ms average search latency. The deterministic French benchmark (`--benchmark-fr`) is the canonical regression test for any multilingual change — variance is bounded to ±1 pp R@5 across runs.
+The cross-encoder is `multilingual-reranker-small` (the figures that follow were measured with earlier cross-encoders). Validated full-run results on the 470 evaluable LongMemEval-S questions (v4.2, session-level recall_any): with the rerank off, **98.7% R@5**, **95.1% NDCG@10**, **93.6% MRR**, ~28 ms average search latency; adaptive mode reaches **99.1% R@5**, **96.0% NDCG@10**, **94.9% MRR**, ~900 ms average search latency. The deterministic French benchmark (`--benchmark-fr`) is the canonical regression test for any multilingual change — variance is bounded to ±1 pp R@5 across runs.
 
 ## Storage
 
@@ -887,11 +887,11 @@ An older layout (everything at the root) keeps working. `MemoryPilot --migrate-l
 
 ### Models: non-commercial use only
 
-MemoryPilot runs two models by Jina AI, downloaded from their Hugging Face repositories on first use and never redistributed by MemoryPilot:
+MemoryPilot runs two models:
 
-- [jina-embeddings-v5-text-nano-retrieval](https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval) (embeddings)
-- [jina-reranker-v2-base-multilingual](https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual) (reranking)
+- [jina-embeddings-v5-text-nano-retrieval](https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval) (embeddings), by Jina AI, downloaded from their Hugging Face repository on first use and never redistributed by MemoryPilot. It is licensed under [CC-BY-NC-4.0](https://creativecommons.org/licenses/by-nc/4.0/): **non-commercial use only**. Personal use is fine. Commercial use, including inside a company or a paid product, needs a commercial licence from [Jina AI](https://jina.ai).
+- [multilingual-reranker-small](https://huggingface.co/Horizon-Labs/multilingual-reranker-small) (reranking), Copyright 2026 Horizon Labs, [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0), fine-tuned from mmBERT-small (MIT, Johns Hopkins University CLSP). Its int8 graph and tokenizer are mirrored unmodified, with their `LICENSE` and `NOTICE`, in the [`model-horizon-small-v1`](https://github.com/Soflutionltd/MemoryPilot/releases/tag/model-horizon-small-v1) release of this repository.
 
-Both are licensed by Jina AI under [CC-BY-NC-4.0](https://creativecommons.org/licenses/by-nc/4.0/): **non-commercial use only**. Personal use is fine. Commercial use, including inside a company or a paid product, needs a commercial licence from [Jina AI](https://jina.ai). The opt-in answer reader (`answer: true`) uses [deepset/roberta-base-squad2](https://huggingface.co/deepset/roberta-base-squad2), CC-BY-4.0.
+The opt-in answer reader (`answer: true`) uses [deepset/roberta-base-squad2](https://huggingface.co/deepset/roberta-base-squad2), CC-BY-4.0.
 
 Built by [SOFLUTION LTD](https://soflution.com)

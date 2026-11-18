@@ -275,17 +275,32 @@ pub fn externalized(repo: &str, file: &str, show_progress: bool) -> Result<std::
         .file_stem()
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| format!("bad onnx file name {}", file))?;
-    let dir = crate::embedding::fastembed_cache_dir()
-        .join("memorypilot-external")
-        .join(repo.replace('/', "--"));
-    let graph = dir.join(format!("{}.onnx", stem));
-    let data = dir.join(format!("{}.onnx_data", stem));
+    let (graph, data) = external_paths(&repo.replace('/', "--"), stem);
     if graph.is_file() && data.is_file() {
         return Ok(graph);
     }
     let source = crate::embedding::hf_file(repo, file, show_progress)?;
     externalize_model(&source, &graph, &data)?;
     Ok(graph)
+}
+
+/// Same for a graph already on disk; `key` names its folder in the cache.
+pub fn externalized_source(source: &Path, key: &str) -> Result<std::path::PathBuf, String> {
+    let stem = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| format!("bad onnx file name {}", source.display()))?;
+    let (graph, data) = external_paths(key, stem);
+    if graph.is_file() && data.is_file() {
+        return Ok(graph);
+    }
+    externalize_model(source, &graph, &data)?;
+    Ok(graph)
+}
+
+fn external_paths(key: &str, stem: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = crate::embedding::fastembed_cache_dir().join("memorypilot-external").join(key);
+    (dir.join(format!("{}.onnx", stem)), dir.join(format!("{}.onnx_data", stem)))
 }
 
 #[cfg(test)]

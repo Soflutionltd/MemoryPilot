@@ -19,8 +19,8 @@ dirs = "6"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "api-24", "download-binaries", "tls-native"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
 # Lean tokenizers (src/tokenizer.rs): tiktoken's rank BPE for jina, a
-# hand-rolled Unigram for XLM-R. The `tokenizers` crate costs 205 MB + 330 MB resident for
-# these two vocabularies; this pair costs ~65 MB for identical output.
+# hand-rolled merge BPE for the reranker. The `tokenizers` crate costs 205 MB
+# resident for the jina vocabulary alone; these give identical output for less.
 tiktoken-rs = { version = "0.12", default-features = false }
 rustc-hash = "2"
 unicode-normalization = "0.1"

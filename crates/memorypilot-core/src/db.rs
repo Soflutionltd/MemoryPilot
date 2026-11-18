@@ -268,12 +268,16 @@ impl SearchConfidence {
     }
 
     /// Cross-encoder logit above which the hit is trusted whatever the
-    /// cosine says (mmarco logits are positive for relevant pairs).
+    /// cosine says. Calibrated on LongMemEval-S with
+    /// multilingual-reranker-small (470 answerable + 30 abstention, rerank
+    /// over 64): at −2.0 the hard `abstain` wrongly fires on 13 answerable
+    /// questions and catches 4 abstention ones; at 1.0, 31 and 6; the
+    /// previous cross-encoder gave 21 and 4.
     pub fn trusted_cross_score() -> f32 {
         std::env::var("MEMORYPILOT_TRUST_CROSS")
             .ok()
             .and_then(|raw| raw.trim().parse::<f32>().ok())
-            .unwrap_or(1.0)
+            .unwrap_or(-2.0)
     }
 
     fn none() -> Self {
@@ -289,7 +293,7 @@ impl SearchConfidence {
         let cross_vouches = cross_score
             .map(|score| score >= Self::trusted_cross_score())
             .unwrap_or(false);
-        // mmarco logits below −4 on the top hit: 1 in 8 answerable LME
+        // A logit below −4 on the top hit: 9 of the 470 answerable LME
         // questions still land there, so this only bites with a weak cosine.
         let cross_denies = cross_score.map(|score| score < -4.0).unwrap_or(false);
         let abstain = (top_cosine < floor && !cross_vouches) || (cross_denies && top_cosine < floor + 0.05);

@@ -2,20 +2,15 @@
 //!
 //! The `tokenizers` crate is correct but memory-hungry: loading the
 //! jina/EuroBERT byte-level BPE (128k vocab, 280k merges) costs ~205 MB
-//! resident and the XLM-R Unigram model used by mmarco (250k pieces)
-//! ~330 MB, because its Unigram trie is a `HashMap` per node. That is
-//! more than both ONNX graphs together. Both tokenizers below reproduce
-//! the `tokenizers` output token-for-token (asserted in tests on FR/EN/
-//! code/CJK/emoji samples) for ~42 MB and ~25 MB respectively.
+//! resident, more than the ONNX graph it feeds. The tokenizers below
+//! reproduce the `tokenizers` output token-for-token (asserted in tests
+//! on FR/EN/code/CJK/emoji samples) for a fraction of that.
 //!
-//! Both read the model's own `tokenizer.json`, so a new revision of the
-//! vocabulary is picked up without a code change.
+//! Each reads the model's own `tokenizer.json`.
 
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::Path;
-
-use unicode_normalization::UnicodeNormalization;
 
 // ─── Byte-level BPE (jina-embeddings-v5 / EuroBERT / Llama-3 family) ───
 
@@ -313,7 +308,7 @@ impl MergeBpe {
     }
 }
 
-// ─── Added tokens (shared by the ModernBERT and Gemma tokenizers) ───
+// ─── Added tokens ───
 
 /// One `added_tokens` entry of a `tokenizer.json`: text matched verbatim
 /// before the BPE runs. `lstrip` also swallows the whitespace before it.
@@ -383,122 +378,6 @@ impl AddedTokens {
             }
         }
         plain(&text[plain_start..], out);
-    }
-}
-
-/// `first query second document second`, the document truncated so the
-/// whole sequence fits in `max_tokens`: the pair template of the
-/// ModernBERT (`[CLS] q [SEP] d [SEP]`) and Gemma (`<bos> q <eos> d <eos>`)
-/// cross-encoders.
-fn encode_pair_with(
-    first: u32,
-    separator: u32,
-    max_tokens: usize,
-    query: &str,
-    document: &str,
-    encode_body: impl Fn(&str, &mut Vec<u32>),
-) -> Vec<u32> {
-    let mut ids = vec![first];
-    encode_body(query, &mut ids);
-    ids.push(separator);
-    let document_start = ids.len();
-    encode_body(document, &mut ids);
-    let document_budget = max_tokens.saturating_sub(document_start + 1);
-    ids.truncate(document_start + document_budget);
-    ids.push(separator);
-    ids
-}
-
-// ─── Byte-level BPE with added tokens (ModernBERT family: Ettin) ───
-
-/// ModernBERT's tokenizer: added tokens (`[CLS]`, `[unused…]`, runs of
-/// spaces) cut out leftmost-longest, NFC normalisation, GPT-2 byte-level
-/// BPE on the rest, and the `[CLS] A [SEP] B [SEP]` pair template.
-/// Reproduces the `tokenizers` crate token-for-token (asserted in tests).
-pub struct ModernBertBpe {
-    ranks: MergeRanks,
-    added: AddedTokens,
-    cls_id: u32,
-    sep_id: u32,
-    pad_id: u32,
-}
-
-impl ModernBertBpe {
-    pub fn from_file(path: &Path) -> Result<Self, String> {
-        #[derive(serde::Deserialize)]
-        struct File {
-            model: Model,
-            added_tokens: Vec<AddedToken>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Model {
-            vocab: HashMap<String, u32>,
-            merges: Vec<serde_json::Value>,
-        }
-
-        let reader = BufReader::new(
-            std::fs::File::open(path)
-                .map_err(|error| format!("open {}: {}", path.display(), error))?,
-        );
-        let file: File = serde_json::from_reader(reader)
-            .map_err(|error| format!("parse {}: {}", path.display(), error))?;
-
-        let added = AddedTokens::new(file.added_tokens)?;
-        let cls_id = added.id("[CLS]")?;
-        let sep_id = added.id("[SEP]")?;
-        let pad_id = added.id("[PAD]")?;
-
-        // The vocabulary leaves out the 13 bytes that never occur in
-        // UTF-8 (0xC0, 0xC1, 0xF5..=0xFF); every byte of a `&str` is covered.
-        let ranks = MergeRanks::build(&file.model.vocab, &file.model.merges)?;
-        let utf8_bytes = (0u8..=0xF4).filter(|byte| !matches!(byte, 0xC0 | 0xC1));
-        if utf8_bytes
-            .into_iter()
-            .any(|byte| ranks.rank_to_id[byte as usize] == u32::MAX)
-        {
-            return Err("vocab does not cover every byte that occurs in UTF-8".into());
-        }
-
-        Ok(Self {
-            ranks,
-            added,
-            cls_id,
-            sep_id,
-            pad_id,
-        })
-    }
-
-    pub fn pad_id(&self) -> u32 {
-        self.pad_id
-    }
-
-    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
-        out.extend(
-            self.ranks
-                .bpe
-                .encode_ordinary(text)
-                .into_iter()
-                .map(|rank| self.ranks.rank_to_id[rank as usize]),
-        );
-    }
-
-    /// As `tokenizers` does: the tokens matched on the raw text first
-    /// (`[CLS]`, `[MASK]`…), then NFC and the tokens matched on the
-    /// normalised text (runs of spaces), then the BPE.
-    fn encode_body(&self, text: &str, out: &mut Vec<u32>) {
-        self.added.cut(text, false, out, |raw, out| {
-            let normalized: String = raw.nfc().collect();
-            self.added
-                .cut(&normalized, true, out, |plain, out| self.encode_plain(plain, out));
-        });
-    }
-
-    /// Cross-encoder input `[CLS] query [SEP] document [SEP]`, the
-    /// document truncated so the whole sequence fits in `max_tokens`.
-    pub fn encode_pair(&self, query: &str, document: &str, max_tokens: usize) -> Vec<u32> {
-        encode_pair_with(self.cls_id, self.sep_id, max_tokens, query, document, |text, out| {
-            self.encode_body(text, out)
-        })
     }
 }
 
@@ -673,166 +552,8 @@ impl SentencePieceBpe {
     /// Cross-encoder input `<bos> query <eos> document <eos>`, the
     /// document truncated so the whole sequence fits in `max_tokens`.
     pub fn encode_pair(&self, query: &str, document: &str, max_tokens: usize) -> Vec<u32> {
-        encode_pair_with(self.bos_id, self.eos_id, max_tokens, query, document, |text, out| {
-            self.encode_body(text, out)
-        })
-    }
-}
-
-// ─── Unigram / SentencePiece (XLM-R family: mmarco-mMiniLMv2) ───
-
-/// Unigram language-model tokenizer (Viterbi best segmentation), with
-/// the XLM-R pipeline: NFKC normalisation, whitespace split, `▁` prefix
-/// per word, `<unk>` fusion, `<s> A </s></s> B </s>` pair template.
-///
-/// Pieces live in one `HashMap<Box<str>, (id, score)>`; the segmentation
-/// probes every substring up to the longest piece length, which for
-/// short memory snippets is faster than the crate's trie anyway.
-pub struct Unigram {
-    pieces: HashMap<Box<str>, (u32, f32)>,
-    max_piece_chars: usize,
-    unk_score: f32,
-    unk_id: u32,
-    bos_id: u32,
-    eos_id: u32,
-    pad_id: u32,
-}
-
-/// Penalty applied to characters absent from the vocabulary, as in
-/// `tokenizers` (`K_UNK_PENALTY`).
-const UNK_PENALTY: f32 = 10.0;
-
-impl Unigram {
-    pub fn from_file(path: &Path) -> Result<Self, String> {
-        #[derive(serde::Deserialize)]
-        struct File {
-            model: Model,
-            added_tokens: Vec<Added>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Model {
-            vocab: Vec<(String, f32)>,
-            unk_id: u32,
-        }
-        #[derive(serde::Deserialize)]
-        struct Added {
-            content: String,
-            id: u32,
-        }
-
-        let reader = BufReader::new(
-            std::fs::File::open(path)
-                .map_err(|error| format!("open {}: {}", path.display(), error))?,
-        );
-        let file: File = serde_json::from_reader(reader)
-            .map_err(|error| format!("parse {}: {}", path.display(), error))?;
-
-        let mut pieces = HashMap::with_capacity(file.model.vocab.len());
-        let mut max_piece_chars = 0;
-        let mut min_score = f32::INFINITY;
-        for (id, (piece, score)) in file.model.vocab.into_iter().enumerate() {
-            max_piece_chars = max_piece_chars.max(piece.chars().count());
-            min_score = min_score.min(score);
-            pieces.insert(piece.into_boxed_str(), (id as u32, score));
-        }
-
-        let special = |name: &str| -> Result<u32, String> {
-            file.added_tokens
-                .iter()
-                .find(|added| added.content == name)
-                .map(|added| added.id)
-                .ok_or_else(|| format!("tokenizer.json has no {} token", name))
-        };
-
-        Ok(Self {
-            pieces,
-            max_piece_chars: max_piece_chars.max(1),
-            unk_score: min_score - UNK_PENALTY,
-            unk_id: file.model.unk_id,
-            bos_id: special("<s>")?,
-            eos_id: special("</s>")?,
-            pad_id: special("<pad>")?,
-        })
-    }
-
-    pub fn pad_id(&self) -> u32 {
-        self.pad_id
-    }
-
-    /// Best segmentation of one `▁word` into piece ids, appended to
-    /// `out`. Consecutive `<unk>` are fused into one, as `tokenizers`
-    /// does for this model.
-    fn segment(&self, word: &str, out: &mut Vec<u32>) {
-        let offsets: Vec<usize> = word
-            .char_indices()
-            .map(|(offset, _)| offset)
-            .chain(std::iter::once(word.len()))
-            .collect();
-        let chars = offsets.len() - 1;
-        // best[i] = (score, previous boundary, id of the piece ending at i)
-        let mut best: Vec<(f32, usize, u32)> = vec![(f32::NEG_INFINITY, 0, 0); chars + 1];
-        best[0].0 = 0.0;
-        for start in 0..chars {
-            let base = best[start].0;
-            if base == f32::NEG_INFINITY {
-                continue;
-            }
-            let mut matched = false;
-            let furthest = (start + self.max_piece_chars).min(chars);
-            for end in (start + 1)..=furthest {
-                if let Some(&(id, score)) = self.pieces.get(&word[offsets[start]..offsets[end]]) {
-                    matched = true;
-                    let candidate = base + score;
-                    if candidate > best[end].0 {
-                        best[end] = (candidate, start, id);
-                    }
-                }
-            }
-            if !matched {
-                let candidate = base + self.unk_score;
-                if candidate > best[start + 1].0 {
-                    best[start + 1] = (candidate, start, self.unk_id);
-                }
-            }
-        }
-        let first = out.len();
-        let mut position = chars;
-        while position > 0 {
-            let (_, previous, id) = best[position];
-            out.push(id);
-            position = previous;
-        }
-        out[first..].reverse();
-        // Fuse runs of <unk>.
-        let mut write = first;
-        for read in first..out.len() {
-            let id = out[read];
-            if id == self.unk_id && write > first && out[write - 1] == self.unk_id {
-                continue;
-            }
-            out[write] = id;
-            write += 1;
-        }
-        out.truncate(write);
-    }
-
-    fn encode_body(&self, text: &str, out: &mut Vec<u32>) {
-        let normalized: String = text.nfkc().collect();
-        let mut word = String::new();
-        for token in normalized.split_whitespace() {
-            word.clear();
-            word.push('\u{2581}');
-            word.push_str(token);
-            self.segment(&word, out);
-        }
-    }
-
-    /// Cross-encoder input `<s> query </s></s> document </s>`, the
-    /// document truncated so the whole sequence fits in `max_tokens`.
-    pub fn encode_pair(&self, query: &str, document: &str, max_tokens: usize) -> Vec<u32> {
         let mut ids = vec![self.bos_id];
         self.encode_body(query, &mut ids);
-        ids.push(self.eos_id);
         ids.push(self.eos_id);
         let document_start = ids.len();
         self.encode_body(document, &mut ids);
@@ -874,11 +595,6 @@ mod tests {
             false,
         )
         .expect("jina tokenizer.json")
-    }
-
-    fn xlmr_tokenizer_json() -> std::path::PathBuf {
-        crate::embedding::hf_file("jinaai/jina-reranker-v2-base-multilingual", "tokenizer.json", false)
-            .expect("jina reranker tokenizer.json")
     }
 
     #[test]
@@ -925,71 +641,9 @@ mod tests {
     }
 
     #[test]
-    fn unigram_matches_tokenizers_crate_on_pairs() {
-        let path = xlmr_tokenizer_json();
-        let ours = Unigram::from_file(&path).expect("load");
-        let mut reference = tokenizers::Tokenizer::from_file(&path).expect("reference");
-        reference
-            .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: 512,
-                strategy: tokenizers::TruncationStrategy::OnlySecond,
-                ..Default::default()
-            }))
-            .unwrap();
-        let query = "comment publier un post Instagram";
-        for sample in SAMPLES {
-            let expected = reference
-                .encode((query, *sample), true)
-                .unwrap()
-                .get_ids()
-                .to_vec();
-            assert_eq!(ours.encode_pair(query, sample, 512), expected, "sample {:?}", sample);
-        }
-        let long = "mémoire longue ".repeat(400);
-        let expected = reference.encode((query, long.as_str()), true).unwrap().get_ids().to_vec();
-        let ids = ours.encode_pair(query, &long, 512);
-        assert_eq!(ids.len(), 512);
-        assert_eq!(ids, expected);
-    }
-
-    #[test]
-    fn modernbert_bpe_matches_tokenizers_crate_on_pairs() {
-        let path = crate::embedding::hf_file("cross-encoder/ettin-reranker-17m-v1", "tokenizer.json", false)
-            .expect("ettin tokenizer.json");
-        let ours = ModernBertBpe::from_file(&path).expect("load");
-        let mut reference = tokenizers::Tokenizer::from_file(&path).expect("reference");
-        reference
-            .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: 512,
-                strategy: tokenizers::TruncationStrategy::OnlySecond,
-                ..Default::default()
-            }))
-            .unwrap();
-        let query = "how do I publish an Instagram post";
-        let added_tokens = [
-            "indented    code\n        deeper block",
-            "a literal [SEP] and [unused3] in the text, then a [MASK] and  [MASK]",
-            "contact |||EMAIL_ADDRESS||| or |||PHONE_NUMBER|||",
-        ];
-        for sample in SAMPLES.iter().chain(added_tokens.iter()) {
-            let expected = reference
-                .encode((query, *sample), true)
-                .unwrap()
-                .get_ids()
-                .to_vec();
-            assert_eq!(ours.encode_pair(query, sample, 512), expected, "sample {:?}", sample);
-        }
-        let long = "a long memory about the release ".repeat(400);
-        let expected = reference.encode((query, long.as_str()), true).unwrap().get_ids().to_vec();
-        let ids = ours.encode_pair(query, &long, 512);
-        assert_eq!(ids.len(), 512);
-        assert_eq!(ids, expected);
-    }
-
-    #[test]
     fn sentencepiece_bpe_matches_tokenizers_crate_on_pairs() {
-        let path = crate::embedding::hf_file("Horizon-Labs/multilingual-reranker-small", "tokenizer.json", false)
-            .expect("mmBERT tokenizer.json");
+        let spec = crate::reranking::HORIZON_SMALL_INT8;
+        let path = crate::model_mirror::mirrored_file(spec.mirror_tag, &spec.tokenizer).expect("reranker tokenizer.json");
         let ours = SentencePieceBpe::from_file(&path).expect("load");
         let mut reference = tokenizers::Tokenizer::from_file(&path).expect("reference");
         reference
