@@ -7,6 +7,7 @@
 //! said; nothing is summarised into memories, which is what polluted
 //! recall when transcripts were distilled automatically.
 
+pub mod actions;
 pub mod archive;
 pub mod claude;
 pub mod cursor;
@@ -33,6 +34,9 @@ pub struct Message {
     pub at: Option<String>,
     pub order: Option<usize>,
     pub text: String,
+    /// What the agent did in this message, one line per tool call that
+    /// reaches outside or changes something (see `actions`).
+    pub actions: Vec<String>,
 }
 
 /// One conversation as a source describes it. `origin_id` is the unit

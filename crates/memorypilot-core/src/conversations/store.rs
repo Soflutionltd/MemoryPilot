@@ -19,6 +19,14 @@ const MIN_ASSISTANT_CHARS: usize = 40;
 /// Agent messages are only embedded from this length: below it they are
 /// "I'm checking X" notes, which the lexical lanes cover.
 const EMBED_ASSISTANT_CHARS: usize = 280;
+/// What the agent wrote before its final answer is kept from this
+/// length on: a draft, a plan or a message it prepared, not "checking X".
+const MIN_STEP_CHARS: usize = 200;
+/// Only a long intermediate text is worth a vector.
+const EMBED_STEP_CHARS: usize = 600;
+/// A long text is stored whole, in parts of `text::MAX_*_CHARS`, up to
+/// this many: past it, it is a pasted file rather than something said.
+const MAX_PARTS: usize = 6;
 pub fn default_path() -> Result<PathBuf, String> {
     let path = crate::layout::conversations_db().ok_or("Cannot find home directory")?;
     if let Some(dir) = path.parent() {
@@ -183,43 +191,67 @@ impl ConversationStore {
                 written += upsert_segment(&tx, source, "title", &key, source.created_at.as_deref(), &body)?;
             }
         }
-        // One segment per user message, one per turn for the agent: its
-        // final answer. The progress notes in between ("checking X") are
+        // One segment per user message; for the agent, its final answer,
+        // what it wrote at length on the way (a draft, a plan), and the
+        // actions of the turn. Its short progress notes ("checking X") are
         // nine messages out of ten and carry no recall value.
         let mut current_turn: Option<String> = tx
             .query_row(
-                "SELECT source_key FROM segments WHERE origin_id = ?1 AND role = 'user' ORDER BY at DESC, id DESC LIMIT 1",
+                "SELECT source_key FROM segments WHERE origin_id = ?1 AND role = 'user' AND source_key NOT GLOB '*#p[0-9]*'
+                 ORDER BY at DESC, id DESC LIMIT 1",
                 [&source.origin_id],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|error| format!("Current turn: {}", error))?;
+        let turn_key = |turn: &Option<String>| turn.clone().unwrap_or_else(|| format!("{}:{}:start", source.tool, source.origin_id));
         let mut answer: Option<&Message> = None;
+        let mut actions: Vec<&str> = Vec::new();
+        let mut actions_at: Option<&str> = None;
         let flush = |tx: &rusqlite::Transaction, turn: &Option<String>, answer: Option<&Message>| -> Result<usize, String> {
             let Some(message) = answer else { return Ok(0) };
-            let body = text::truncate_chars(secrets::redact(message.text.trim()).trim(), text::MAX_ANSWER_CHARS);
+            let body = message.text.trim();
             if body.chars().count() < MIN_ASSISTANT_CHARS {
                 return Ok(0);
             }
-            let turn_key = turn.clone().unwrap_or_else(|| format!("{}:{}:start", source.tool, source.origin_id));
-            let key = format!("{}#answer", turn_key);
-            upsert_segment(tx, source, "assistant", &key, message.at.as_deref(), &body)
+            let key = format!("{}#answer", turn_key(turn));
+            upsert_parts(tx, source, "assistant", &key, message.at.as_deref(), body, text::MAX_ANSWER_CHARS)
+        };
+        let step = |tx: &rusqlite::Transaction, message: &Message| -> Result<usize, String> {
+            let body = message.text.trim();
+            if body.chars().count() < MIN_STEP_CHARS {
+                return Ok(0);
+            }
+            let key = format!("{}:{}:{}#step", source.tool, source.origin_id, message.key);
+            upsert_parts(tx, source, "step", &key, message.at.as_deref(), body, text::MAX_ANSWER_CHARS)
         };
         for message in messages {
             match message.role {
-                Role::Assistant => answer = Some(message),
+                Role::Assistant => {
+                    actions.extend(message.actions.iter().map(String::as_str));
+                    actions_at = actions_at.or(message.at.as_deref());
+                    if message.text.trim().is_empty() {
+                        continue;
+                    }
+                    // What was the latest text of the turn is now a step.
+                    if let Some(previous) = answer.replace(message) {
+                        written += step(&tx, previous)?;
+                    }
+                }
                 Role::User => {
                     written += flush(&tx, &current_turn, answer.take())?;
+                    written += upsert_actions(&tx, source, &turn_key(&current_turn), actions_at.take(), &std::mem::take(&mut actions))?;
                     let key = format!("{}:{}:{}", source.tool, source.origin_id, message.key);
-                    let body = text::clean_user_text(&secrets::redact(&message.text));
+                    let body = text::typed_text(&message.text);
                     if body.chars().count() >= MIN_USER_CHARS {
-                        written += upsert_segment(&tx, source, "user", &key, message.at.as_deref(), &body)?;
+                        written += upsert_parts(&tx, source, "user", &key, message.at.as_deref(), &body, text::MAX_USER_CHARS)?;
                     }
                     current_turn = Some(key);
                 }
             }
         }
         written += flush(&tx, &current_turn, answer.take())?;
+        written += upsert_actions(&tx, source, &turn_key(&current_turn), actions_at, &actions)?;
 
         let mut blob = Vec::with_capacity(seen.len() * 8);
         for hash in seen {
@@ -235,7 +267,7 @@ impl ConversationStore {
 
         tx.execute(
             "UPDATE conversations SET
-                message_count = (SELECT COUNT(*) FROM segments WHERE conversation_id = ?1 AND role != 'title'),
+                message_count = (SELECT COUNT(*) FROM segments WHERE conversation_id = ?1 AND role IN ('user', 'assistant')),
                 updated_at = COALESCE((SELECT MAX(at) FROM segments WHERE conversation_id = ?1), updated_at),
                 project = CASE WHEN project_pinned = 1 THEN project ELSE COALESCE(
                     (SELECT value FROM refs WHERE conversation_id = ?1 AND kind = 'project'
@@ -534,12 +566,107 @@ fn upsert_segment(
     Ok(1)
 }
 
-/// 1: queued for the encoder, 0: never embedded (short agent notes).
+/// 1: queued for the encoder, 0: never embedded (short agent notes,
+/// the actions of a turn, which are found by their words).
 fn embed_state(role: &str, body: &str) -> i64 {
     match role {
         "assistant" if body.chars().count() < EMBED_ASSISTANT_CHARS => 0,
+        "step" if body.chars().count() < EMBED_STEP_CHARS => 0,
+        "action" => 0,
         _ => 1,
     }
+}
+
+/// `body` in parts of at most `max` characters, cut at a paragraph, a
+/// line or a space when one is near the end of the part.
+fn parts(body: &str, max: usize) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = body.trim();
+    while !rest.is_empty() && parts.len() < MAX_PARTS {
+        let Some((limit, _)) = rest.char_indices().nth(max) else {
+            parts.push(rest);
+            break;
+        };
+        let window = &rest[..limit];
+        let floor = window.char_indices().nth(max * 2 / 3).map(|(index, _)| index).unwrap_or(0);
+        let cut = ["\n\n", "\n", " "]
+            .iter()
+            .find_map(|separator| window.rfind(separator).filter(|index| *index >= floor))
+            .unwrap_or(limit);
+        parts.push(rest[..cut].trim_end());
+        rest = rest[cut..].trim_start();
+    }
+    parts
+}
+
+/// Stores a text whole: its first part under `key`, the next ones under
+/// `key#p2`, `key#p3`… Parts a shorter rewrite no longer has are removed.
+fn upsert_parts(
+    tx: &rusqlite::Transaction,
+    source: &SourceConversation,
+    role: &str,
+    key: &str,
+    at: Option<&str>,
+    body: &str,
+    max: usize,
+) -> Result<usize, String> {
+    let body = secrets::redact(body);
+    let parts = parts(&body, max);
+    let mut written = 0;
+    for (index, part) in parts.iter().enumerate() {
+        let part_key = if index == 0 { key.to_string() } else { format!("{}#p{}", key, index + 1) };
+        written += upsert_segment(tx, source, role, &part_key, at, part)?;
+    }
+    for index in parts.len().max(1)..MAX_PARTS {
+        delete_segment(tx, &format!("{}#p{}", key, index + 1))?;
+    }
+    Ok(written)
+}
+
+fn delete_segment(tx: &rusqlite::Transaction, key: &str) -> Result<(), String> {
+    let id: Option<i64> = tx
+        .query_row("SELECT id FROM segments WHERE source_key = ?1", [key], |row| row.get(0))
+        .optional()
+        .map_err(|error| format!("Segment lookup: {}", error))?;
+    let Some(id) = id else { return Ok(()) };
+    for sql in ["DELETE FROM segments_fts WHERE rowid = ?1", "DELETE FROM refs WHERE segment_id = ?1", "DELETE FROM segments WHERE id = ?1"] {
+        tx.execute(sql, [id]).map_err(|error| format!("Segment delete: {}", error))?;
+    }
+    Ok(())
+}
+
+/// Adds the actions of a turn to the ones already stored for it: a turn
+/// is read in several syncs while it runs.
+fn upsert_actions(
+    tx: &rusqlite::Transaction,
+    source: &SourceConversation,
+    turn_key: &str,
+    at: Option<&str>,
+    actions: &[&str],
+) -> Result<usize, String> {
+    if actions.is_empty() {
+        return Ok(0);
+    }
+    let key = format!("{}#actions", turn_key);
+    let mut stored = String::new();
+    for index in 0..MAX_PARTS {
+        let part_key = if index == 0 { key.clone() } else { format!("{}#p{}", key, index + 1) };
+        let part: Option<String> = tx
+            .query_row("SELECT text FROM segments WHERE source_key = ?1", [&part_key], |row| row.get(0))
+            .optional()
+            .map_err(|error| format!("Actions lookup: {}", error))?;
+        let Some(part) = part else { break };
+        stored.push_str(&part);
+        stored.push('\n');
+    }
+    let mut lines: Vec<String> = stored.lines().map(str::to_string).filter(|line| !line.is_empty()).collect();
+    for action in actions {
+        let action = secrets::redact(action).into_owned();
+        if !lines.contains(&action) {
+            lines.push(action);
+        }
+    }
+    upsert_parts(tx, source, "action", &key, at, &lines.join("\n"), text::MAX_ANSWER_CHARS)
 }
 
 /// Writes the FTS row and the references of a segment whose old ones
@@ -560,6 +687,7 @@ fn index_segment(
     .map_err(|error| format!("FTS insert: {}", error))?;
 
     let mut refs: Vec<Reference> = text::extract_references(body);
+    refs.extend(super::actions::urls(body).into_iter().map(|value| Reference { kind: "url", value }));
     refs.extend(project_hints(body).into_iter().map(|value| Reference { kind: "project", value }));
     if role == "title" {
         if let Some(workspace) = workspace {
@@ -616,6 +744,7 @@ mod tests {
             at: Some(format!("2026-10-28T10:{:02}:00.000Z", minute)),
             order: None,
             text: text.to_string(),
+            actions: Vec::new(),
         }
     }
 
@@ -663,6 +792,84 @@ mod tests {
                 ("assistant".to_string(), final_answer.to_string()),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stored(store: &ConversationStore) -> Vec<(String, String, String)> {
+        let mut statement = store
+            .conn
+            .prepare("SELECT role, source_key, text FROM segments WHERE role != 'title' ORDER BY at, id")
+            .unwrap();
+        statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn a_turn_keeps_its_draft_its_actions_and_long_texts_whole() {
+        let dir = std::env::temp_dir().join(format!("mp-conv-turn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = ConversationStore::open(&dir.join("c.db")).unwrap();
+        let source = SourceConversation {
+            origin_id: "c1".to_string(),
+            root_id: "c1".to_string(),
+            tool: "cursor",
+            title: None,
+            workspace: None,
+            created_at: None,
+            version: "1".to_string(),
+            source_path: None,
+        };
+        let draft = format!(
+            "Here is the post for the developer community: music cannot be attached to a scheduled post through the API. {}",
+            "We tried the audio endpoint and the container flow. ".repeat(4)
+        );
+        let mut browse = message("a2", Role::Assistant, 3, "");
+        browse.actions = vec![
+            "navigate: https://developers.example.com/community/threads/new/?ref=nav".to_string(),
+            "form_input: Music on a scheduled post".to_string(),
+        ];
+        let mut again = message("a3", Role::Assistant, 4, "");
+        again.actions = vec!["navigate: https://developers.example.com/community/threads/new/?ref=nav".to_string()];
+        let long_request = format!("Écris le message pour le forum. {}", "Le contexte complet de la demande est le suivant. ".repeat(100));
+        store
+            .apply(&source, true, &[
+                message("u1", Role::User, 1, &long_request),
+                message("a1", Role::Assistant, 2, &draft),
+                browse,
+                message("a4", Role::Assistant, 5, "Checking the page."),
+                message("a5", Role::Assistant, 6, "The post is published on the developer community; I will watch for an answer."),
+            ], &[])
+            .unwrap();
+        // The same turn read again, as while it is still running.
+        store.apply(&source, true, &[again], &[]).unwrap();
+
+        let rows = stored(&store);
+        let of = |role: &str| -> Vec<&(String, String, String)> { rows.iter().filter(|row| row.0 == role).collect() };
+        let request: String = of("user").iter().map(|row| row.2.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(of("user").len() >= 2, "a long request is stored in parts");
+        assert!(of("user").iter().all(|row| row.2.chars().count() <= text::MAX_USER_CHARS));
+        assert_eq!(request.matches("Le contexte complet").count(), 100, "nothing is cut");
+        assert_eq!(of("step").len(), 1, "the draft is kept, the progress note is not: {:?}", of("step"));
+        assert!(of("step")[0].2.starts_with("Here is the post"));
+        assert_eq!(of("assistant").len(), 1);
+        assert!(of("assistant")[0].2.starts_with("The post is published"));
+        assert_eq!(of("action").len(), 1, "one list of actions per turn: {:?}", of("action"));
+        assert_eq!(
+            of("action")[0].2,
+            "navigate: https://developers.example.com/community/threads/new/?ref=nav\nform_input: Music on a scheduled post",
+            "each action once, in order"
+        );
+        let url: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM refs WHERE kind = 'url' AND value = 'https://developers.example.com/community/threads/new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(url, 1);
+        let count: i64 = store.conn.query_row("SELECT message_count FROM conversations", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, (of("user").len() + 1) as i64, "requests and answers only");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

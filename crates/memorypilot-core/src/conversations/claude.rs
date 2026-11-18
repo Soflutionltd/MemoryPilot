@@ -160,12 +160,14 @@ pub fn read_session(file: &SessionFile, titles: &HashMap<String, String>) -> Res
         if line.is_meta || line.is_sidechain {
             continue;
         }
-        let Some(text) = line.message.and_then(|m| m.content).map(|c| text_of(&c)) else { continue };
-        if text.trim().is_empty() {
+        let Some(content) = line.message.and_then(|m| m.content) else { continue };
+        let text = text_of(&content);
+        let actions = if role == Role::Assistant { actions_of(&content) } else { Vec::new() };
+        if text.trim().is_empty() && actions.is_empty() {
             continue;
         }
         let Some(key) = line.uuid else { continue };
-        messages.push(Message { key, role, at, order: None, text });
+        messages.push(Message { key, role, at, order: None, text, actions });
     }
 
     let fallback_id = file
@@ -204,6 +206,18 @@ fn text_of(content: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// The tool calls of a message, as action lines.
+fn actions_of(content: &Value) -> Vec<String> {
+    let Value::Array(blocks) = content else { return Vec::new() };
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| {
+            super::actions::action_line(block.get("name")?.as_str()?, block.get("input").unwrap_or(&Value::Null))
+        })
+        .collect()
 }
 
 #[cfg(test)]

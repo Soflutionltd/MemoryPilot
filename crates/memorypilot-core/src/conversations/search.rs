@@ -167,9 +167,13 @@ impl ConversationStore {
             if !within(row.at.as_deref(), options.after.as_deref(), options.before.as_deref()) {
                 continue;
             }
+            // What the user asked leads; a draft and the trace of the
+            // actions support a conversation, they rarely name its topic.
             let role_weight = match row.role.as_str() {
                 "title" => 1.15,
                 "user" => 1.0,
+                "step" => 0.7,
+                "action" => 0.5,
                 _ => 0.85,
             };
             let origin_weight = if row.is_main { 1.0 } else { SUBAGENT_WEIGHT };
@@ -575,12 +579,14 @@ impl ConversationStore {
         Ok((messages, has_more.then_some(start + limit)))
     }
 
-    /// Conversations that mention a commit or a file.
+    /// Conversations that mention a commit, a file or an address (kind
+    /// `url`: any address containing `value`, so a site name is enough).
     pub fn by_reference(&self, kind: &str, value: &str, limit: usize) -> Result<Vec<(String, i64)>, String> {
         let mut statement = self
             .conn
             .prepare_cached(
-                "SELECT conversation_id, COUNT(*) FROM refs WHERE kind = ?1 AND (value = ?2 OR value LIKE '%' || ?2)
+                "SELECT conversation_id, COUNT(*) FROM refs
+                 WHERE kind = ?1 AND (value = ?2 OR value LIKE '%' || ?2 OR (?1 = 'url' AND instr(value, ?2) > 0))
                  GROUP BY conversation_id ORDER BY COUNT(*) DESC LIMIT ?3",
             )
             .map_err(|error| format!("References: {}", error))?;
@@ -727,6 +733,7 @@ mod tests {
                     at: Some(format!("2026-10-12T10:{:02}:00.000Z", index)),
                     order: None,
                     text: text.to_string(),
+                    actions: Vec::new(),
                 })
                 .collect();
             store.apply(&source, true, &messages, &[]).unwrap();
@@ -761,6 +768,48 @@ mod tests {
         };
         assert_eq!(search(&[]), vec!["new".to_string()]);
         assert_eq!(search(&["planner"]), vec!["new".to_string(), "old".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_conversation_is_found_by_a_site_it_went_to() {
+        use super::super::{Message, Role, SourceConversation};
+        let (mut store, dir) = store_with("site", &[("plain", &[("user", "Corrige le carrousel qui plante à la publication")])]);
+        let source = SourceConversation {
+            origin_id: "posted".to_string(),
+            root_id: "posted".to_string(),
+            tool: "cursor",
+            title: None,
+            workspace: None,
+            created_at: None,
+            version: "1".to_string(),
+            source_path: None,
+        };
+        let turn = [
+            Message {
+                key: "u".to_string(),
+                role: Role::User,
+                at: Some("2026-10-12T10:00:00.000Z".to_string()),
+                order: None,
+                text: "Poste la question sur la musique dans leur communauté".to_string(),
+                actions: Vec::new(),
+            },
+            Message {
+                key: "a".to_string(),
+                role: Role::Assistant,
+                at: Some("2026-10-12T10:01:00.000Z".to_string()),
+                order: None,
+                text: String::new(),
+                actions: vec!["navigate: https://developers.example.com/community/threads/new/".to_string()],
+            },
+        ];
+        store.apply(&source, true, &turn, &[]).unwrap();
+        let found = store.by_reference("url", "developers.example.com", 5).unwrap();
+        assert_eq!(found, vec![("posted".to_string(), 1)]);
+        assert!(store.by_reference("url", "other.example.org", 5).unwrap().is_empty());
+        // The words of an action are searchable inside the conversation.
+        let within = store.search_within("posted", "community threads", 5, false).unwrap().unwrap();
+        assert_eq!(within.first().map(|message| message.role.as_str()), Some("action"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

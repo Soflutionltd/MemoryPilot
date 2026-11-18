@@ -305,18 +305,29 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
 
     let mut hits = Vec::new();
     if let Some(reference) = reference.as_deref() {
-        let kind = if reference.len() >= 7 && reference.chars().all(|c| c.is_ascii_hexdigit()) {
-            "commit"
+        let is_commit = reference.len() >= 7 && reference.chars().all(|c| c.is_ascii_hexdigit());
+        let is_address = reference.starts_with("http://") || reference.starts_with("https://");
+        let lookups: Vec<(&str, String)> = if is_commit {
+            vec![("commit", reference.to_lowercase())]
+        } else if is_address {
+            let address = reference.split(['?', '#']).next().unwrap_or(reference).trim_end_matches('/');
+            vec![("url", address.to_string())]
         } else {
-            "file"
+            // A file path first; a bare site name ("developers.example.com") is no file.
+            vec![("file", reference.to_string()), ("url", reference.to_string())]
         };
-        let value = if kind == "commit" { reference.to_lowercase() } else { reference.to_string() };
-        let found = match store.by_reference(kind, &value, offset + limit + 1 + spare) {
-            Ok(found) => found,
-            Err(error) => return tool_error(&error),
-        };
-        for (conversation_id, mentions) in found {
-            hits.push(json!({ "conversation_id": conversation_id, "mentions": mentions }));
+        for (kind, value) in lookups {
+            let found = match store.by_reference(kind, &value, offset + limit + 1 + spare) {
+                Ok(found) => found,
+                Err(error) => return tool_error(&error),
+            };
+            if found.is_empty() {
+                continue;
+            }
+            for (conversation_id, mentions) in found {
+                hits.push(json!({ "conversation_id": conversation_id, "mentions": mentions }));
+            }
+            break;
         }
     }
     let mut related_memories = Vec::new();

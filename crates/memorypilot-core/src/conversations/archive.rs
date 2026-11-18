@@ -676,6 +676,7 @@ fn parse(content: &str, path: &Path) -> Result<ArchivedConversation, String> {
                 at: attribute(line, "at").filter(|at| *at != "-").map(str::to_string),
                 order: Some(threads.last().map(|(_, messages)| messages.len()).unwrap_or(0)),
                 text: String::new(),
+                actions: Vec::new(),
             });
             skip_label = attribute(line, "empty").is_none();
         } else if let Some(message) = open.as_mut() {

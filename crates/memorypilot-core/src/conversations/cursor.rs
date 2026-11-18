@@ -100,6 +100,8 @@ struct Bubble {
     text: Option<String>,
     #[serde(rename = "createdAt")]
     created_at: Option<serde_json::Value>,
+    #[serde(rename = "toolFormerData")]
+    tool: Option<ToolCall>,
 }
 
 /// A bubble as the archive reads it: the text, and for a tool call only
@@ -117,6 +119,7 @@ struct FullBubble {
 
 #[derive(Deserialize)]
 struct ToolCall {
+    name: Option<String>,
     params: Option<String>,
     #[serde(rename = "rawArgs")]
     raw_args: Option<String>,
@@ -175,7 +178,7 @@ pub fn read_thread(conn: &Connection, composer: &Composer) -> Result<Thread, Str
         };
         let Some(text) = bubble.text.filter(|t| !t.trim().is_empty()) else { continue };
         let at = bubble.created_at.as_ref().and_then(timestamp_of).or_else(|| base.clone());
-        thread.messages.push(Message { key: id.to_string(), role, at, order: position.get(id).copied(), text });
+        thread.messages.push(Message { key: id.to_string(), role, at, order: position.get(id).copied(), text, actions: Vec::new() });
     }
     thread.messages.sort_by(|a, b| {
         let rank = |m: &Message| (m.order.unwrap_or(usize::MAX), m.at.clone(), m.key.clone());
@@ -361,7 +364,20 @@ pub fn read_messages(conn: &Connection, composer: &Composer, ids: &[String]) -> 
             Some(2) => Role::Assistant,
             _ => continue,
         };
-        let Some(text) = bubble.text.filter(|t| !t.trim().is_empty()) else { continue };
+        // A tool call is a bubble of the agent without text.
+        let actions: Vec<String> = bubble
+            .tool
+            .filter(|_| role == Role::Assistant)
+            .and_then(|tool| {
+                let arguments = tool.params.or(tool.raw_args).unwrap_or_default();
+                super::actions::action_line(tool.name.as_deref()?, &serde_json::Value::String(arguments))
+            })
+            .into_iter()
+            .collect();
+        let text = bubble.text.filter(|t| !t.trim().is_empty()).unwrap_or_default();
+        if text.is_empty() && actions.is_empty() {
+            continue;
+        }
         let at = bubble
             .created_at
             .as_ref()
@@ -373,6 +389,7 @@ pub fn read_messages(conn: &Connection, composer: &Composer, ids: &[String]) -> 
             at,
             order: position.get(id.as_str()).copied(),
             text,
+            actions,
         });
     }
     messages.sort_by(|a, b| {

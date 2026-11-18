@@ -119,6 +119,7 @@ pub fn ingest(store: &mut ConversationStore, conversation: &ImportedConversation
             at: message.at.clone(),
             order: Some(order),
             text: message.text.clone(),
+            actions: Vec::new(),
         });
     }
     let mut all_seen: Vec<u64> = seen.into_iter().chain(added).collect();
