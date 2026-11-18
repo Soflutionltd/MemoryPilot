@@ -262,7 +262,7 @@ impl Database {
         importance_max: i32,
     ) -> Result<(usize, usize), String> {
         let now = chrono::Utc::now();
-        let sql = "SELECT id, content, kind, project, importance, updated_at FROM memories WHERE kind NOT IN ('credential', 'architecture', 'transcript_chunk') AND importance <= ?1 AND tags NOT LIKE '%pinned%'";
+        let sql = "SELECT id, content, kind, project, importance, updated_at FROM memories WHERE kind NOT IN ('credential', 'architecture', 'transcript_chunk', 'external_request') AND importance <= ?1 AND tags NOT LIKE '%pinned%'";
         let mut stmt = self
             .conn
             .prepare(sql)
@@ -487,7 +487,7 @@ impl Database {
 
         // Compression potential (compressible old memories)
         let compressible: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM memories WHERE updated_at < ?1 AND importance <= 3 AND kind NOT IN ('credential', 'architecture', 'transcript_chunk') AND tags NOT LIKE '%pinned%'",
+            "SELECT COUNT(*) FROM memories WHERE updated_at < ?1 AND importance <= 3 AND kind NOT IN ('credential', 'architecture', 'transcript_chunk', 'external_request') AND tags NOT LIKE '%pinned%'",
             params![cutoff_30], |r| r.get(0),
         ).unwrap_or(0);
 

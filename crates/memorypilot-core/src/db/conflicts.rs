@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use super::Database;
 
-const SKIP_KINDS: &[&str] = &["transcript", "credential", "skill", "snippet"];
+const SKIP_KINDS: &[&str] = &["transcript", "credential", "skill", "snippet", "external_request"];
 
 /// Strong negations only: "ne ... aucune erreur" / "0 erreur" must not
 /// count as disagreement.

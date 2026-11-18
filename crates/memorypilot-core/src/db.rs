@@ -39,6 +39,9 @@ mod conflicts;
 mod supersede;
 #[path = "db/verification.rs"]
 mod verification;
+#[path = "db/external.rs"]
+mod external;
+pub use external::{ExternalRequest, NewExternalRequest, EXTERNAL_REQUEST_KIND, EXTERNAL_STATUSES};
 #[path = "db/unverified.rs"]
 mod unverified;
 pub use unverified::{claims_an_absence, is_unverified, metadata_for_claim, UNVERIFIED};
@@ -203,6 +206,7 @@ pub const MEMORY_KINDS: &[&str] = &[
     "architecture",
     "problem",
     "skill",
+    "external_request",
 ];
 
 /// Serialized by hand (db/vault.rs): credentials go out masked, with a pointer.

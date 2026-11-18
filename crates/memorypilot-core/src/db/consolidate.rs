@@ -359,7 +359,7 @@ impl Database {
         let mut sql = String::from(
             "SELECT id, project, kind, tags, importance, access_count, created_at, updated_at, content, embedding
              FROM memories
-             WHERE embedding IS NOT NULL AND kind NOT IN ('credential') AND tags NOT LIKE '%pinned%'",
+             WHERE embedding IS NOT NULL AND kind NOT IN ('credential', 'external_request') AND tags NOT LIKE '%pinned%'",
         );
         let mut params_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(p) = canonical_project.as_deref() {

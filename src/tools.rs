@@ -31,6 +31,8 @@ const CORE_TOOLS: &[&str] = &[
     "read_conversation",
     "search_in_conversation",
     "ingest_conversation",
+    "log_external_request",
+    "pending_external",
     "list_skills",
     "get_skill",
     "rate_skill",
@@ -424,6 +426,36 @@ fn all_tool_definitions() -> Value {
                     "dry_run": { "type": "boolean", "default": false }
                 },
                 "required": ["old_name", "new_name"]
+            }
+        },
+        {
+            "name": "log_external_request",
+            "description": "Record something sent to a third party, right after sending it: a post on a vendor's developer forum, a bug report, a support ticket, an e-mail, an app review submission. Without it, a later session cannot know the request exists. Give the destination, the subject, the URL and what was asked. To record an answer or close a request, pass its id with status (pending, answered, closed), last_reply_at or note. Logging the same request twice updates it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "destination": { "type": "string", "description": "Where it went, e.g. 'Meta developer forum', 'App Store Connect', 'support e-mail of the bank'" },
+                    "subject": { "type": "string", "description": "What it is about, in one line" },
+                    "details": { "type": ["string","null"], "description": "What was asked, in a few sentences" },
+                    "url": { "type": ["string","null"], "description": "Link to the post, ticket or thread" },
+                    "sent_at": { "type": ["string","null"], "description": "YYYY-MM-DD or RFC 3339; now when absent" },
+                    "project": { "type": ["string","null"] },
+                    "id": { "type": ["string","null"], "description": "An existing request to update instead of creating one" },
+                    "status": { "type": ["string","null"], "enum": ["pending", "answered", "closed", null] },
+                    "last_reply_at": { "type": ["string","null"], "description": "Date of the last answer received" },
+                    "note": { "type": ["string","null"], "description": "What the answer said" }
+                }
+            }
+        },
+        {
+            "name": "pending_external",
+            "description": "List what was sent to third parties and still waits for an answer (forum posts, bug reports, support tickets, e-mails), the longest-waiting first, with destination, subject, URL, date and days waited. Call it before answering 'did they reply?' or 'did we ever ask them?'. With all=true, also the answered and closed ones.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": ["string","null"], "description": "Only this project; every project when absent" },
+                    "all": { "type": "boolean", "default": false }
+                }
             }
         },
         {
@@ -975,6 +1007,8 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
     let args = resolved.as_ref().unwrap_or(args);
     match name {
         "add_project_alias" => handle_add_project_alias(db, args),
+        "log_external_request" => handle_log_external_request(db, args),
+        "pending_external" => handle_pending_external(db, args),
         "recall" => handle_recall(db, args),
         "remember_working" => handle_remember_working(args),
         "recall_working" => handle_recall_working(db, args),
@@ -1930,6 +1964,50 @@ fn with_resolved_projects(db: &Database, args: &Value) -> Option<Value> {
     Some(args)
 }
 
+fn handle_log_external_request(db: &Database, args: &Value) -> Value {
+    let text = |key: &str| args.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
+    if let Some(id) = text("id") {
+        return match db.update_external_request(id, text("status"), text("last_reply_at"), text("note")) {
+            Ok(Some(request)) => tool_result(&serde_json::to_string_pretty(&request).unwrap()),
+            Ok(None) => tool_error(&format!("External request not found: {}", id)),
+            Err(e) => tool_error(&e),
+        };
+    }
+    let (Some(destination), Some(subject)) = (text("destination"), text("subject")) else {
+        return tool_error("destination and subject required (or id to update a request)");
+    };
+    let new = crate::db::NewExternalRequest {
+        destination,
+        subject,
+        url: text("url"),
+        sent_at: text("sent_at"),
+        project: text("project"),
+        details: text("details"),
+        detected: None,
+    };
+    match db.log_external_request(&new, &scope_from_args(args)) {
+        Ok(request) => tool_result(&serde_json::to_string_pretty(&request).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_pending_external(db: &Database, args: &Value) -> Value {
+    let project = args.get("project").and_then(|v| v.as_str());
+    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    match db.external_requests(project, !all) {
+        Ok(requests) => {
+            let mut output = json!({ "count": requests.len(), "requests": requests });
+            if requests.is_empty() {
+                output["note"] = json!(
+                    "No request is recorded. Only requests logged with log_external_request are known: one written by hand in a browser, or in a session that was never indexed, is not here. Do not conclude that nothing was ever sent."
+                );
+            }
+            tool_result(&serde_json::to_string_pretty(&output).unwrap())
+        }
+        Err(e) => tool_error(&e),
+    }
+}
+
 fn handle_add_project_alias(db: &Database, args: &Value) -> Value {
     let (Some(alias), Some(project)) =
         (args.get("alias").and_then(|v| v.as_str()), args.get("project").and_then(|v| v.as_str()))
@@ -2630,9 +2708,9 @@ pub fn footprint() -> Value {
 }
 
 pub fn server_instructions() -> String {
-    let mut text = String::from("CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials.\n4. A search that finds nothing proves nothing: sessions may be missing from the index. Never store 'it never happened' or 'nothing was sent' as a fact; say it was not found, and where you looked.");
+    let mut text = String::from("CRITICAL WORKFLOW:\n1. Always call 'recall' tool at the start of a conversation.\n2. DURING the conversation, you MUST proactively call 'add_memory' to store any new architecture decision, convention, or significant bug fix. Do NOT ask the user for permission — act as an autonomous technical secretary.\n3. NEVER store secrets, passwords, API keys, or tokens in memory. Use environment variables or secret managers for credentials.\n4. A search that finds nothing proves nothing: sessions may be missing from the index. Never store 'it never happened' or 'nothing was sent' as a fact; say it was not found, and where you looked.\n5. Right after you post, submit or send something to a third party (vendor forum, bug report, support ticket, e-mail, app review), call 'log_external_request' with the destination, subject and URL; call 'pending_external' before answering whether someone replied or was ever asked.");
     if let Some(line) = crate::agent_skills::agents_dir().and_then(|root| crate::agent_skills::instructions_line(&root)) {
-        text.push_str("\n5. ");
+        text.push_str("\n6. ");
         text.push_str(&line);
     }
     text
@@ -2779,6 +2857,37 @@ mod tests {
 
     fn text_of(response: &Value) -> Value {
         serde_json::from_str(response["content"][0]["text"].as_str().expect("text")).expect("json")
+    }
+
+    #[test]
+    fn a_request_sent_to_a_third_party_is_logged_then_listed_as_waiting() {
+        let dir = std::env::temp_dir().join(format!("mp-tools-external-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Database::open_at(&dir.join("memory.db")).expect("db");
+        let empty = text_of(&handle_tool_call(&db, "pending_external", &json!({})));
+        assert_eq!(empty["count"], 0);
+        assert!(empty["note"].as_str().expect("note").contains("Do not conclude"));
+
+        let logged = text_of(&handle_tool_call(&db, "log_external_request", &json!({
+            "destination": "forum développeurs Meta",
+            "subject": "Musique sur une publication Instagram programmée",
+            "url": "https://developers.facebook.com/community/threads/1234567890/",
+            "sent_at": "2026-10-12",
+            "project": "MonApp",
+        })));
+        assert_eq!(logged["status"], "pending");
+        let id = logged["id"].as_str().expect("id");
+        let pending = text_of(&handle_tool_call(&db, "pending_external", &json!({ "project": "monapp" })));
+        assert_eq!(pending["count"], 1);
+        assert_eq!(pending["requests"][0]["url"], "https://developers.facebook.com/community/threads/1234567890/");
+
+        let answered = text_of(&handle_tool_call(&db, "log_external_request", &json!({ "id": id, "last_reply_at": "2026-11-20", "note": "Not supported yet" })));
+        assert_eq!(answered["status"], "answered");
+        assert_eq!(text_of(&handle_tool_call(&db, "pending_external", &json!({})))["count"], 0);
+        assert_eq!(text_of(&handle_tool_call(&db, "pending_external", &json!({ "all": true })))["count"], 1);
+        assert!(handle_tool_call(&db, "log_external_request", &json!({ "subject": "x" }))["isError"].as_bool().unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

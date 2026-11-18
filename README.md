@@ -213,7 +213,7 @@ v4.6.0 targets the LongMemEval categories a top-k retriever alone cannot win: mu
 | Deduplication | Content hash (exact) + Jaccard 85% (fuzzy) | Basic hash | Confidence scoring | Embedding similarity | LLM-based merge |
 | HTTP API | Multi-threaded REST server (optional) | No | REST + MCP + leases + signals | Cloud hosted | REST + GraphQL |
 | Memory types | 13 types, importance 1-5 | Wings/Rooms hierarchy | Tier-based (working / short / long / archival) | 1 type | Episodic / semantic |
-| MCP tools | 72 tools, 23 exposed by default (the rest behind `memory_admin`) | 47 tools | **65 tools** | N/A | Limited MCP server |
+| MCP tools | 74 tools, 25 exposed by default (the rest behind `memory_admin`) | 47 tools | **65 tools** | N/A | Limited MCP server |
 | Hooks / event capture | SessionStart auto-recall for **Cursor, Claude Code and Codex**, per-prompt recall (Claude Code), conversation index at session end, opt-in Stop auto-ingest (incremental, distilled, agent narration filtered, secrets redacted) + file watcher | No | **12 named hooks** (Claude Code, Cursor, Codex, Copilot CLI…) | No | No |
 | Privacy | 100% local, zero API calls | 100% local | 100% local (SQLite) | Cloud dependent | Cloud or self-host (LLM required) |
 | Language | Rust (single binary, zero deps) | Python (pip install) | TypeScript / Node (npm install) | SaaS | Python + Neo4j |
@@ -498,7 +498,7 @@ MemoryPilot --backfill
 MemoryPilot --backfill-force
 ```
 
-## MCP Tools (23 by default, 72 in the full profile)
+## MCP Tools (25 by default, 74 in the full profile)
 
 ### Core
 
@@ -511,6 +511,8 @@ MemoryPilot --backfill-force
 | **`find_conversation`** | Finds a past conversation from a vague description, across Cursor (every window, sub-agents folded into their conversation), Claude Code and Claude desktop agent sessions. Exact words and stems, misheard words (one or two letters off, split names glued back), and meaning, fused per conversation. Also finds conversations by a commit or a file they mention. Returns the matching message, commits, files and related memories. |
 | **`read_conversation`** | Reads a found conversation, paginated, optionally centred on the matching message. |
 | **`search_in_conversation`** | Searches inside one conversation and returns only the matching messages (id, role, date, snippet), so a conversation of thousands of messages is searched instead of paged through. |
+| **`log_external_request`** | Records what was sent to a third party (forum post, bug report, support ticket, e-mail): destination, subject, URL, date, status and last reply. Updates a request when an answer arrives. |
+| **`pending_external`** | Lists the requests still waiting for an answer, the longest-waiting first. They also open the recall of their project. |
 
 ### Memory CRUD
 

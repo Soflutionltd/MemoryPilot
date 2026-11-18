@@ -141,6 +141,7 @@ impl Database {
             "architecture" => "ARCH",
             "milestone" => "MILE",
             "problem" => "PROB",
+            "external_request" => "EXT",
             _ => "MEM",
         };
         let truncated = crate::text::preview_words(&mem.content, COMPACT_LINE_BYTES);
@@ -439,6 +440,8 @@ impl Database {
     ) -> Result<serde_json::Value, String> {
         // ~4 chars per token — 800 token budget = 3200 chars for memories
         const TOKEN_BUDGET_CHARS: usize = 3200;
+        /// Requests without an answer listed at the top of a recall.
+        const MAX_WAITING_RECALLED: usize = 5;
 
         // Auto-detect project
         let proj_name = match Self::canonical_project(project) {
@@ -781,6 +784,10 @@ impl Database {
             .chain(&decisions)
             .map(|m| m.id.as_str())
             .collect();
+        // What still waits for an answer from a third party, said first:
+        // nobody thinks of asking for it.
+        let waiting = self.external_requests(proj_ref, true).unwrap_or_default();
+        let waiting_lines = external::waiting_lines(&waiting, MAX_WAITING_RECALLED);
         if compact {
             let mut lines = Vec::new();
             lines.push(format!(
@@ -788,6 +795,9 @@ impl Database {
                 proj_ref.unwrap_or("none"),
                 mode.as_str()
             ));
+            if !waiting_lines.is_empty() {
+                lines.push(format!("--- waiting on third parties ---\n{}", waiting_lines.join("\n")));
+            }
             if !critical.is_empty() {
                 lines.push(format!(
                     "--- critical ---\n{}",
@@ -881,6 +891,9 @@ impl Database {
             "decisions": decisions.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
             "global_prompt": global_prompt.as_deref().unwrap_or(""),
         });
+        if !waiting.is_empty() {
+            response["waiting_on_third_parties"] = serde_json::json!(waiting.iter().take(MAX_WAITING_RECALLED).collect::<Vec<_>>());
+        }
         if let (Some(secrets), Some(object)) = (secrets, response.as_object_mut()) {
             object.insert("secrets".into(), secrets);
         }

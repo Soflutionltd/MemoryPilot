@@ -24,7 +24,7 @@ pub(crate) const SUPERSEDED_TAG: &str = "superseded";
 const AUTO_LAST_RUN_KEY: &str = "supersede_last_run";
 const AUTO_INTERVAL_SECS: i64 = 6 * 3600;
 
-const SKIP_KINDS: &[&str] = &["transcript", "credential", "skill", "snippet", "todo"];
+const SKIP_KINDS: &[&str] = &["transcript", "credential", "skill", "snippet", "todo", "external_request"];
 const STATUS_KINDS: &[&str] = &["milestone", "fact"];
 const DURABLE_KINDS: &[&str] = &[
     "decision",

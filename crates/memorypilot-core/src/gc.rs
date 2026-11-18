@@ -156,6 +156,7 @@ pub fn gc_score(importance: i32, age_days: i64, kind: &str, _config: &GcConfig) 
         "skill" => 0.1,      // Skills are curated procedures
         "fact" => 0.4,       // Facts may become outdated
         "credential" => 0.1, // Credentials should persist
+        "external_request" => 0.1, // What was sent to a third party stays on record
         _ => 0.5,
     };
 

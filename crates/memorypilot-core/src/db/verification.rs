@@ -30,7 +30,7 @@ const CURRENT_STATE_KINDS: &[&str] = &[
 ];
 /// Kinds that may describe an open problem in prose ("faille non corrigée").
 const PROSE_KINDS: &[&str] = &["fact", "note", "decision", "pattern"];
-const SKIP_KINDS: &[&str] = &["credential", "transcript"];
+const SKIP_KINDS: &[&str] = &["credential", "transcript", "external_request"];
 const OPEN_MARKERS: &[&str] = &[
     "non corrigé",
     "pas corrigé",
