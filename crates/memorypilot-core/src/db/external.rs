@@ -267,12 +267,12 @@ impl Database {
         }
         let mut added = 0;
         for submission in store.unreported_submissions(&hosts)? {
-            let request = submission.request.split_whitespace().collect::<Vec<_>>().join(" ");
-            let subject = crate::text::preview(&request, 140);
+            let subject = crate::text::preview(&submission.typed.split_whitespace().collect::<Vec<_>>().join(" "), 140);
+            let asked = crate::text::preview(&submission.request.split_whitespace().collect::<Vec<_>>().join(" "), 200);
             let project = submission.project.as_deref().and_then(|project| self.resolve_project(project));
             let details = format!(
-                "Found in the actions of conversation {}: text was typed on {}. Not confirmed: check it was sent, then update or close it.",
-                submission.conversation_id, submission.host
+                "Found in the actions of conversation {}: this text was typed on {}, in a turn that asked: {}. Not confirmed: check it was sent, then update or close it.",
+                submission.conversation_id, submission.host, asked
             );
             let new = NewExternalRequest {
                 destination: &submission.host,
@@ -414,6 +414,7 @@ mod tests {
                 actions: vec![
                     "navigate: https://developers.facebook.com/community/threads/new/".to_string(),
                     "form_input: Music on a scheduled Instagram post".to_string(),
+                    "form_input: A post scheduled through the content publishing API cannot carry a music track. Is there a supported way to attach one?".to_string(),
                 ],
             },
         ];
@@ -425,7 +426,7 @@ mod tests {
         assert_eq!(waiting[0].destination, "developers.facebook.com");
         assert_eq!(waiting[0].detected.as_deref(), Some("session"));
         assert_eq!(waiting[0].sent_at, "2026-10-12T10:05:00.000Z");
-        assert!(waiting[0].subject.starts_with("Poste la question sur la musique"));
+        assert!(waiting[0].subject.starts_with("A post scheduled through the content publishing API"), "the subject is what was typed: {}", waiting[0].subject);
         assert!(waiting_lines(&waiting, 5)[0].contains(", to confirm)"));
 
         // Closed by the user, it is not proposed again at the next indexing.

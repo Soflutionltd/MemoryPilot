@@ -178,7 +178,7 @@ fn posting_turn(id: &str) -> Vec<Message> {
             Role::Assistant,
             "2026-10-12T10:05:00.000Z",
             "",
-            &["navigate: https://developers.facebook.com/community/threads/new/", "form_input: Music on a scheduled Instagram post"],
+            &["navigate: https://developers.facebook.com/community/threads/new/", "form_input: Music on a scheduled Instagram post", "form_input: A post scheduled through the content publishing API cannot carry a music track. Is there a supported way to attach one?"],
         ),
         message(&format!("{}-a3", id), Role::Assistant, "2026-10-12T10:06:00.000Z", "C'est posté dans leur communauté, je surveille la réponse.", &[]),
     ]
