@@ -105,6 +105,17 @@ impl Database {
     }
 }
 
+/// Finalists a search keeps before the cross-encoder: `limit`, or at least
+/// the wide rerank width when a caller asked for a wide rerank.
+fn candidate_pool(limit: usize, wide: bool) -> usize {
+    if wide {
+        limit.clamp(crate::reranking::WIDE_RERANK_WIDTH, MAX_SEARCH_LIMIT)
+    } else {
+        limit
+    }
+}
+
+
 /// Vectors in the approximate index from which a search scores only the
 /// approximate neighbours and the keyword hits, instead of every memory.
 pub const ANN_BYPASS_THRESHOLD: usize = 5_000;
@@ -497,13 +508,16 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     // Instead the RRF ranks just below the pool are kept aside and
     // appended right before MMR, below every genuine finalist, so a
     // distinct candidate can still displace a near-duplicate.
+    // A wide rerank needs that many finalists to rescore, whatever the
+    // limit: the list is cut back to `limit` once they are ordered.
+    let pool = candidate_pool(limit, crate::reranking::wide_scope());
     let session_candidate_limit = if crate::session_fusion::should_expand_candidates(query) {
-        (limit * 3).min(30).max(limit)
+        (pool * 3).min(30).max(pool)
     } else {
-        limit
+        pool
     };
     let mmr_reserve_limit = if crate::diversity::is_enabled() {
-        (limit * crate::diversity::pool_multiplier()).min(24).max(limit)
+        (pool * crate::diversity::pool_multiplier()).min(24).max(pool)
     } else {
         0
     };
@@ -735,4 +749,18 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     store.record_access(&returned);
 
     Ok((results, confidence))
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::candidate_pool;
+
+    #[test]
+    fn a_wide_rerank_rescores_its_full_width_whatever_the_limit() {
+        assert_eq!(candidate_pool(10, false), 10);
+        assert_eq!(candidate_pool(50, false), 50);
+        assert_eq!(candidate_pool(30, true), 64);
+        assert_eq!(candidate_pool(50, true), 64);
+        assert_eq!(candidate_pool(80, true), 80);
+    }
 }

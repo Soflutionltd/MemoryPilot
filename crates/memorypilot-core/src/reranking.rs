@@ -446,6 +446,11 @@ pub fn with_wide_rerank<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// True inside [`with_wide_rerank`].
+pub(crate) fn wide_scope() -> bool {
+    WIDE_SCOPE.with(|c| c.get())
+}
+
 /// How many candidates the cross-encoder rescores: the wide width inside
 /// [`with_wide_rerank`], else `MEMORYPILOT_CROSS_RERANK_TOP_K` (2 to 64).
 fn rerank_width(raw: Option<&str>, wide: bool) -> usize {
