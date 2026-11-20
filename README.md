@@ -85,7 +85,7 @@ Evaluated on the 470 answerable questions of [LongMemEval-S](https://arxiv.org/a
 | Zep / Graphiti (2025 paper) | 63.8% / 71.2% | not published | gpt-4o-mini / gpt-4o as reader, GPT-4o judge | [arXiv 2501.13956](https://arxiv.org/abs/2501.13956), Table 2 |
 | Supermemory | 85.2% / 84.6% | not published | gemini-3-pro / gpt-5 as reader, LongMemEval-S, 500 questions | [supermemory.ai research](https://supermemory.ai/research/longmembench/), read 2026-11-16 |
 
-**MemoryPilot's end-to-end run (2026-11-18, `main` after v4.13.0).** All 500 questions, abstention included. MemoryPilot indexes each haystack turn by turn with no LLM call, answers one `search_memory` per question, and the 50 turns it returns go to the reader in the official LongMemEval prompt (`run_generation.py`, chain of thought on). The official judge prompts (`evaluate_qa.py`) grade the answers with `gpt-4o-2024-08-06` at temperature 0. The search is a compact one: assistant turns ranked after the third are cut to 150 characters, which keeps the prompt at 6,047 tokens per question (measured: 3,023,706 prompt tokens over 500 questions).
+**MemoryPilot's end-to-end run (2026-11-18, compact search as released in v4.14.0).** All 500 questions, abstention included. MemoryPilot indexes each haystack turn by turn with no LLM call, answers one `search_memory` per question, and the 50 turns it returns go to the reader in the official LongMemEval prompt (`run_generation.py`, chain of thought on). The official judge prompts (`evaluate_qa.py`) grade the answers with `gpt-4o-2024-08-06` at temperature 0. The search is a compact one: assistant turns ranked after the third are cut to 150 characters, which keeps the prompt at 6,047 tokens per question (measured: 3,023,706 prompt tokens over 500 questions).
 
 | Question type | Correct |
 |---------------|--------:|
@@ -108,7 +108,7 @@ MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --e2e 
 MemoryPilot --benchmark-longmemeval benchmarks/longmemeval_s_cleaned.json --rejudge run.json --llm-base-url https://api.openai.com/v1 > run-gpt4o.json
 ```
 
-Limits of this measure: a single run; the settings (50 turns, cut at 150 characters after rank 3) were chosen on this same question set, not on a held-out split; nobody outside this project has rerun it. The compact mode is on `main` and ships with the release after v4.13.0.
+Limits of this measure: a single run; the settings (50 turns, cut at 150 characters after rank 3) were chosen on this same question set, not on a held-out split; nobody outside this project has rerun it. The compact mode ships in v4.14.0; the run predates the widening of its candidate pool to 100, which has not been measured end to end.
 
 > All figures are published by their own authors, none was reproduced independently, and the two tables cannot be compared with each other. On answer accuracy MemoryPilot is second to Recallium's published score and uses about half its context; on session-level recall MemoryPilot posts the highest published local score, by a margin smaller than the gap between this metric and a plain BM25 baseline. The protocol to settle a comparison: same 470 questions, same hardware, every system run by the same script, reporting `recall_any@5`, `recall_all@5`, turn-level evidence recall and end-to-end QA accuracy with a fixed reader and judge.
 
@@ -116,7 +116,7 @@ Limits of this measure: a single run; the settings (50 turns, cut at 150 charact
 
 Quality is one axis. The others decide what a memory costs on every conversation and every write.
 
-| Measure | MemoryPilot v4.13 | How to reproduce |
+| Measure | MemoryPilot v4.14 | How to reproduce |
 |---------|------------------:|------------------|
 | LLM calls per write | **0** | Dedup, entities, graph links and embeddings run locally |
 | LLM calls per search | **0** | Local encoder and reranker |
@@ -338,6 +338,21 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## What's new in v4.14
+
+- **Compact search** (`search_memory` with `compact: true`): the same ranking in a short context. Assistant turns ranked after the third are cut to 150 characters, unless the question is about what the assistant said; a total or a timeline reaches further. The reranker reads 64 candidates out of a pool of 100, whatever the limit. This is the mode behind the LongMemEval-S result above: 97.2% (486/500) at 6,047 prompt tokens per question.
+- **One reranker, served from this repository**: multilingual-reranker-small replaces the previous one; its download and loading are more robust.
+- **Conversation finder**: a turn keeps its drafts, its actions and its whole texts; a question in French finds a text written in English, and the reverse; `search_in_conversation` searches inside one conversation; the running conversation no longer shows up in its own search; the index says what it may be missing; a message that Cursor stores under several identifiers is indexed once. A memory keeps the conversation it comes from.
+- **Projects**: a project is identified by its git remote, worktrees are attached to it, and a name alias leads to the same project. `merge_projects`, `rename_project` and the `project` field of `update_memory`, with a backup of the database before any merge or rename. `get_memory_health` reports duplicate and orphan projects.
+- **Secrets no longer hide a note**: a note that holds a secret keeps its kind and its text, and only the value is masked (`[secret masqué : …]`); the answer of `add_memory` says so. The value is not kept: it belongs in a secret manager. Only an explicit `credential` goes to the vault. File names, version tags and code identifiers are no longer taken for secret values.
+- **Tool annotations**: each of the 74 tools states its title and whether it reads, adds or changes data (`readOnlyHint`, `destructiveHint`), so a client can ask for confirmation where it matters.
+- **Memory kinds**: requests sent to a third party have their own kind and a waiting list; an absence that was not confirmed is no longer stored as a fact; a kind chosen by the caller no longer receives an automatic expiry.
+- **Skills**: third-party skills are imported and updated after review, with a trust list for updates without review.
+- **`--footprint`**: what MemoryPilot costs a client before any call (tools, characters, instructions).
+- **Benchmark tooling**: end-to-end LongMemEval with an LLM judge (`--e2e`), evidence coverage at several depths without any LLM call, re-grading of saved answers by another judge (`--rejudge`).
+- **Fixes**: a first start on a new database no longer fails with "database is locked"; the description of `memory_admin` fits the 4,096-character limit of clients; rustix moved to its patched release (RUSTSEC-2026-0486).
+- **Known advisory, not fixed in this release**: the bundled SQLite (3.45, through rusqlite 0.31) is affected by CVE-2026-119375, which needs a crafted database and `-wal` pair written by another party into MemoryPilot's data directory. The fix is rusqlite 0.41 or later, a breaking upgrade planned for the next release.
+
 ## What's new in v4.13
 
 - **Conversation finder** (`find_conversation`, `read_conversation`): "the Gina comparison for MemoryPilot sorting" finds the conversation where it happened, whichever tool it was in. The index lives in its own database (`~/.MemoryPilot/conversations.db`, never mixed with memories), is read-only on the sources, and syncs incrementally (a few seconds at most, before a search). It keeps each request, the final answer of each turn, what the agent wrote at length on the way (a draft, a plan) and the actions of the turn (commands run, pages opened), whole, not its short progress notes: 703 conversations, 26,000 messages and 110 MB (vectors included) for 120 GB of Cursor history. On 22 real questions asked from memory, the right conversation comes first for 77% of them and in the top 3 for all of them (MRR 0.87, 150 ms median); words alone reach 91% in the top 3 in 26 ms. `--index-conversations` (with `--rebuild` to read every conversation again from its source, as after an upgrade that indexes more), `--find-conversation "<query>"`, `--benchmark-conversations <file>`. A question in French finds a message written in English, and the reverse, by a lane of translated words (a French and English lexicon of everyday and product vocabulary). The index also says what it may be missing (`coverage_warnings`: a sync that failed, a session seen running but never read, weeks of silence inside a long conversation), and a turn where the agent typed text on a site known for requests (a vendor's developer forum, a feedback form; more with the `external_hosts` setting) is recorded as an external request to confirm.
@@ -434,7 +449,7 @@ Not updated automatically: Homebrew installs (`brew upgrade memorypilot`), binar
 ```bash
 # Via Cargo, pinned to a release tag — works anywhere Rust runs
 # (unsigned on macOS: Keychain prompt after each update if you store credentials):
-cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.13.0 --bin MemoryPilot
+cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.14.0 --bin MemoryPilot
 
 # Local clone + auto-config (same installer, run from inside the repo):
 git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && ./install.sh
