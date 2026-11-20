@@ -234,11 +234,9 @@ pub fn auto_classify(content: &str) -> (i32, &'static str, Option<i64>) {
     let lower = content.to_lowercase();
     let any = |terms: &[&str]| terms.iter().any(|term| has_term(&lower, term));
 
-    // Only an actual secret value makes a credential: a credential is hidden from
-    // safe recall, so "secrets go to 1Password" or "90k tokens" must stay visible.
-    if crate::db::contains_secret_value(content) {
-        return (5, "credential", None);
-    }
+    // A secret value does not decide the kind: the write masks the value
+    // and the note keeps the kind its text earns, so that it stays visible
+    // in recall. Only a memory sent as a credential goes to the vault.
 
     // Conversation chunks are useful for retrieval, but should not crowd durable facts.
     let corpus = crate::graph::analyze_corpus(content, None);
@@ -358,7 +356,8 @@ mod tests {
         ] {
             assert_ne!(auto_classify(content).1, "credential", "{}", content);
         }
-        assert_eq!(auto_classify("Compte test : demo@example.com / password: Hx9!kLm2pQ").1, "credential");
+        // A real value does not make the note a credential either: the write masks it.
+        assert_ne!(auto_classify("Compte test : demo@example.com / password: Hx9!kLm2pQ").1, "credential");
     }
 
     #[test]

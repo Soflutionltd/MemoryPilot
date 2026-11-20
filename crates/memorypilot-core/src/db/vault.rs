@@ -647,6 +647,16 @@ const FILE_EXTENSIONS: &[&str] = &[
     "mov", "log", "plist", "ipa", "apk", "aab", "tar", "gz", "icc", "icm",
 ];
 
+/// More extensions, read strictly: the name before them must not look
+/// like a value on its own (`Hx9!kLm2pQ.c`, `Zq8xW3kLp9RtYv2m.ini`). The
+/// first list stays lenient because key files are named after their key
+/// id (`AuthKey_77ZLGAGK7W.p8`), which is what one searches for.
+const MORE_FILE_EXTENSIONS: &[&str] = &[
+    "xlsx", "xls", "docx", "doc", "pptx", "ppt", "odt", "ods", "numbers", "pages", "gif", "heic", "mp3", "wav",
+    "webm", "ttf", "otf", "woff", "woff2", "xml", "ini", "lock", "bak", "db", "sqlite", "tsx", "jsx", "kt", "go",
+    "rb", "php", "java", "c", "h", "cpp",
+];
+
 /// A known prefix followed by a value: the prefix alone (`sk_live`, « AIza ») is a mention.
 fn has_secret_prefix(core: &str) -> bool {
     SECRET_PREFIXES
@@ -712,9 +722,46 @@ fn is_advisory_id(core: &str) -> bool {
             .all(|group| group.len() == 4 && group.chars().all(|c| "23456789cfghjmpqrvwx".contains(c)))
 }
 
+/// A name followed by a known extension. The name itself must not read
+/// as a key: `a8Kf3xQ9mZ2pL7vN4wR8.json` is a key someone saved, not a
+/// file worth finding by its name.
 fn is_file_name(core: &str) -> bool {
-    core.rsplit_once('.')
-        .is_some_and(|(stem, extension)| !stem.is_empty() && FILE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+    core.rsplit_once('.').is_some_and(|(stem, extension)| {
+        let extension = extension.to_ascii_lowercase();
+        if stem.is_empty() || has_secret_prefix(stem) || random_part(stem) {
+            return false;
+        }
+        FILE_EXTENSIONS.contains(&extension.as_str())
+            || (MORE_FILE_EXTENSIONS.contains(&extension.as_str()) && !looks_secret(stem))
+    })
+}
+
+/// A version tag as names carry them (`V22`, `v7`, `v4`): a letter v and
+/// one to four digits.
+fn is_version_tag(part: &str) -> bool {
+    part.strip_prefix(['v', 'V'])
+        .is_some_and(|digits| (1..=4).contains(&digits.len()) && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Words, numbers and version tags joined by separators
+/// (`IdeeKdo_Selection_Cultura_V22`, `rapport-ventes-v4.16`): a name
+/// someone gave, not a value drawn at random.
+fn words_and_versions(core: &str) -> bool {
+    let parts: Vec<&str> = core.split(['-', '_', '.', ':']).filter(|part| !part.is_empty()).collect();
+    let named: Vec<&str> = parts.iter().copied().filter(|part| !is_version_tag(part)).collect();
+    named.len() < parts.len() && !named.is_empty() && made_of_words(named.iter().copied()) && named.iter().any(|part| part.chars().filter(|c| c.is_alphabetic()).count() >= 3)
+}
+
+/// A long run of letters and digits that is not made of words: the random
+/// part of a key, even in lowercase behind a prefix (`sbp_<40 hex>`).
+fn random_part(core: &str) -> bool {
+    !core.contains('/')
+        && core.split(['-', '_', '.', ':']).any(|part| {
+            part.chars().count() >= 20
+                && part.chars().any(|c| c.is_ascii_digit())
+                && part.chars().any(|c| c.is_alphabetic())
+                && !made_of_words([part])
+        })
 }
 
 /// Lowercase words of a label, split on punctuation and camelCase (`(zoneId` -> zone, id).
@@ -864,7 +911,7 @@ pub(crate) fn looks_secret(token: &str) -> bool {
         && core.matches('-').count() < 3
         && !joined_words(core);
     let separators = ['-', '_', '.', ':'];
-    let word_like = made_of_words(core.split(separators).filter(|part| !part.is_empty()));
+    let word_like = made_of_words(core.split(separators).filter(|part| !part.is_empty())) || words_and_versions(core);
     // Long random token. Lowercase words joined by separators
     // (`multilingual-e5-small`, `x86_64-unknown-linux-musl`) and camelCase names are not keys.
     let separated = core.contains(separators);
@@ -876,13 +923,7 @@ pub(crate) fn looks_secret(token: &str) -> bool {
         && !word_like
         && (!separated || (has_upper && has_lower));
     // A long random part behind a prefix, even in lowercase (`sbp_<40 hex>`, `glpat-…`).
-    let random_part = !core.contains('/') && core.split(separators).any(|part| {
-        part.chars().count() >= 20
-            && part.chars().any(|c| c.is_ascii_digit())
-            && part.chars().any(|c| c.is_alphabetic())
-            && !made_of_words([part])
-    });
-    random_token || random_part || password_like
+    random_token || random_part(core) || password_like
 }
 
 /// True when the text holds a secret VALUE (key, token, password), not
@@ -956,6 +997,62 @@ pub(crate) fn find_secret_value(content: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// What a memory that is not a credential stores for `content`: the text
+/// as given when it holds no secret value, else the text with each value
+/// replaced by the mask of `secrets.rs`, so that the note keeps its kind
+/// and stays searchable. The value itself is not kept anywhere. `None`
+/// when a value could not be masked: the caller then seals the whole
+/// text, as before, rather than store it in clear.
+pub(crate) fn without_secret_values(content: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !contains_secret_value(content) && matches!(crate::secrets::redact(content), std::borrow::Cow::Borrowed(_)) {
+        return Some(std::borrow::Cow::Borrowed(content));
+    }
+    // Two detectors read a text: the one of the conversation index
+    // (`secrets.rs`) and the one of the vault. A value either of them
+    // sees must not stay in a note anyone can search.
+    let mut text = crate::secrets::redact(content).into_owned();
+    for _ in 0..64 {
+        if !contains_secret_value(&text) {
+            return Some(std::borrow::Cow::Owned(text));
+        }
+        text = mask_first_value(&text)?;
+    }
+    None
+}
+
+/// `text` with the first value the vault sees masked where it stands. The
+/// value is replaced in its own token only: a one-letter password in a
+/// URI must not blank that letter in every other word. `None` when the
+/// value cannot be placed.
+fn mask_first_value(text: &str) -> Option<String> {
+    const MASK_OPEN: &str = "[secret masqué : ";
+    let tokens: Vec<(usize, &str)> =
+        text.split_whitespace().map(|token| (token.as_ptr() as usize - text.as_ptr() as usize, token)).collect();
+    let replaced = |start: usize, end: usize, with: &str| format!("{}{}{}", &text[..start], with, &text[end..]);
+    for (offset, token) in &tokens {
+        if let Some((start, end)) = uri_password_range(token) {
+            let password = &token[start..end];
+            if password != "••••" && !password.starts_with('$') && !password.starts_with('<') {
+                return Some(replaced(offset + start, offset + end, &crate::secrets::mask("secret", password)));
+            }
+        }
+    }
+    let value = find_secret_value(text)?;
+    let core_of = |token: &str| token.trim_matches(|c: char| !c.is_alphanumeric() && !PASSWORD_SYMBOLS.contains(&c)).to_string();
+    let (offset, token) = tokens
+        .iter()
+        .find(|(_, token)| core_of(token) == value)
+        .or_else(|| tokens.iter().find(|(_, token)| token.contains(value.as_str())))?;
+    let at = offset + token.find(value.as_str())?;
+    // What an earlier mask left of the value it covered (`…ab12]\d`): the
+    // rest goes, the mask keeps its closing bracket.
+    let inside_mask = text[..*offset].rfind(MASK_OPEN).is_some_and(|open| !text[open..*offset].contains(']'));
+    if let Some(close) = value.find(']').filter(|_| inside_mask) {
+        return Some(replaced(at + close + 1, at + value.len(), ""));
+    }
+    Some(replaced(at, at + value.len(), &crate::secrets::mask("secret", &value)))
 }
 
 /// Searchable label with secret-looking tokens masked.
@@ -1933,5 +2030,155 @@ mod tests {
             let value = find_secret_value(secret).expect("value");
             assert!(!masked_label(secret).contains(&value), "{} shown in the label of {}", value, secret);
         }
+    }
+
+    #[test]
+    fn names_of_files_versions_and_code_are_not_secret_values() {
+        for content in [
+            "Essai : fichier IdeeKdo_Selection_Cultura_V22.xlsx",
+            "Le tableau Suivi_Commandes_Librairie_V7.xlsx remplace Suivi_Commandes_Librairie_V6.xlsx",
+            "Export du jour : rapport-ventes-novembre-v4.16.csv et Bilan_Annuel_2026_v3.docx",
+            "Maquette Accueil_Boutique_Mobile_V12.png, logo MonApp_Icone_Finale_v2.svg",
+            "Le script import_catalogue_fournisseur_v7.py lit Catalogue_Fournisseur_V7.json",
+            "Présentation Lancement_Produit_Automne_V3.pptx envoyée, notes dans Compte_Rendu_Reunion_V2.md",
+            "Version du flux : Flux_Catalogue_Partenaire_V22 remplace Flux_Catalogue_Partenaire_V21",
+            "Architecture : la clé API du partenaire est lue côté serveur, jamais exposée au navigateur",
+            "La variable d'environnement AWIN_FLUX_CULTURA donne l'adresse du flux, AWIN_FLUX_CULTURA_V2 la suivante",
+            "Routes d'administration : /api/admin/recharger et /api/admin/vider-le-cache, protégées par session",
+            "Couleurs de la marque : #612A9E pour le fond, #F4EFFA pour les cartes, #1B1B1F pour le texte",
+        ] {
+            assert_eq!(find_secret_value(content), None, "{}", content);
+            assert_eq!(without_secret_values(content).as_deref(), Some(content), "stored as given: {}", content);
+        }
+    }
+
+    #[test]
+    fn real_values_stay_detected_even_when_they_look_like_file_names() {
+        // Assembled here: a key written whole in a source file is refused by the host's push protection.
+        let stripe = format!("sk_{}_{}", "live", "51Hq8dKa9ZxYw3Vu7TsRq2PoNm");
+        let supabase = format!("sbp_{}", "4f9a1c7e2b8d6035a1c7e2b8d60354f9a1c7e2b8");
+        let gitlab = format!("{}-{}", "glpat", "x7Kp2Lm9Qw4Rt6Yz8Bn3");
+        for content in [
+            format!("Stripe : {stripe}"),
+            format!("Jeton Supabase {supabase}"),
+            format!("GitLab : {gitlab}"),
+            "Clé du service : aB3xK9mQ2pL7vN4wR8tYc5".to_string(),
+            "Compte test : demo@example.com / password: Hx9!kLm2pQ".to_string(),
+            "Base : postgres://admin:Tr0ub4dor-Zebra-91@db.example.com:5432/app".to_string(),
+            // Saved under a file name: the name is the key.
+            "Fichier a8Kf3xQ9mZ2pL7vN4wR8tYc5.json à ne pas commiter".to_string(),
+            format!("Sauvegarde {stripe}.txt sur le bureau"),
+            format!("Export {supabase}.csv"),
+            // An extension does not excuse a name that reads as a value.
+            "Notes dans Hx9!kLm2pQ.c et Zq8xW3kLp9RtYv2m.ini".to_string(),
+            "Archive Tr0ub4dor-Zebra-91!.bak à supprimer".to_string(),
+            // Announced as a password, words and a version are one.
+            "Compte de recette, mdp : Bonjour_Paris_V7".to_string(),
+            // Next to a versioned file name, the key is still found.
+            "Le fichier Suivi_Commandes_V7.xlsx utilise la clé aB3xK9mQ2pL7vN4wR8tYc5".to_string(),
+        ] {
+            assert!(contains_secret_value(&content), "missed: {}", content);
+        }
+    }
+
+    #[test]
+    fn a_note_keeps_its_text_with_only_the_secret_value_masked() {
+        let note = "Suivi_Commandes_V7.xlsx : connexion avec la clé aB3xK9mQ2pL7vN4wR8tYc5 puis export chaque lundi";
+        let stored = without_secret_values(note).expect("maskable").into_owned();
+        assert!(!stored.contains("aB3xK9mQ2pL7vN4wR8tYc5"), "{}", stored);
+        assert!(stored.contains("[secret masqué : "), "{}", stored);
+        assert!(stored.starts_with("Suivi_Commandes_V7.xlsx : connexion avec la clé"), "{}", stored);
+        assert!(stored.ends_with("puis export chaque lundi"), "{}", stored);
+        assert!(!contains_secret_value(&stored), "the mask is not read as a value: {}", stored);
+        // Several values, seen by either detector, are all masked.
+        let stripe = format!("sk_{}_{}", "live", "51Hq8dKa9ZxYw3Vu7TsRq2PoNm");
+        let several = format!("Admin : password: Hx9!kLm2pQ ; base postgres://admin:Tr0ub4dor-Zebra-91@db.example.com/app ; Stripe {stripe}");
+        let several = several.as_str();
+        let stored = without_secret_values(several).expect("maskable").into_owned();
+        for value in ["Hx9!kLm2pQ", "Tr0ub4dor-Zebra-91", stripe.as_str()] {
+            assert!(!stored.contains(value), "{} left in {}", value, stored);
+        }
+        assert!(stored.contains("db.example.com/app"), "what is not secret stays: {}", stored);
+        assert!(!contains_secret_value(&stored) && matches!(crate::secrets::redact(&stored), std::borrow::Cow::Borrowed(_)), "{}", stored);
+        // Storing the masked text again changes nothing.
+        assert_eq!(without_secret_values(&stored).as_deref(), Some(stored.as_str()));
+        // A one-letter password is masked where it stands, not in every word that has the letter.
+        let short = "Cache de recette : redis://:x@cache.example.com:6379 et rien d'autre avec x dans le texte";
+        let stored = without_secret_values(short).expect("maskable").into_owned();
+        assert!(stored.contains("@cache.example.com:6379 et rien d'autre avec x dans le texte"), "{}", stored);
+        assert!(!stored.contains("redis://:x@"), "{}", stored);
+        // A value full of symbols leaves one well-formed mask and nothing of itself.
+        let symbols = "Compte : pwd: P@ss.w0rd*+?[x]\\d ok";
+        let stored = without_secret_values(symbols).expect("maskable").into_owned();
+        assert!(!stored.contains("w0rd") && stored.ends_with(" ok"), "{}", stored);
+        assert_eq!(stored.matches("[secret masqué : ").count(), stored.matches(']').count(), "every mask is closed: {}", stored);
+        assert!(!contains_secret_value(&stored), "{}", stored);
+    }
+
+    #[test]
+    fn a_secret_never_turns_a_note_into_a_credential() {
+        let dir = std::env::temp_dir().join(format!("mp-note-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open_at(&dir.join("memory.db")).unwrap();
+        let scope = super::super::MemoryScope::default();
+        let add = |content: &str, kind: &str| db.add_memory(content, kind, Some("demo"), &[], "test", 3, None, None, &scope).unwrap().0;
+
+        // The file name that started it: a note, as written.
+        let file = add("Essai : fichier IdeeKdo_Selection_Cultura_V22.xlsx", "note");
+        assert_eq!(file.kind, "note");
+        assert_eq!(file.content, "Essai : fichier IdeeKdo_Selection_Cultura_V22.xlsx");
+        assert!(file.metadata.as_ref().is_none_or(|m| m.get("sealed").is_none()));
+
+        // A real value in a decision: the decision stays one, the value is gone.
+        let decision = add("Décision : le flux partenaire passe par la clé aB3xK9mQ2pL7vN4wR8tYc5, renouvelée chaque trimestre", "decision");
+        assert_eq!(decision.kind, "decision");
+        assert!(!decision.content.contains("aB3xK9mQ2pL7vN4wR8tYc5"));
+        assert!(decision.content.contains("[secret masqué : ") && decision.content.contains("renouvelée chaque trimestre"));
+        assert!(decision.metadata.as_ref().is_none_or(|m| m.get("enc").is_none()), "the value is kept nowhere");
+        let raw: String = db.conn.query_row("SELECT content || COALESCE(metadata, '') FROM memories WHERE id = ?1", params![decision.id], |r| r.get(0)).unwrap();
+        assert!(!raw.contains("aB3xK9mQ2pL7vN4wR8tYc5"), "not in the row either");
+
+        // Both are found by a search and listed among the memories of their kind.
+        let found = db.search("flux partenaire renouvelée chaque trimestre", 5, Some("demo"), None, None, None).unwrap();
+        assert!(found.iter().any(|result| result.memory.id == decision.id), "the decision is searchable");
+        let found = db.search("IdeeKdo Selection Cultura", 5, Some("demo"), None, None, None).unwrap();
+        assert!(found.iter().any(|result| result.memory.id == file.id), "the note is searchable");
+
+        // Updating a note with a value masks it and keeps the kind.
+        let updated = db
+            .update_memory_full(&file.id, Some("Essai : fichier IdeeKdo_Selection_Cultura_V22.xlsx, mot de passe : Hx9!kLm2pQ"), None, None, None, None, None)
+            .unwrap()
+            .expect("updated");
+        assert_eq!(updated.kind, "note");
+        assert!(!updated.content.contains("Hx9!kLm2pQ") && updated.content.contains("IdeeKdo_Selection_Cultura_V22.xlsx"), "{}", updated.content);
+
+        // An older note stored with a value in clear: touching only its tags masks it,
+        // and its hash follows (the embedding is computed again from the masked text).
+        db.conn
+            .execute(
+                "UPDATE memories SET content = ?2, content_hash = ?3 WHERE id = ?1",
+                params![decision.id, "Ancienne note : clé aB3xK9mQ2pL7vN4wR8tYc5 du flux", super::super::content_hash("Ancienne note : clé aB3xK9mQ2pL7vN4wR8tYc5 du flux")],
+            )
+            .unwrap();
+        let retagged = db.update_memory_full(&decision.id, None, None, Some(&["flux".to_string()]), None, None, None).unwrap().expect("updated");
+        assert!(!retagged.content.contains("aB3xK9mQ2pL7vN4wR8tYc5") && retagged.kind == "decision", "{}", retagged.content);
+        let hash: String = db.conn.query_row("SELECT content_hash FROM memories WHERE id = ?1", params![decision.id], |r| r.get(0)).unwrap();
+        assert_eq!(hash, super::super::content_hash(&retagged.content), "the hash is the one of the masked text");
+
+        // An import does not bring a value in either.
+        db.import_batch(&[("Importé : jeton aB3xK9mQ2pL7vN4wR8tYc5 du partenaire".to_string(), "note".to_string(), Some("demo".to_string()), Vec::new(), "import".to_string())])
+            .unwrap();
+        let leaked: i64 = db.conn.query_row("SELECT COUNT(*) FROM memories WHERE content LIKE '%aB3xK9mQ2pL7vN4wR8tYc5%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(leaked, 0, "no row holds the value");
+        let imported: (String, String) = db.conn.query_row("SELECT kind, content FROM memories WHERE source = 'import'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(imported.0, "note");
+        assert!(imported.1.starts_with("Importé : jeton [secret masqué : "), "{}", imported.1);
+
+        // Sent as a credential, a memory still goes to the vault.
+        let credential = add("Admin demo : password: Hx9!kLm2pQ", "credential");
+        assert_eq!(credential.kind, "credential");
+        assert!(credential.content.starts_with(SEAL_PREFIX) && !credential.content.contains("Hx9!kLm2pQ"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -322,7 +322,7 @@ fn secret_values_are_sealed_at_once_and_stay_sealed_after_update() {
         let (mem, _) = db
             .add_memory(
                 &format!("Compte démo : demo@example.com / password: {}", secret),
-                "fact",
+                "credential",
                 Some("demo"),
                 &tags,
                 "test",

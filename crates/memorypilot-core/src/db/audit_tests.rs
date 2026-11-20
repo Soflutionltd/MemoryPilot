@@ -64,10 +64,13 @@ fn credential_uri_never_stored_or_returned_in_clear() {
         assert!(!stored.content.contains("synthetic_password"), "label: {}", stored.content);
         assert!(stored.content.contains("postgres://alice:••••@db.example.com/app"), "label: {}", stored.content);
 
-        // The same URI in a note is detected as a credential.
+        // The same URI in a note: the note stays a note, its password is
+        // masked and kept nowhere (the checks below cover both memories).
         let (note, _) = add(&db, &format!("Staging uses DATABASE_URL={URI} for now"), "note", "proj");
-        assert_eq!(note.kind, "credential");
+        assert_eq!(note.kind, "note");
         assert!(!note.content.contains("synthetic_password"));
+        assert!(note.content.contains("[secret masqué : ") && note.content.starts_with("Staging uses") && note.content.ends_with("for now"), "{}", note.content);
+        assert!(note.metadata.as_ref().is_none_or(|m| m.get("enc").is_none()), "no ciphertext for a note");
 
         let raw: i64 = db
             .conn

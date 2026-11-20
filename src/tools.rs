@@ -1535,11 +1535,24 @@ fn handle_add(db: &Database, args: &Value) -> Value {
                     .as_object_mut()
                     .map(|o| o.insert("_merged".into(), json!(true)));
             }
+            if let Some(notice) = masked_secret_notice(content, &mem) {
+                result.as_object_mut().map(|o| o.insert("secret_masked".into(), json!(notice)));
+            }
             tool_result(&serde_json::to_string_pretty(&result).unwrap())
         }
         Err(e) => tool_error(&e),
     }
 }
+
+/// What to tell the caller when the memory was stored with a secret value
+/// masked: the value is kept nowhere, it belongs in a password manager.
+fn masked_secret_notice(given: &str, stored: &crate::db::Memory) -> Option<&'static str> {
+    const MASK: &str = "[secret masqué : ";
+    (stored.kind != "credential" && stored.content.matches(MASK).count() > given.matches(MASK).count()).then_some(
+        "A secret value in this text was replaced by a mask and is not stored anywhere. Keep the value in a password manager (1Password) and store only where it lives. If the masked word was not a secret, update the memory with it reworded.",
+    )
+}
+
 fn handle_add_bulk(db: &Database, args: &Value) -> Value {
     let raw_items: Vec<Value> = args
         .get("memories")
@@ -1577,13 +1590,24 @@ fn handle_add_bulk(db: &Database, args: &Value) -> Value {
         }
     }
     match db.add_memories_bulk(&items) {
-        Ok((added, merged, skipped)) => tool_result(&format!(
-            "Bulk complete: {} added, {} merged (dedup), {} skipped. Total processed: {}.",
-            added.len(),
-            merged,
-            skipped,
-            items.len()
-        )),
+        Ok((added, merged, skipped)) => {
+            const MASK: &str = "[secret masqué : ";
+            let masked = added.iter().filter(|memory| memory.kind != "credential" && memory.content.contains(MASK)).count();
+            let given = items.iter().filter(|item| item.content.contains(MASK)).count();
+            let notice = if masked > given {
+                " A secret value was replaced by a mask in some of them and is not stored anywhere: keep it in a password manager (1Password)."
+            } else {
+                ""
+            };
+            tool_result(&format!(
+                "Bulk complete: {} added, {} merged (dedup), {} skipped. Total processed: {}.{}",
+                added.len(),
+                merged,
+                skipped,
+                items.len(),
+                notice
+            ))
+        }
         Err(e) => tool_error(&e),
     }
 }

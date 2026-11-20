@@ -341,6 +341,14 @@ impl Database {
             .map_err(|e| format!("Tx: {}", e))?;
         let mut count = 0;
         for (content, kind, project, tags, source) in memories {
+            // As any other write: a value is masked, and a text whose value
+            // cannot be masked is left to the vault (sealed at next start).
+            let cleaned = if kind == "credential" { None } else { Some(vault::without_secret_values(content)) };
+            let kind: &str = if matches!(cleaned, Some(None)) { "credential" } else { kind };
+            let content: &str = match &cleaned {
+                Some(Some(text)) => text,
+                _ => content,
+            };
             let exists: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM memories WHERE content=?1)",
@@ -508,8 +516,15 @@ pub fn add_memory_to<S: MemoryStore + GraphStore + ?Sized>(
     metadata: Option<&serde_json::Value>,
     scope: &MemoryScope,
 ) -> Result<WriteOutcome, String> {
-    // A secret value is sealed and hidden from safe recall whatever kind the caller chose.
-    let forced_credential = kind != "credential" && vault::contains_secret_value(content);
+    // A note that holds a secret value keeps its kind and stays findable:
+    // the value alone is masked and not kept. Only a value that cannot be
+    // masked still sends the whole text to the vault.
+    let cleaned = if kind == "credential" { None } else { Some(vault::without_secret_values(content)) };
+    let forced_credential = matches!(cleaned, Some(None));
+    let content: &str = match &cleaned {
+        Some(Some(text)) => text,
+        _ => content,
+    };
     let kind = if forced_credential { "credential" } else { kind };
     let canonical_project = Database::canonical_project(project);
     let scoped_metadata = Database::apply_scope_to_metadata(metadata, scope);
@@ -639,10 +654,12 @@ pub fn update_memory_in<S: MemoryStore + GraphStore + ?Sized>(
         ));
     }
     let new_content = content.unwrap_or(existing.content.as_str());
-    let new_kind = if requested_kind != "credential" && vault::contains_secret_value(new_content) {
-        "credential"
-    } else {
-        requested_kind
+    // As at creation: the value is masked, the memory keeps its kind.
+    let cleaned = if requested_kind == "credential" { None } else { Some(vault::without_secret_values(new_content)) };
+    let new_kind = if matches!(cleaned, Some(None)) { "credential" } else { requested_kind };
+    let new_content: &str = match &cleaned {
+        Some(Some(text)) => text,
+        _ => new_content,
     };
     let new_tags = tags
         .map(|t| t.to_vec())
@@ -679,7 +696,8 @@ pub fn update_memory_in<S: MemoryStore + GraphStore + ?Sized>(
     }
     // Leaving the vault swaps the stored masked label for the clear text: hash and embedding must follow.
     let leaves_vault = existing.kind == "credential" && new_kind != "credential";
-    let content_changed = (content.is_some() && new_content != existing.content) || leaves_vault;
+    // Also true with no new text: an older note that held a value in clear is masked on any update.
+    let content_changed = new_content != existing.content || leaves_vault;
 
     let mem = Memory {
         id: id.into(),
