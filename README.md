@@ -338,6 +338,13 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## What's new in v4.14.1
+
+A security release: no change in behaviour, search results are identical to v4.14.0 on the project's deterministic benchmarks.
+
+- **SQLite 3.54.1** (rusqlite 0.43) fixes CVE-2026-119375, the advisory that v4.14.0 shipped with. A database written by this version is still read by v4.14.0, so the automatic rollback stays safe.
+- **cookie 0.18.3** (RUSTSEC-2026-0594) and **url 2.5.9** (RUSTSEC-2026-0592) moved to their patched releases.
+
 ## What's new in v4.14
 
 - **Compact search** (`search_memory` with `compact: true`): the same ranking in a short context. Assistant turns ranked after the third are cut to 150 characters, unless the question is about what the assistant said; a total or a timeline reaches further. The reranker reads 64 candidates out of a pool of 100, whatever the limit. This is the mode behind the LongMemEval-S result above: 97.2% (486/500) at 6,047 prompt tokens per question.
@@ -351,7 +358,7 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 - **`--footprint`**: what MemoryPilot costs a client before any call (tools, characters, instructions).
 - **Benchmark tooling**: end-to-end LongMemEval with an LLM judge (`--e2e`), evidence coverage at several depths without any LLM call, re-grading of saved answers by another judge (`--rejudge`).
 - **Fixes**: a first start on a new database no longer fails with "database is locked"; the description of `memory_admin` fits the 4,096-character limit of clients; rustix moved to its patched release (RUSTSEC-2026-0486).
-- **Known advisory in v4.14.0**: the bundled SQLite (3.45, through rusqlite 0.31) is affected by CVE-2026-119375, which needs a crafted database and `-wal` pair written by another party into MemoryPilot's data directory. Fixed on `main` (rusqlite 0.43, SQLite 3.54.1); it ships with the next release.
+- **Known advisory in v4.14.0, fixed in v4.14.1**: the bundled SQLite (3.45, through rusqlite 0.31) is affected by CVE-2026-119375, which needs a crafted database and `-wal` pair written by another party into MemoryPilot's data directory.
 
 ## What's new in v4.13
 
@@ -449,7 +456,7 @@ Not updated automatically: Homebrew installs (`brew upgrade memorypilot`), binar
 ```bash
 # Via Cargo, pinned to a release tag — works anywhere Rust runs
 # (unsigned on macOS: Keychain prompt after each update if you store credentials):
-cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.14.0 --bin MemoryPilot
+cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.14.1 --bin MemoryPilot
 
 # Local clone + auto-config (same installer, run from inside the repo):
 git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && ./install.sh
