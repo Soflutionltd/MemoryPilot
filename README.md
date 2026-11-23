@@ -351,7 +351,7 @@ One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech
 - **`--footprint`**: what MemoryPilot costs a client before any call (tools, characters, instructions).
 - **Benchmark tooling**: end-to-end LongMemEval with an LLM judge (`--e2e`), evidence coverage at several depths without any LLM call, re-grading of saved answers by another judge (`--rejudge`).
 - **Fixes**: a first start on a new database no longer fails with "database is locked"; the description of `memory_admin` fits the 4,096-character limit of clients; rustix moved to its patched release (RUSTSEC-2026-0486).
-- **Known advisory, not fixed in this release**: the bundled SQLite (3.45, through rusqlite 0.31) is affected by CVE-2026-119375, which needs a crafted database and `-wal` pair written by another party into MemoryPilot's data directory. The fix is rusqlite 0.41 or later, a breaking upgrade planned for the next release.
+- **Known advisory in v4.14.0**: the bundled SQLite (3.45, through rusqlite 0.31) is affected by CVE-2026-119375, which needs a crafted database and `-wal` pair written by another party into MemoryPilot's data directory. Fixed on `main` (rusqlite 0.43, SQLite 3.54.1); it ships with the next release.
 
 ## What's new in v4.13
 

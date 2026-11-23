@@ -6,47 +6,25 @@ impl Database {
     pub(super) fn hygiene_report(&self) -> crate::gc::HygieneReport {
         let stale_threshold = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         crate::gc::HygieneReport {
-            projects_missing_path: self.conn.query_row(
-                "SELECT COUNT(*) FROM projects WHERE trim(path) = ''",
-                [],
-                |row| row.get(0),
-            ).unwrap_or(0),
-            memory_project_mismatches: self.conn.query_row(
-                "SELECT COUNT(*) FROM memories m WHERE m.project IS NOT NULL AND NOT EXISTS (SELECT 1 FROM projects p WHERE p.name = m.project)",
-                [],
-                |row| row.get(0),
-            ).unwrap_or(0),
-            never_accessed_memories: self.conn.query_row(
-                "SELECT COUNT(*) FROM memories WHERE access_count = 0",
-                [],
-                |row| row.get(0),
-            ).unwrap_or(0),
-            stale_low_value_memories: self.conn.query_row(
-                "SELECT COUNT(*) FROM memories WHERE importance <= 2 AND access_count = 0 AND updated_at < ?1",
-                params![stale_threshold],
-                |row| row.get(0),
-            ).unwrap_or(0),
-            orphan_entities: self.conn.query_row(
-                "SELECT COUNT(*) FROM memory_entities WHERE memory_id NOT IN (SELECT id FROM memories)",
-                [],
-                |row| row.get(0),
-            ).unwrap_or(0),
-            orphan_links: self.conn.query_row(
-                "SELECT COUNT(*) FROM memory_links WHERE source_id NOT IN (SELECT id FROM memories) OR target_id NOT IN (SELECT id FROM memories)",
-                [],
-                |row| row.get(0),
-            ).unwrap_or(0),
-            credential_memories: self.conn.query_row(
-                "SELECT COUNT(*) FROM memories WHERE kind = 'credential'",
-                [],
-                |row| row.get(0),
-            ).unwrap_or(0),
-            global_memories: self.conn.query_row(
-                "SELECT COUNT(*) FROM memories WHERE project IS NULL",
-                [],
-                |row| row.get(0),
-            ).unwrap_or(0),
+            projects_missing_path: self.count_rows("SELECT COUNT(*) FROM projects WHERE trim(path) = ''", []),
+            memory_project_mismatches: self.count_rows("SELECT COUNT(*) FROM memories m WHERE m.project IS NOT NULL AND NOT EXISTS (SELECT 1 FROM projects p WHERE p.name = m.project)", []),
+            never_accessed_memories: self.count_rows("SELECT COUNT(*) FROM memories WHERE access_count = 0", []),
+            stale_low_value_memories: self.count_rows("SELECT COUNT(*) FROM memories WHERE importance <= 2 AND access_count = 0 AND updated_at < ?1", params![stale_threshold]),
+            orphan_entities: self.count_rows("SELECT COUNT(*) FROM memory_entities WHERE memory_id NOT IN (SELECT id FROM memories)", []),
+            orphan_links: self.count_rows("SELECT COUNT(*) FROM memory_links WHERE source_id NOT IN (SELECT id FROM memories) OR target_id NOT IN (SELECT id FROM memories)", []),
+            credential_memories: self.count_rows("SELECT COUNT(*) FROM memories WHERE kind = 'credential'", []),
+            global_memories: self.count_rows("SELECT COUNT(*) FROM memories WHERE project IS NULL", []),
         }
+    }
+
+    /// A `COUNT(*)` as a `usize`, 0 when the query fails: the hygiene report is
+    /// advisory and must not stop on one unreadable table.
+    fn count_rows<P: rusqlite::Params>(&self, sql: &str, params: P) -> usize {
+        self.conn
+            .query_row(sql, params, |row| row.get::<_, i64>(0))
+            .ok()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0)
     }
 
     // ─── TTL / EXPIRATION ─────────────────────────────
