@@ -50,7 +50,12 @@ const MAX_DEPTH: usize = 9;
 
 fn collect(dir: &Path, depth: usize, out: &mut Vec<SessionFile>, skipped: &mut Vec<String>) {
     if depth > MAX_DEPTH {
-        skipped.push(format!("Claude sessions under {} not read: deeper than {} folders", dir.display(), MAX_DEPTH));
+        // Plugin and skill folders go deeper with no session in them:
+        // only a folder that holds session logs is worth a word.
+        let logs = count_logs(dir);
+        if logs > 0 {
+            skipped.push(format!("{} Claude session logs under {} not read: deeper than {} folders", logs, dir.display(), MAX_DEPTH));
+        }
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -103,6 +108,22 @@ fn collect(dir: &Path, depth: usize, out: &mut Vec<SessionFile>, skipped: &mut V
         let id = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         out.push(SessionFile { path, id, version: format!("{}:{}:{}", READER_VERSION, meta.len(), modified) });
     }
+}
+
+/// Session logs anywhere under `dir`.
+fn count_logs(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => count_logs(&path),
+                Ok(_) if path.extension().is_some_and(|e| e == "jsonl") && path.file_name().is_some_and(|n| n != "audit.jsonl") => 1,
+                _ => 0,
+            }
+        })
+        .sum()
 }
 
 /// Desktop session titles, keyed by the Claude Code session id they wrap.
@@ -322,6 +343,22 @@ mod tests {
         assert_eq!(session.conversation.origin_id, "s1");
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[1].text, "Elle est payée sur Revolut.");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_too_deep_folder_is_reported_only_when_it_holds_sessions() {
+        let dir = std::env::temp_dir().join(format!("mp-claude-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let deep = (0..=MAX_DEPTH + 1).fold(dir.clone(), |path, level| path.join(format!("d{}", level)));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("schema.xsd"), "").unwrap();
+        let (files, skipped) = list_sessions(std::slice::from_ref(&dir));
+        assert!(files.is_empty() && skipped.is_empty(), "{skipped:?}");
+        std::fs::write(deep.join("lost.jsonl"), "").unwrap();
+        let (_, skipped) = list_sessions(std::slice::from_ref(&dir));
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].starts_with("1 Claude session logs under"), "{}", skipped[0]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
