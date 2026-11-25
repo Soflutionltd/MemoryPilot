@@ -22,6 +22,8 @@ pub use search::{ConversationHit, ConversationMessage, SearchOptions};
 pub use store::ConversationStore;
 
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -71,6 +73,8 @@ pub struct SyncReport {
     pub origins_updated: usize,
     pub messages_written: usize,
     pub errors: Vec<String>,
+    /// Files, folders or lines left out of the index, and why.
+    pub skipped: Vec<String>,
     pub timed_out: bool,
     pub elapsed_ms: u128,
 }
@@ -218,30 +222,61 @@ fn sync_claude(
     report: &mut SyncReport,
     over_budget: &dyn Fn(&mut SyncReport) -> bool,
 ) {
-    let roots = claude::default_roots();
+    sync_claude_roots(store, &claude::default_roots(), report, over_budget);
+}
+
+fn sync_claude_roots(
+    store: &mut ConversationStore,
+    roots: &[std::path::PathBuf],
+    report: &mut SyncReport,
+    over_budget: &dyn Fn(&mut SyncReport) -> bool,
+) {
     if roots.is_empty() {
         return;
     }
-    let titles = claude::desktop_titles(&roots);
-    for file in claude::list_sessions(&roots) {
+    let titles = claude::desktop_titles(roots);
+    let (files, skipped) = claude::list_sessions(roots);
+    report.skipped.extend(skipped);
+    let known: std::collections::HashSet<String> = files.iter().map(|file| file.id.clone()).collect();
+    for file in &files {
         if over_budget(report) {
             return;
         }
         report.origins_checked += 1;
-        let session = match claude::read_session(&file, &titles) {
+        let origin = if file.id.is_empty() { None } else { Some(file.id.as_str()) };
+        if let Some(origin) = origin {
+            match store.origin_version(origin) {
+                Ok(Some(version)) if version == file.version => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    report.errors.push(error);
+                    continue;
+                }
+            }
+        }
+        let session = match claude::read_session(file, &titles, &known) {
             Ok(session) => session,
             Err(error) => {
                 report.errors.push(error);
                 continue;
             }
         };
+        if session.unreadable_lines > 0 {
+            report.skipped.push(format!(
+                "Claude session {}: {} lines are not JSON and were left out",
+                file.path.display(),
+                session.unreadable_lines
+            ));
+        }
         let source = &session.conversation;
-        match store.origin_version(&source.origin_id) {
-            Ok(Some(version)) if version == source.version => continue,
-            Ok(_) => {}
-            Err(error) => {
-                report.errors.push(error);
-                continue;
+        if origin.is_none() {
+            match store.origin_version(&source.origin_id) {
+                Ok(Some(version)) if version == source.version => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    report.errors.push(error);
+                    continue;
+                }
             }
         }
         let mut seen: Vec<u64> = session.messages.iter().map(|m| hash_key(&m.key)).collect();
@@ -251,7 +286,20 @@ fn sync_claude(
                 report.messages_written += written;
                 report.origins_updated += 1;
             }
-            Err(error) => report.errors.push(error),
+            Err(error) => {
+                report.errors.push(error);
+                continue;
+            }
+        }
+        let kept: std::collections::HashSet<&str> = session.messages.iter().map(|m| m.key.as_str()).collect();
+        if let Err(error) = store.prune_origin(source, &kept) {
+            report.errors.push(error);
+        }
+        // The file was read to its end: a day it says nothing on was a
+        // session opened and left, not a conversation the index lost.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        if let Err(error) = store.forget_silent_days(&source.root_id, &session.days, &today) {
+            report.errors.push(error);
         }
     }
 }
@@ -281,5 +329,102 @@ pub fn embed_pending(store: &mut ConversationStore, budget: Option<Duration>) ->
             .collect();
         store.store_embeddings(&rows)?;
         done += rows.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(kind: &str, uuid: &str, session: &str, at: &str, text: &str) -> String {
+        let content = if kind == "user" {
+            serde_json::json!(text)
+        } else {
+            serde_json::json!([{ "type": "text", "text": text }])
+        };
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": kind, "uuid": uuid, "sessionId": session, "cwd": "/work/courly",
+                "timestamp": at, "message": { "content": content }
+            })
+        )
+    }
+
+    /// A session resumed from another starts with the lines of that one,
+    /// under its id. It used to be indexed under that id: its own id
+    /// stayed unknown, and both files took turns on one origin.
+    #[test]
+    fn a_resumed_claude_session_is_indexed_under_its_own_id() {
+        let dir = std::env::temp_dir().join(format!("mp-resumed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first_dir = dir.join("projects/-work-courly-worktree");
+        let resumed_dir = dir.join("projects/-work-courly");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&resumed_dir).unwrap();
+        let earlier = [
+            line("user", "u1", "first", "2026-11-16T17:29:03Z", "Prépare la page des tarifs de Courly"),
+            line("assistant", "a1", "first", "2026-11-16T17:30:00Z", "La page des tarifs est prête avec les trois forfaits, le mensuel, l'annuel et l'offre équipe."),
+        ]
+        .concat();
+        std::fs::write(first_dir.join("first.jsonl"), &earlier).unwrap();
+        let own = [
+            line("user", "u2", "resumed", "2026-11-19T09:00:00Z", "Ajoute le paiement par virement SEPA"),
+            line("assistant", "a2", "resumed", "2026-11-19T09:02:00Z", "Le virement SEPA est branché sur le tunnel de paiement, avec le mandat signé à la commande."),
+        ]
+        .concat();
+        // Copied history, one line that is not JSON, then its own turns;
+        // the last line is still being written.
+        let resumed = format!("{}{{not json\n{}{{\"type\":\"user\"", earlier, own);
+        std::fs::write(resumed_dir.join("resumed.jsonl"), resumed).unwrap();
+
+        let mut store = ConversationStore::open(&dir.join("conversations.db")).unwrap();
+        // The index as the former reader left it: the resumed session's
+        // messages filed under the session it resumed.
+        let (files, _) = claude::list_sessions(&[dir.join("projects")]);
+        let resumed_file = files.iter().find(|file| file.id == "resumed").unwrap();
+        let mut misfiled = claude::read_session(resumed_file, &HashMap::new(), &Default::default()).unwrap();
+        misfiled.conversation.origin_id = "first".into();
+        misfiled.conversation.root_id = "first".into();
+        misfiled.conversation.version = "old".into();
+        store.apply(&misfiled.conversation, true, &misfiled.messages, &[]).unwrap();
+        // Seen running on a day it said something, and on one it did not.
+        let day = |raw: &str| chrono::DateTime::parse_from_rfc3339(raw).unwrap().with_timezone(&chrono::Utc);
+        store.record_activity("resumed", "claude", None, day("2026-11-19T09:00:00Z")).unwrap();
+        store.record_activity("resumed", "claude", None, day("2026-11-21T10:00:00Z")).unwrap();
+
+        let mut report = SyncReport::default();
+        sync_claude_roots(&mut store, &[dir.join("projects")], &mut report, &|_| false);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        assert!(report.skipped[0].contains("resumed.jsonl: 1 lines are not JSON"), "{}", report.skipped[0]);
+
+        let segments = |conversation: &str| -> Vec<String> {
+            let mut statement = store
+                .conn
+                .prepare("SELECT source_key FROM segments WHERE conversation_id = ?1 AND role IN ('user', 'assistant') ORDER BY at")
+                .unwrap();
+            statement.query_map([conversation], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(segments("first"), ["claude-code:first:u1", "claude-code:first:u1#answer"]);
+        assert_eq!(segments("resumed"), ["claude-code:resumed:u2", "claude-code:resumed:u2#answer"]);
+        let count = |conversation: &str| -> i64 {
+            store.conn.query_row("SELECT message_count FROM conversations WHERE id = ?1", [conversation], |row| row.get(0)).unwrap()
+        };
+        assert_eq!((count("first"), count("resumed")), (2, 2));
+        let found = store.search_within("resumed", "virement SEPA", 5, false).unwrap().expect("the resumed session is known");
+        assert!(!found.is_empty());
+
+        let days: Vec<String> = {
+            let mut statement = store.conn.prepare("SELECT day FROM activity WHERE conversation_id = 'resumed'").unwrap();
+            statement.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(days, ["2026-11-19"], "a day the session said nothing on is not reported as lost");
+
+        // Nothing changed: no file is read again.
+        let mut again = SyncReport::default();
+        sync_claude_roots(&mut store, &[dir.join("projects")], &mut again, &|_| false);
+        assert_eq!((again.origins_checked, again.origins_updated), (2, 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

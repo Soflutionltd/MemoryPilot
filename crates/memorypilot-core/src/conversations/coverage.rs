@@ -58,7 +58,8 @@ impl ConversationStore {
     /// Keeps the outcome of a sync. Best effort: a lost line only makes
     /// the index look less recently synced than it is.
     pub fn record_sync(&self, report: &SyncReport, now: Now) {
-        let errors = (!report.errors.is_empty()).then(|| report.errors.join(" | "));
+        let left_out: Vec<&String> = report.errors.iter().chain(report.skipped.iter()).collect();
+        let errors = (!left_out.is_empty()).then(|| left_out.iter().map(|line| line.as_str()).collect::<Vec<_>>().join(" | "));
         let _ = self.conn.execute(
             "INSERT INTO sync_log (at, origins_checked, origins_updated, messages_written, errors, timed_out, elapsed_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -89,6 +90,26 @@ impl ConversationStore {
             )
             .map(|_| ())
             .map_err(|error| format!("Activity: {}", error))
+    }
+
+    /// Drops the days a session was seen running on which its source,
+    /// read to the end, holds no message: it was opened and nothing was
+    /// said. `today` is kept, the session may still be speaking.
+    pub fn forget_silent_days(&self, conversation_id: &str, days_said: &std::collections::BTreeSet<String>, today: &str) -> Result<(), String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT day FROM activity WHERE conversation_id = ?1 AND day < ?2")
+            .map_err(|error| format!("Activity days: {}", error))?;
+        let days: Vec<String> = statement
+            .query_map(params![conversation_id, today], |row| row.get(0))
+            .and_then(|rows| rows.collect())
+            .map_err(|error| format!("Activity days: {}", error))?;
+        for day in days.iter().filter(|day| !days_said.contains(*day)) {
+            self.conn
+                .execute("DELETE FROM activity WHERE conversation_id = ?1 AND day = ?2", params![conversation_id, day])
+                .map_err(|error| format!("Activity forget: {}", error))?;
+        }
+        Ok(())
     }
 
     /// What the index may be missing, in sentences an agent can relay:
