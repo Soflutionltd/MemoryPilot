@@ -219,17 +219,18 @@ pub fn decrypt_bytes(key: &[u8; 32], blob: &[u8]) -> Option<Vec<u8>> {
     cipher.decrypt(XNonce::from_slice(nonce), ct).ok()
 }
 
-/// The clear text of a `metadata.enc` ciphertext, `None` when the key does
-/// not open it.
-pub fn open_text(key: &[u8; 32], enc: &str) -> Option<String> {
-    decrypt_with(key, enc)
-}
-
-/// Whether a credential row carries a ciphertext. The 🔒 prefix alone is only
-/// what a label looks like: any caller can type it.
-pub(crate) fn has_ciphertext(content: &str, metadata: Option<&serde_json::Value>) -> bool {
-    content.starts_with(SEAL_PREFIX)
-        && metadata
+/// Whether a credential row is already sealed, so that a write leaves it as
+/// it is. A row read back from the store keeps its label and its ciphertext,
+/// whatever key that ciphertext was made with: sealing it again would
+/// replace the secret by its masked label. A new row is sealed only when it
+/// carries a ciphertext: the 🔒 prefix alone is a text any caller can type
+/// (and callers cannot supply a ciphertext, see `add_memory_to`).
+pub fn already_sealed(content: &str, metadata: Option<&serde_json::Value>, new_row: bool) -> bool {
+    if !content.starts_with(SEAL_PREFIX) {
+        return false;
+    }
+    !new_row
+        || metadata
             .and_then(|meta| meta.get("enc"))
             .and_then(|enc| enc.as_str())
             .is_some_and(|enc| !enc.is_empty())
@@ -1137,23 +1138,14 @@ fn vault_disabled() -> bool {
 /// so the secret never lands in the table, the FTS index or the WAL.
 /// `None` when nothing has to change (not a credential, already sealed, or
 /// vault turned off on purpose). Fails closed when the key is unavailable.
-pub(crate) fn seal_for_write(memory: &Memory) -> Result<Option<Memory>, String> {
-    const NO_KEY: &str = "Credential not stored: the vault key is unavailable (Keychain refused or key file unreadable). Set MEMORYPILOT_VAULT=off to store credentials in clear on purpose.";
-    if memory.kind != "credential" || vault_disabled() {
+pub(crate) fn seal_for_write(memory: &Memory, new_row: bool) -> Result<Option<Memory>, String> {
+    if memory.kind != "credential" || vault_disabled() || already_sealed(&memory.content, memory.metadata.as_ref(), new_row) {
         return Ok(None);
     }
-    // Already sealed only when its ciphertext opens with the vault key: a
-    // text that merely starts with the lock is a secret still in clear.
-    if has_ciphertext(&memory.content, memory.metadata.as_ref()) {
-        let key = key().ok_or_else(|| NO_KEY.to_string())?;
-        let enc = memory.metadata.as_ref().and_then(|meta| meta.get("enc")).and_then(|enc| enc.as_str());
-        if enc.and_then(|enc| decrypt_with(key, enc)).is_some() {
-            return Ok(None);
-        }
-    }
+    // A new text that starts with the lock is a secret still in clear.
     let plain = memory.content.trim_start_matches(SEAL_PREFIX);
     let Some(enc) = encrypt(plain) else {
-        return Err(NO_KEY.into());
+        return Err("Credential not stored: the vault key is unavailable (Keychain refused or key file unreadable). Set MEMORYPILOT_VAULT=off to store credentials in clear on purpose.".into());
     };
     if decrypt(&enc).as_deref() != Some(plain) {
         return Err("Credential not stored: the ciphertext could not be read back".into());

@@ -528,7 +528,13 @@ pub fn add_memory_to<S: MemoryStore + GraphStore + ?Sized>(
     };
     let kind = if forced_credential { "credential" } else { kind };
     let canonical_project = Database::canonical_project(project);
-    let scoped_metadata = Database::apply_scope_to_metadata(metadata, scope);
+    let mut scoped_metadata = Database::apply_scope_to_metadata(metadata, scope);
+    // A ciphertext is written by the vault only: one sent by a caller would
+    // pass a text in clear for a sealed credential.
+    if let Some(object) = scoped_metadata.as_mut().and_then(|meta| meta.as_object_mut()) {
+        object.remove("enc");
+        object.remove("sealed");
+    }
     if let Some(existing) = find_duplicate(store, content, canonical_project.as_deref())? {
         // Merge. The new text replaces the old one unless it adds nothing to
         // it (all its words already there): a near-duplicate that changes a

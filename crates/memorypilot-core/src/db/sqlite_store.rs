@@ -66,7 +66,7 @@ impl Database {
 
 impl MemoryStore for Database {
     fn insert_memory(&self, memory: &Memory, content_hash: &str) -> Result<(), String> {
-        let sealed = vault::seal_for_write(memory)?;
+        let sealed = vault::seal_for_write(memory, true)?;
         let sealed_hash = sealed.as_ref().map(|m| super::content_hash(&m.content));
         let memory = sealed.as_ref().unwrap_or(memory);
         let content_hash = sealed_hash.as_deref().unwrap_or(content_hash);
@@ -112,7 +112,7 @@ impl MemoryStore for Database {
     }
 
     fn write_memory(&self, memory: &Memory, content_hash: &str, content_changed: bool) -> Result<(), String> {
-        let sealed = vault::seal_for_write(memory)?;
+        let sealed = vault::seal_for_write(memory, false)?;
         let sealed_hash = sealed.as_ref().map(|m| super::content_hash(&m.content));
         let memory = sealed.as_ref().unwrap_or(memory);
         let content_hash = sealed_hash.as_deref().unwrap_or(content_hash);
