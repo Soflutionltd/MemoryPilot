@@ -710,6 +710,14 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
             // If it's not already in results, fetch it and add it
             if !results.iter().any(|r| r.memory.id == rel_id) {
                 if let Ok(Some(mem)) = store.fetch_memory(&rel_id) {
+                    // A neighbour is held to the filters of the search, as
+                    // the lexical and vector lanes are: a link may cross
+                    // projects and kinds, the answer to a filtered search may not.
+                    let in_project = canonical_project.as_deref().is_none_or(|wanted| mem.project.as_deref() == Some(wanted));
+                    let of_kind = kind.is_none_or(|wanted| mem.kind == wanted);
+                    if !in_project || !of_kind {
+                        continue;
+                    }
                     results.push(SearchResult {
                         memory: mem,
                         score: graph_score,
