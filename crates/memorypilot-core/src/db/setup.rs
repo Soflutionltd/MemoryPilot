@@ -116,6 +116,7 @@ impl Database {
                 tags TEXT NOT NULL DEFAULT '[]',
                 source TEXT NOT NULL DEFAULT '',
                 importance INTEGER NOT NULL DEFAULT 3,
+                expires_at TEXT,
                 metadata TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -139,6 +140,12 @@ impl Database {
                 "ALTER TABLE memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3;
                  ALTER TABLE memories ADD COLUMN expires_at TEXT;",
             );
+        }
+        // An archived original keeps its expiry: restored, it still expires.
+        if self.conn.prepare("SELECT expires_at FROM memories_archive LIMIT 0").is_err() {
+            self.conn
+                .execute_batch("ALTER TABLE memories_archive ADD COLUMN expires_at TEXT;")
+                .map_err(|e| format!("Schema (archive expiry): {}", e))?;
         }
         // v3.0 columns
         let has_embedding: bool = self

@@ -155,8 +155,8 @@ impl Database {
             .conn
             .execute(
                 "INSERT OR REPLACE INTO memories_archive
-                 (id,content,kind,project,tags,source,importance,metadata,created_at,updated_at,archived_at,reason,replaced_by)
-                 SELECT id,content,kind,project,tags,source,importance,metadata,created_at,updated_at,?2,?3,?4
+                 (id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,archived_at,reason,replaced_by)
+                 SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,?2,?3,?4
                  FROM memories WHERE id=?1",
                 params![id, Utc::now().to_rfc3339(), reason, replaced_by],
             )
@@ -197,7 +197,7 @@ impl Database {
     /// Puts an archived original back among the memories, as it was.
     pub fn restore_archived(&self, id: &str) -> Result<Option<Memory>, String> {
         let row = self.conn.query_row(
-            "SELECT content,kind,project,tags,source,importance,metadata,created_at FROM memories_archive WHERE id=?1",
+            "SELECT content,kind,project,tags,source,importance,metadata,created_at,expires_at FROM memories_archive WHERE id=?1",
             params![id],
             |r| {
                 Ok((
@@ -209,10 +209,11 @@ impl Database {
                     r.get::<_, i32>(5)?,
                     r.get::<_, Option<String>>(6)?,
                     r.get::<_, String>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             },
         );
-        let Ok((content, kind, project, tags, source, importance, metadata, created_at)) = row else {
+        let Ok((content, kind, project, tags, source, importance, metadata, created_at, expires_at)) = row else {
             return Ok(None);
         };
         let memory = Memory {
@@ -223,7 +224,7 @@ impl Database {
             tags: serde_json::from_str(&tags).unwrap_or_default(),
             source,
             importance,
-            expires_at: None,
+            expires_at,
             created_at,
             updated_at: Utc::now().to_rfc3339(),
             metadata: metadata.and_then(|m| serde_json::from_str(&m).ok()),
