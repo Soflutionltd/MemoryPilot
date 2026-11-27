@@ -30,32 +30,89 @@ impl Database {
         }
     }
 
-    /// Deletes every episode built from this memory, and every summary built
-    /// on those episodes, up to the top level: a deleted memory must not live
-    /// on in a daily or monthly summary. The next rollup rebuilds them from
-    /// what is left.
-    fn forget_in_episodes(&self, memory_id: &str) -> Result<(), String> {
-        let ids_citing = |column: &str, id: &str| -> Result<Vec<String>, String> {
+    /// Deletes the row of a memory and its full-text entry. `false` when
+    /// there was no such memory.
+    fn remove_row(&self, id: &str) -> Result<bool, String> {
+        self.conn
+            .execute(
+                "DELETE FROM memories_fts WHERE rowid IN (SELECT rowid FROM memories WHERE id=?1)",
+                params![id],
+            )
+            .map_err(|e| format!("FTS delete: {}", e))?;
+        self.conn
+            .execute("DELETE FROM memories WHERE id=?1", params![id])
+            .map(|affected| affected > 0)
+            .map_err(|e| format!("Delete: {}", e))
+    }
+
+    /// Removes these memories as one unit: rows, full-text entries, the
+    /// episodes built on them and, once written, their vectors. Returns how
+    /// many existed.
+    pub(super) fn remove_memories(&self, ids: &[String]) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let removed = self.atomically(|| {
+            let mut removed: Vec<&str> = Vec::new();
+            for id in ids {
+                if self.remove_row(id)? {
+                    removed.push(id);
+                }
+            }
+            self.forget_in_episodes(&removed)?;
+            Ok(removed)
+        })?;
+        if let Some(ann) = self.ann.as_ref() {
+            for id in &removed {
+                let _ = ann.remove(id);
+            }
+        }
+        Ok(removed.len())
+    }
+
+    /// Deletes every episode built from these memories, and every summary
+    /// built on those episodes, up to the top level: a deleted memory must
+    /// not live on in a daily or monthly summary. The next rollup rebuilds
+    /// them from what is left. One read of the episodes, whatever the number
+    /// of memories.
+    fn forget_in_episodes(&self, memory_ids: &[&str]) -> Result<(), String> {
+        if memory_ids.is_empty() {
+            return Ok(());
+        }
+        let episodes: Vec<(String, Vec<String>, Vec<String>)> = {
             let mut stmt = self
                 .conn
-                .prepare_cached(&format!("SELECT id FROM episodes WHERE {} LIKE ?1 ESCAPE '\\'", column))
+                .prepare_cached("SELECT id, source_ids, child_ids FROM episodes")
                 .map_err(|e| format!("Episodes of a memory: {}", e))?;
-            let pattern = format!("%\"{}\"%", id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
             let rows = stmt
-                .query_map(params![pattern], |r| r.get::<_, String>(0))
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
                 .map_err(|e| format!("Episodes of a memory: {}", e))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Episodes of a memory: {}", e))
-        };
-        let mut doomed: Vec<String> = Vec::new();
-        let mut pending = ids_citing("source_ids", memory_id)?;
-        while let Some(episode_id) = pending.pop() {
-            if doomed.contains(&episode_id) {
-                continue;
+            let mut episodes = Vec::new();
+            for row in rows {
+                let (id, sources, children) = row.map_err(|e| format!("Episodes of a memory: {}", e))?;
+                let ids_of = |json: &str| serde_json::from_str::<Vec<String>>(json).map_err(|e| format!("Episode {}: unreadable id list: {}", id, e));
+                episodes.push((id.clone(), ids_of(&sources)?, ids_of(&children)?));
             }
-            pending.extend(ids_citing("child_ids", &episode_id)?);
-            doomed.push(episode_id);
+            episodes
+        };
+        let gone: HashSet<&str> = memory_ids.iter().copied().collect();
+        let mut doomed: HashSet<&str> = episodes
+            .iter()
+            .filter(|(_, sources, _)| sources.iter().any(|source| gone.contains(source.as_str())))
+            .map(|(id, _, _)| id.as_str())
+            .collect();
+        loop {
+            let parents: Vec<&str> = episodes
+                .iter()
+                .filter(|(id, _, children)| !doomed.contains(id.as_str()) && children.iter().any(|child| doomed.contains(child.as_str())))
+                .map(|(id, _, _)| id.as_str())
+                .collect();
+            if parents.is_empty() {
+                break;
+            }
+            doomed.extend(parents);
         }
-        for episode_id in &doomed {
+        for episode_id in doomed {
             self.conn
                 .execute("DELETE FROM episodes WHERE id=?1", params![episode_id])
                 .map_err(|e| format!("Episode delete: {}", e))?;
@@ -155,26 +212,7 @@ impl MemoryStore for Database {
     }
 
     fn remove_memory(&self, id: &str) -> Result<bool, String> {
-        let removed = self.atomically(|| {
-            self.conn
-                .execute(
-                    "DELETE FROM memories_fts WHERE rowid IN (SELECT rowid FROM memories WHERE id=?1)",
-                    params![id],
-                )
-                .map_err(|e| format!("FTS delete: {}", e))?;
-            let affected = self
-                .conn
-                .execute("DELETE FROM memories WHERE id=?1", params![id])
-                .map_err(|e| format!("Delete: {}", e))?;
-            if affected > 0 {
-                self.forget_in_episodes(id)?;
-            }
-            Ok(affected > 0)
-        })?;
-        if let Some(ann) = self.ann.as_ref() {
-            let _ = ann.remove(id);
-        }
-        Ok(removed)
+        self.remove_memories(&[id.to_string()]).map(|removed| removed > 0)
     }
 
     fn list_memory_rows(

@@ -57,14 +57,9 @@ impl Database {
                 .map_err(|e| format!("Cleanup: {}", e))?;
             rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Cleanup: {}", e))?
         };
-        // The same path as a deletion: index entry, vector and the episodes
-        // built on the memory go with it.
-        let mut removed = 0usize;
-        for id in &expired {
-            if self.remove_memory(id)? {
-                removed += 1;
-            }
-        }
+        // The same path as a deletion: index entries, vectors and the
+        // episodes built on these memories go with them.
+        let removed = self.remove_memories(&expired)?;
         // An archived original past its expiry is not kept either.
         self.conn
             .execute(
