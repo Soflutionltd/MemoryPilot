@@ -3,8 +3,8 @@
 #
 #   scripts/release-macos.sh
 #
-# Builds the tag of the workspace version (vX.Y.Z, already pushed and checked
-# out), signs it with the Developer ID of the login Keychain, notarizes it with
+# Runs the tests, builds the tag of the workspace version (vX.Y.Z, already
+# pushed and checked out), signs it with the Developer ID of the login Keychain, notarizes it with
 # the App Store Connect API key, uploads MemoryPilot-aarch64-apple-darwin.tar.gz
 # (+ .sha256) to the GitHub release, then points the Homebrew tap at it.
 #
@@ -37,6 +37,11 @@ TAG="v${VERSION}"
 git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null || die "tag ${TAG} is not on origin: push it first"
 [ "$(git rev-parse HEAD)" = "$(git rev-parse "${TAG}^{commit}")" ] || die "HEAD is not ${TAG}: check out the tag"
 git diff --quiet HEAD || die "uncommitted changes: the asset must be the tag, nothing else"
+
+# Nothing is signed, uploaded or announced to the updater from a tag whose
+# tests fail: a build that compiles is not a build that works.
+echo "▸ test ${TAG}"
+cargo test --workspace --locked --features http || die "tests fail on ${TAG}: nothing was built or published"
 
 echo "▸ build ${TAG} (${TARGET})"
 cargo build --release --locked --features http --bin MemoryPilot --target "$TARGET"
