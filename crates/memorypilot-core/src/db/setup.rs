@@ -142,10 +142,14 @@ impl Database {
             );
         }
         // An archived original keeps its expiry: restored, it still expires.
-        if self.conn.prepare("SELECT expires_at FROM memories_archive LIMIT 0").is_err() {
-            self.conn
-                .execute_batch("ALTER TABLE memories_archive ADD COLUMN expires_at TEXT;")
-                .map_err(|e| format!("Schema (archive expiry): {}", e))?;
+        let archive_has_expiry = || self.conn.prepare("SELECT expires_at FROM memories_archive LIMIT 0").is_ok();
+        if !archive_has_expiry() {
+            // Another process opening the same database may add it first.
+            if let Err(error) = self.conn.execute_batch("ALTER TABLE memories_archive ADD COLUMN expires_at TEXT;") {
+                if !archive_has_expiry() {
+                    return Err(format!("Schema (archive expiry): {}", error));
+                }
+            }
         }
         // v3.0 columns
         let has_embedding: bool = self
