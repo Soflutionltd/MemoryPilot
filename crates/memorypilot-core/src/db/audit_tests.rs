@@ -562,3 +562,51 @@ fn a_filtered_search_keeps_its_filters_through_the_graph() {
     }
     cleanup(&path);
 }
+
+/// A sealed row read back from the store is never sealed again, even when
+/// its ciphertext does not open here (key replaced, database from another
+/// machine) or is gone: sealing the masked label would destroy the secret
+/// for good and pass the label for the value.
+#[test]
+fn an_update_never_reseals_a_credential_it_cannot_open() {
+    let path = temp_db_path("no-reseal");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let (foreign, _) = add(&db, "Compte A : demo@example.com / password: synthetic_foreign_value", "credential", "proj");
+        let (lost, _) = add(&db, "Compte B : demo@example.com / password: synthetic_lost_value", "credential", "proj");
+        let from_another_key = serde_json::json!({ "enc": "Y2lwaGVydGV4dCBmcm9tIGFub3RoZXIga2V5IGFuZCBtYWNoaW5l", "sealed": true }).to_string();
+        db.conn.execute("UPDATE memories SET metadata=?1 WHERE id=?2", rusqlite::params![from_another_key, foreign.id]).unwrap();
+        db.conn.execute("UPDATE memories SET metadata='{}' WHERE id=?1", rusqlite::params![lost.id]).unwrap();
+        let metadata = |id: &str| -> String { db.conn.query_row("SELECT metadata FROM memories WHERE id=?1", rusqlite::params![id], |r| r.get(0)).unwrap() };
+
+        for id in [&foreign.id, &lost.id] {
+            db.update_memory_full(id, None, None, Some(&["compte".to_string()]), Some(4), None, None).expect("tag update");
+        }
+        let kept: serde_json::Value = serde_json::from_str(&metadata(&foreign.id)).unwrap();
+        assert_eq!(kept["enc"], "Y2lwaGVydGV4dCBmcm9tIGFub3RoZXIga2V5IGFuZCBtYWNoaW5l", "the ciphertext of another key was replaced");
+        assert!(db.credential_clear_text(&foreign.id).is_err(), "a credential that cannot be opened must say so");
+        let still_lost: serde_json::Value = serde_json::from_str(&metadata(&lost.id)).unwrap();
+        assert!(still_lost.get("enc").is_none(), "a masked label was sealed as if it were the secret");
+        assert!(db.credential_clear_text(&lost.id).is_err());
+    }
+    cleanup(&path);
+}
+
+/// As capsules: a merge has no expiry, so it leaves temporary memories alone.
+#[test]
+fn gc_merge_leaves_temporary_memories_alone() {
+    let path = temp_db_path("gc-expiry");
+    {
+        let db = Database::open_at(&path).expect("db");
+        for i in 0..10 {
+            seed_old(&db, &format!("e{i}"), &format!("Todo {i}: fix the export. Detail {i} explains why the cursor skips lines."), "todo", 1, "[]");
+        }
+        let expiry = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        db.conn.execute("UPDATE memories SET expires_at=?1 WHERE id LIKE 'e%'", rusqlite::params![expiry]).unwrap();
+        db.run_gc(&crate::gc::GcConfig::default(), false).expect("gc");
+        let remaining: i64 = db.conn.query_row("SELECT COUNT(*) FROM memories WHERE id LIKE 'e%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 10, "temporary memories were merged");
+        assert!(db.list_archived(None, 50).unwrap().is_empty());
+    }
+    cleanup(&path);
+}
