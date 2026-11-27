@@ -19,7 +19,7 @@ use crate::pool::{app_session, ExpiryClock, PooledClient};
 use crate::text::{fts5_to_tsquery, index_text};
 use crate::{pg_error, MasterKey, PgConnection, PgPool};
 use crate::{ApiKeyInfo, DailyUsage, NewApiKey, Permission, TenantLimits};
-use memorypilot_core::db::{seal_text, unwrap_key, wrap_key, SEAL_PREFIX};
+use memorypilot_core::db::{open_text, seal_text, unwrap_key, wrap_key, SEAL_PREFIX};
 
 /// Where a store reads and writes. With a subject it sees that end user's
 /// memories plus the ones shared by the space, and writes as that end
@@ -576,14 +576,27 @@ impl PgStore {
     /// Seals a credential with the tenant key: searchable masked label,
     /// ciphertext in `metadata.enc`. Already sealed rows are left as they are.
     fn seal(&self, memory: &Memory) -> Result<Memory, String> {
-        if memory.kind != "credential" || memory.content.starts_with(SEAL_PREFIX) {
+        if memory.kind != "credential" {
             return Ok(memory.clone());
         }
         let dek = self.dek.as_ref().ok_or_else(|| {
             "Credentials need the per-tenant encryption key (set MEMORYPILOT_MASTER_KEY)"
                 .to_string()
         })?;
-        let (masked, enc) = seal_text(dek, &memory.content)
+        // Sealed only when its ciphertext opens with the tenant key: the 🔒
+        // prefix alone is a text any caller can type.
+        let opens = memory.content.starts_with(SEAL_PREFIX)
+            && memory
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("enc"))
+                .and_then(|enc| enc.as_str())
+                .and_then(|enc| open_text(dek, enc))
+                .is_some();
+        if opens {
+            return Ok(memory.clone());
+        }
+        let (masked, enc) = seal_text(dek, memory.content.trim_start_matches(SEAL_PREFIX))
             .ok_or_else(|| "Could not seal the credential".to_string())?;
         let mut sealed = memory.clone();
         sealed.content = masked;
