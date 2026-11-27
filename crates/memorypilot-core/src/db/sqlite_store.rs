@@ -7,6 +7,63 @@ use std::collections::{HashMap, HashSet};
 
 const MEMORY_COLUMNS: &str = "id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count";
 
+impl Database {
+    /// Runs `writes` as one unit: all of them are kept, or none. A savepoint,
+    /// so it also works inside a transaction a caller already opened.
+    pub(super) fn atomically<T>(&self, writes: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        self.conn
+            .execute_batch("SAVEPOINT memory_write")
+            .map_err(|e| format!("Write begin: {}", e))?;
+        match writes() {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("RELEASE memory_write")
+                    .map_err(|e| format!("Write commit: {}", e))?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(rollback) = self.conn.execute_batch("ROLLBACK TO memory_write; RELEASE memory_write") {
+                    return Err(format!("{} (and the rollback failed: {})", error, rollback));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Deletes every episode built from this memory, and every summary built
+    /// on those episodes, up to the top level: a deleted memory must not live
+    /// on in a daily or monthly summary. The next rollup rebuilds them from
+    /// what is left.
+    fn forget_in_episodes(&self, memory_id: &str) -> Result<(), String> {
+        let ids_citing = |column: &str, id: &str| -> Result<Vec<String>, String> {
+            let mut stmt = self
+                .conn
+                .prepare_cached(&format!("SELECT id FROM episodes WHERE {} LIKE ?1 ESCAPE '\\'", column))
+                .map_err(|e| format!("Episodes of a memory: {}", e))?;
+            let pattern = format!("%\"{}\"%", id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            let rows = stmt
+                .query_map(params![pattern], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("Episodes of a memory: {}", e))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Episodes of a memory: {}", e))
+        };
+        let mut doomed: Vec<String> = Vec::new();
+        let mut pending = ids_citing("source_ids", memory_id)?;
+        while let Some(episode_id) = pending.pop() {
+            if doomed.contains(&episode_id) {
+                continue;
+            }
+            pending.extend(ids_citing("child_ids", &episode_id)?);
+            doomed.push(episode_id);
+        }
+        for episode_id in &doomed {
+            self.conn
+                .execute("DELETE FROM episodes WHERE id=?1", params![episode_id])
+                .map_err(|e| format!("Episode delete: {}", e))?;
+        }
+        Ok(())
+    }
+}
+
 impl MemoryStore for Database {
     fn insert_memory(&self, memory: &Memory, content_hash: &str) -> Result<(), String> {
         let sealed = vault::seal_for_write(memory)?;
@@ -18,18 +75,20 @@ impl MemoryStore for Database {
             .metadata
             .as_ref()
             .map(|m| serde_json::to_string(m).unwrap_or_default());
-        self.conn.execute(
-            "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10,?11,?12,0)",
-            params![memory.id, memory.content, memory.kind, memory.project.as_deref(), tags_json, memory.source, memory.importance, memory.expires_at.as_deref(), meta_json, content_hash, memory.created_at, memory.updated_at],
-        ).map_err(|e| format!("Insert: {}", e))?;
-        let rowid = self.conn.last_insert_rowid();
         let fts_content = Self::fts_index_content(&memory.content);
-        self.conn.execute(
-            "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
-            params![rowid, fts_content, tags_json, memory.kind, memory.project.as_deref().unwrap_or("")],
-        ).map_err(|e| format!("FTS insert: {}", e))?;
-        Ok(())
+        self.atomically(|| {
+            self.conn.execute(
+                "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,content_hash,created_at,updated_at,access_count)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10,?11,?12,0)",
+                params![memory.id, memory.content, memory.kind, memory.project.as_deref(), tags_json, memory.source, memory.importance, memory.expires_at.as_deref(), meta_json, content_hash, memory.created_at, memory.updated_at],
+            ).map_err(|e| format!("Insert: {}", e))?;
+            let rowid = self.conn.last_insert_rowid();
+            self.conn.execute(
+                "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
+                params![rowid, fts_content, tags_json, memory.kind, memory.project.as_deref().unwrap_or("")],
+            ).map_err(|e| format!("FTS insert: {}", e))?;
+            Ok(())
+        })
     }
 
     fn fetch_memory(&self, id: &str) -> Result<Option<Memory>, String> {
@@ -62,60 +121,60 @@ impl MemoryStore for Database {
             .metadata
             .as_ref()
             .map(|value| serde_json::to_string(value).unwrap_or_default());
-        if content_changed {
-            self.conn.execute(
-                "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7,embedding=NULL,content_hash=?8 WHERE id=?9",
-                params![memory.content, memory.kind, tags_json, memory.importance, memory.expires_at, metadata_json, memory.updated_at, content_hash, memory.id],
-            ).map_err(|e| format!("Update: {}", e))?;
-        } else {
-            self.conn.execute(
-                "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7 WHERE id=?8",
-                params![memory.content, memory.kind, tags_json, memory.importance, memory.expires_at, metadata_json, memory.updated_at, memory.id],
-            ).map_err(|e| format!("Update: {}", e))?;
-        }
-        if let Ok(rowid) = self.conn.query_row::<i64, _, _>(
-            "SELECT rowid FROM memories WHERE id=?1",
-            params![memory.id],
-            |r| r.get(0),
-        ) {
-            let _ = self
-                .conn
-                .execute("DELETE FROM memories_fts WHERE rowid=?1", params![rowid]);
-            let proj = memory.project.as_deref().unwrap_or("");
-            let fts_content = Self::fts_index_content(&memory.content);
-            let _ = self.conn.execute(
-                "INSERT INTO memories_fts (rowid,content,tags,kind,project) VALUES (?1,?2,?3,?4,?5)",
-                params![rowid, fts_content, tags_json, memory.kind, proj]);
-        }
-        Ok(())
+        let fts_content = Self::fts_index_content(&memory.content);
+        self.atomically(|| {
+            // The index entry goes first, while the row still tells its rowid.
+            self.conn
+                .execute(
+                    "DELETE FROM memories_fts WHERE rowid IN (SELECT rowid FROM memories WHERE id=?1)",
+                    params![memory.id],
+                )
+                .map_err(|e| format!("FTS update: {}", e))?;
+            let updated = if content_changed {
+                self.conn.execute(
+                    "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7,embedding=NULL,content_hash=?8 WHERE id=?9",
+                    params![memory.content, memory.kind, tags_json, memory.importance, memory.expires_at, metadata_json, memory.updated_at, content_hash, memory.id],
+                )
+            } else {
+                self.conn.execute(
+                    "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,metadata=?6,updated_at=?7 WHERE id=?8",
+                    params![memory.content, memory.kind, tags_json, memory.importance, memory.expires_at, metadata_json, memory.updated_at, memory.id],
+                )
+            }
+            .map_err(|e| format!("Update: {}", e))?;
+            if updated > 0 {
+                self.conn
+                    .execute(
+                        "INSERT INTO memories_fts (rowid,content,tags,kind,project) SELECT rowid,?2,?3,?4,?5 FROM memories WHERE id=?1",
+                        params![memory.id, fts_content, tags_json, memory.kind, memory.project.as_deref().unwrap_or("")],
+                    )
+                    .map_err(|e| format!("FTS update: {}", e))?;
+            }
+            Ok(())
+        })
     }
 
     fn remove_memory(&self, id: &str) -> Result<bool, String> {
-        if let Ok(rowid) = self.conn.query_row::<i64, _, _>(
-            "SELECT rowid FROM memories WHERE id=?1",
-            params![id],
-            |r| r.get(0),
-        ) {
-            let _ = self
+        let removed = self.atomically(|| {
+            self.conn
+                .execute(
+                    "DELETE FROM memories_fts WHERE rowid IN (SELECT rowid FROM memories WHERE id=?1)",
+                    params![id],
+                )
+                .map_err(|e| format!("FTS delete: {}", e))?;
+            let affected = self
                 .conn
-                .execute("DELETE FROM memories_fts WHERE rowid=?1", params![rowid]);
-        }
-        let affected = self
-            .conn
-            .execute("DELETE FROM memories WHERE id=?1", params![id])
-            .map_err(|e| format!("Delete: {}", e))?;
+                .execute("DELETE FROM memories WHERE id=?1", params![id])
+                .map_err(|e| format!("Delete: {}", e))?;
+            if affected > 0 {
+                self.forget_in_episodes(id)?;
+            }
+            Ok(affected > 0)
+        })?;
         if let Some(ann) = self.ann.as_ref() {
             let _ = ann.remove(id);
         }
-        if affected > 0 {
-            // A deleted memory must not live on in an episode summary; the
-            // next rollup rebuilds the episode from what is left.
-            let _ = self.conn.execute(
-                "DELETE FROM episodes WHERE source_ids LIKE ?1",
-                params![format!("%\"{}\"%", id)],
-            );
-        }
-        Ok(affected > 0)
+        Ok(removed)
     }
 
     fn list_memory_rows(

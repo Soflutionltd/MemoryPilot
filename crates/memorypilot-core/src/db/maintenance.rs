@@ -40,18 +40,39 @@ impl Database {
             }
             *ts = std::time::Instant::now();
         }
+        self.remove_expired()
+    }
+
+    /// Removes what is past its expiry, now (`cleanup_expired` without its
+    /// once-a-minute throttle).
+    pub(super) fn remove_expired(&self) -> Result<usize, String> {
         let now = Utc::now().to_rfc3339();
-        let _ = self.conn.execute(
-            "DELETE FROM memories_fts WHERE rowid IN (SELECT rowid FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1)",
-            params![now]);
-        let affected = self
-            .conn
+        let expired: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1")
+                .map_err(|e| format!("Cleanup: {}", e))?;
+            let rows = stmt
+                .query_map(params![now], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("Cleanup: {}", e))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Cleanup: {}", e))?
+        };
+        // The same path as a deletion: index entry, vector and the episodes
+        // built on the memory go with it.
+        let mut removed = 0usize;
+        for id in &expired {
+            if self.remove_memory(id)? {
+                removed += 1;
+            }
+        }
+        // An archived original past its expiry is not kept either.
+        self.conn
             .execute(
-                "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1",
+                "DELETE FROM memories_archive WHERE expires_at IS NOT NULL AND expires_at < ?1",
                 params![now],
             )
-            .map_err(|e| format!("Cleanup: {}", e))?;
-        Ok(affected)
+            .map_err(|e| format!("Cleanup (archive): {}", e))?;
+        Ok(removed)
     }
 
     // ─── GC & COMPRESSION ─────────────────────────────
@@ -86,7 +107,7 @@ impl Database {
         let mut preview_candidates: Vec<crate::gc::GcPreviewCandidate> = Vec::new();
 
         for kind in &config.compressible_kinds {
-            let sql = "SELECT id, content, project, importance, updated_at FROM memories WHERE kind = ?1 AND tags NOT LIKE '%pinned%'";
+            let sql = "SELECT id, content, project, importance, updated_at FROM memories WHERE kind = ?1 AND tags NOT LIKE '%pinned%' AND expires_at IS NULL";
             if let Ok(mut stmt) = self.conn.prepare(&sql) {
                 if let Ok(rows) = stmt.query_map(params![kind], |r| {
                     Ok((
@@ -232,7 +253,8 @@ impl Database {
 
     /// Compress old low-importance memories into dense capsules.
     /// Groups by project + age, merges into ~100-200 token summaries.
-    /// Pinned memories are never compacted; every original is kept in
+    /// Pinned memories are never compacted, nor are memories with an expiry:
+    /// a summary without one would keep what was meant to go. Every original is kept in
     /// `memories_archive` (see `restore_archived`). Returns (capsules_created, memories_compressed).
     pub fn compact_to_capsules(
         &self,
@@ -240,7 +262,7 @@ impl Database {
         importance_max: i32,
     ) -> Result<(usize, usize), String> {
         let now = chrono::Utc::now();
-        let sql = "SELECT id, content, kind, project, importance, updated_at FROM memories WHERE kind NOT IN ('credential', 'architecture', 'transcript_chunk', 'external_request') AND importance <= ?1 AND tags NOT LIKE '%pinned%'";
+        let sql = "SELECT id, content, kind, project, importance, updated_at FROM memories WHERE kind NOT IN ('credential', 'architecture', 'transcript_chunk', 'external_request') AND importance <= ?1 AND tags NOT LIKE '%pinned%' AND expires_at IS NULL";
         let mut stmt = self
             .conn
             .prepare(sql)
