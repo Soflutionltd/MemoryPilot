@@ -3,11 +3,14 @@
 //!
 //! A repository followed on its main branch can change under an
 //! installation, and a file damaged in the cache (a download cut short, a
-//! disk error) made every start fail without repairing itself. A file is
-//! hashed once, when it enters the cache or is first seen there; a marker
-//! next to it then spares the 250 MB read at every start. When the model
-//! fails to load, `repair` hashes again and removes what does not match,
-//! so that the next load downloads it.
+//! disk error) made every start fail without repairing itself, or loaded
+//! as it was: ONNX Runtime reads external weights without checking them,
+//! and damaged weights give vectors that mean nothing. A file is hashed
+//! when it enters the cache or is first seen there, and again whenever its
+//! size or modification time changed since; a marker next to it holds
+//! those and spares the 250 MB read at every other start. When the model
+//! fails to load, `repair` hashes again whatever the marker says and
+//! removes what does not match, so that the next load downloads it.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -118,16 +121,27 @@ fn forget(path: &Path) {
     let _ = std::fs::remove_file(marker(path));
 }
 
+/// What a marker holds: the print that was checked, and the size and
+/// modification time the file had then. `None` when they cannot be read.
+fn state_of(path: &Path, sha256: &str) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(format!("{} {} {}", sha256, metadata.len(), modified.as_nanos()))
+}
+
 /// Checks `path` against its pin. A file that does not match is removed
 /// (with the cache blob it points to), so that the next call downloads it.
 fn verify(path: &Path, file: &PinnedFile) -> Result<(), String> {
-    let checked = std::fs::read_to_string(marker(path)).is_ok_and(|print| print.trim() == file.sha256);
-    if checked && has_size(path, file.bytes) {
+    let sized = has_size(path, file.bytes);
+    let state = state_of(path, file.sha256);
+    let checked = std::fs::read_to_string(marker(path)).ok();
+    if sized && state.is_some() && checked == state {
         return Ok(());
     }
-    let found = if has_size(path, file.bytes) { sha256_of(path)? } else { String::new() };
+    let found = if sized { sha256_of(path)? } else { String::new() };
     if found == file.sha256 {
-        std::fs::write(marker(path), file.sha256).map_err(|error| format!("{}: {}", marker(path).display(), error))?;
+        let state = state.ok_or_else(|| format!("{}: size or modification time cannot be read", path.display()))?;
+        std::fs::write(marker(path), state).map_err(|error| format!("{}: {}", marker(path).display(), error))?;
         return Ok(());
     }
     let size = std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0);
@@ -205,11 +219,17 @@ mod tests {
         let (cache, path, blob) = cache_with("once", b"hello");
         assert!(REPO.is_cached(&cache, &HELLO));
         assert_eq!(REPO.file(&cache, &HELLO, false), Ok(path.clone()));
-        assert_eq!(std::fs::read_to_string(marker(&path)).expect("marker"), HELLO.sha256);
+        let noted = std::fs::read_to_string(marker(&path)).expect("marker");
+        assert!(noted.starts_with(HELLO.sha256), "{}", noted);
+        // Untouched: believed on its marker (no 250 MB read at every start).
+        assert_eq!(REPO.file(&cache, &HELLO, false), Ok(path.clone()));
+        assert_eq!(std::fs::read_to_string(marker(&path)).expect("marker"), noted);
 
-        // Damaged afterwards at the same size: the marker is believed (no
-        // 250 MB read at every start), a repair is not fooled.
+        // Damaged without a trace (same size, same time, as a disk error
+        // would): the marker is believed, a repair is not fooled.
+        let written = std::fs::metadata(&blob).expect("blob").modified().expect("time");
         std::fs::write(&blob, b"jello").expect("damage");
+        std::fs::File::options().write(true).open(&blob).expect("blob").set_modified(written).expect("time back");
         assert_eq!(REPO.file(&cache, &HELLO, false), Ok(path.clone()));
         assert_eq!(REPO.repair(&cache, &[HELLO]), 1);
         assert!(!path.exists() && !blob.exists() && !marker(&path).exists());
@@ -242,12 +262,27 @@ mod tests {
         }
     }
 
+    /// Weights rewritten at the same size load without an error in ONNX
+    /// Runtime: the change of modification time is what gives them away.
+    #[test]
+    fn a_file_rewritten_after_its_check_is_hashed_again() {
+        let (cache, path, blob) = cache_with("rewritten", b"hello");
+        assert_eq!(REPO.file(&cache, &HELLO, false), Ok(path.clone()));
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::write(&blob, b"jello").expect("damage");
+        std::fs::File::options().write(true).open(&blob).expect("blob").set_modified(later).expect("time");
+        let error = verify(&path, &HELLO).expect_err("rewritten");
+        assert!(error.contains("does not match its pinned print"), "{}", error);
+        assert!(!path.exists() && !blob.exists() && !marker(&path).exists());
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
     #[test]
     fn a_good_file_survives_a_repair() {
         let (cache, path, blob) = cache_with("good", b"hello");
         assert_eq!(REPO.repair(&cache, &[HELLO]), 0);
         assert!(path.exists() && blob.exists());
-        assert_eq!(std::fs::read_to_string(marker(&path)).expect("marker"), HELLO.sha256);
+        assert!(std::fs::read_to_string(marker(&path)).expect("marker").starts_with(HELLO.sha256));
         let _ = std::fs::remove_dir_all(cache);
     }
 }
