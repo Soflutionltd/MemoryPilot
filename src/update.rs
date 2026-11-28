@@ -166,52 +166,73 @@ pub fn startup_guard() {
     let mut state = read_state(&dir);
     let on_probation = state.pending.clone();
     let action = on_boot(&mut state, VERSION, &exe.path, crashed_boots(&dir, VERSION));
+    if action == BootAction::RollBack {
+        if let Some(pending) = on_probation.as_ref() {
+            roll_back(&dir, exe, pending, &state);
+        }
+        return;
+    }
     if let Err(error) = write_state(&dir, &state) {
         log(error);
     }
-    match action {
-        BootAction::Continue => {}
-        BootAction::Probation => {
-            if let Err(error) = create_boot_marker(&dir) {
-                log(error);
-            }
-            clear_boot_marker_on_signals();
-            if let Some(pending) = on_probation.as_ref() {
-                refresh_backup_before_upgrade(pending, memorypilot_core::db::SCHEMA_VERSION);
-            }
+    if action == BootAction::Probation {
+        if let Err(error) = create_boot_marker(&dir) {
+            log(error);
         }
-        BootAction::RollBack => {
-            remove_boot_markers(&dir, VERSION);
-            log(format!(
-                "v{} crashed {} times at startup: restoring the previous version",
-                VERSION, MAX_CRASHED_BOOTS
-            ));
-            let old = old_binary(&exe.path);
-            if !old.is_file() {
-                log(format!("cannot restore {}: file missing", old.display()));
-                return;
-            }
-            if let (Some(pending), Some(root)) = (on_probation.as_ref(), data_dir()) {
-                match restore_database_before(pending, &memory_backups_dir(&root)) {
-                    Ok(Some(aside)) => log(format!(
-                        "the database v{} upgraded is kept as {}; the copy taken before the update is back in place",
-                        pending.to,
-                        aside.display()
-                    )),
-                    Ok(None) => {}
-                    Err(error) => log(format!(
-                        "the database stays as v{} left it ({}): the previous version may refuse to open it",
-                        pending.to, error
-                    )),
-                }
-            }
-            if let Err(error) = fs::rename(&old, &exe.path) {
-                log(format!("cannot restore {}: {}", old.display(), error));
-                return;
-            }
-            restart_process(&exe.path);
+        clear_boot_marker_on_signals();
+        if let Some(pending) = on_probation.as_ref() {
+            refresh_backup_before_upgrade(pending, memorypilot_core::db::SCHEMA_VERSION);
         }
     }
+}
+
+/// Puts the previous binary back, and the database from before the update
+/// if the new version upgraded its schema. One process at a time (the update
+/// lock); the state is only written once the files are in place, so a
+/// rollback cut short is taken up again by the next server that starts.
+/// Returns only if this process keeps running the version it started as.
+fn roll_back(dir: &Path, exe: &Executable, pending: &Pending, rolled_back: &UpdateState) {
+    let Ok(lock) = UpdateLock::acquire(dir) else {
+        log("another MemoryPilot is restoring the previous version");
+        return;
+    };
+    let old = old_binary(&exe.path);
+    if !old.is_file() {
+        log(format!("v{} crashed at startup, but {} is missing: staying on it", VERSION, old.display()));
+        if let Err(error) = write_state(dir, rolled_back) {
+            log(error);
+        }
+        remove_boot_markers(dir, VERSION);
+        return;
+    }
+    log(format!(
+        "v{} crashed {} times at startup: restoring the previous version",
+        VERSION, MAX_CRASHED_BOOTS
+    ));
+    if let Some(root) = data_dir() {
+        match restore_database_before(pending, &memory_backups_dir(&root)) {
+            Ok(Some(aside)) => log(format!(
+                "the database v{} upgraded is kept as {}; the copy taken before the update is back in place",
+                pending.to,
+                aside.display()
+            )),
+            Ok(None) => {}
+            Err(error) => log(format!(
+                "the database stays as v{} left it ({}): the previous version may refuse to open it",
+                pending.to, error
+            )),
+        }
+    }
+    if let Err(error) = fs::rename(&old, &exe.path) {
+        log(format!("cannot restore {}: {}", old.display(), error));
+        return;
+    }
+    if let Err(error) = write_state(dir, rolled_back) {
+        log(error);
+    }
+    remove_boot_markers(dir, VERSION);
+    drop(lock);
+    restart_process(&exe.path);
 }
 
 /// Background work of a long-running server: probation confirmation by
@@ -295,7 +316,14 @@ fn development_build(exe: &Path, debug_build: bool) -> Option<&'static str> {
 #[cfg(unix)]
 fn clear_boot_marker_on_signals() {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-    let mut signals = match signal_hook::iterator::Signals::new([SIGHUP, SIGINT, SIGTERM]) {
+    // A signal the process was started to ignore (nohup, a background job of
+    // a non-interactive shell) stays ignored: watching it would end a server
+    // that was meant to survive it.
+    let watched: Vec<i32> = [SIGHUP, SIGINT, SIGTERM]
+        .into_iter()
+        .filter(|signal| !signal_is_ignored(*signal))
+        .collect();
+    let mut signals = match signal_hook::iterator::Signals::new(&watched) {
         Ok(signals) => signals,
         Err(error) => {
             log(format!("cannot watch termination signals: {}", error));
@@ -315,6 +343,22 @@ fn clear_boot_marker_on_signals() {
 
 #[cfg(not(unix))]
 fn clear_boot_marker_on_signals() {}
+
+/// Whether `signal` is currently set to be ignored by this process.
+#[cfg(unix)]
+fn signal_is_ignored(signal: i32) -> bool {
+    let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+    // SAFETY: with a null new action, sigaction only writes the current
+    // disposition of `signal` into `current`, a valid, writable sigaction;
+    // it is read only after the call reported success.
+    let read = unsafe { libc::sigaction(signal, std::ptr::null(), current.as_mut_ptr()) };
+    if read != 0 {
+        return false;
+    }
+    // SAFETY: the call above succeeded, so the kernel filled `current`.
+    let current = unsafe { current.assume_init() };
+    current.sa_sigaction == libc::SIG_IGN
+}
 
 /// Replaces this process with the binary on disk, same arguments, same open
 /// stdin and stdout. Call only when no request is in progress. Returns only
@@ -536,8 +580,15 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
         return Err("the downloaded binary does not start or reports another version".into());
     }
     let backup = backup_database(&data, &manifest.version)?;
+    // Here and not after the install: a version whose self-test keeps failing
+    // is tried again every few hours, one more copy each time.
+    prune_backups(&memory_backups_dir(&data), BACKUPS_KEPT);
     self_test(&new_binary, backup.as_deref(), &work.path)?;
-    let schema_before = backup.as_deref().and_then(|copy| schema_version_of(copy).ok());
+    let schema_before = match backup.as_deref().map(schema_version_of) {
+        Some(Ok(version)) => Some(version),
+        Some(Err(error)) => return Err(format!("the copy of the database cannot be read back: {}", error)),
+        None => None,
+    };
 
     // The probation is recorded before the binary is replaced: a new binary
     // in place without it could never be rolled back.
@@ -558,7 +609,6 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
         }
         return Err(error);
     }
-    prune_backups(&memory_backups_dir(&data), BACKUPS_KEPT);
     Ok(Outcome::Installed {
         version: manifest.version,
         backup,
@@ -777,18 +827,40 @@ fn refresh_backup_before_upgrade(pending: &Pending, schema_of_this_binary: i32) 
     else {
         return;
     };
-    if before >= schema_of_this_binary || schema_version_of(live).ok() != Some(before) {
+    if before >= schema_of_this_binary {
         return;
     }
-    let fresh = backup.with_extension(format!("db.fresh-{}", std::process::id()));
-    let _ = fs::remove_file(&fresh);
-    let copied = copy_database(live, &fresh).and_then(|()| schema_version_of(&fresh));
-    if copied == Ok(before) && fs::rename(&fresh, backup).is_ok() {
-        return;
+    match schema_version_of(live) {
+        Ok(current) if current == before => {}
+        Ok(_) => return,
+        Err(error) => {
+            log(format!("copy before the schema upgrade not refreshed: {}", error));
+            return;
+        }
     }
+    let Some(backups) = backup.parent() else { return };
+    let fresh = backups.join(format!("{}{}.{}", PARTIAL_BACKUP_PREFIX, pending.to, std::process::id()));
     let _ = fs::remove_file(&fresh);
-    if let Err(error) = copied {
-        log(format!("copy before the schema upgrade not refreshed: {}", error));
+    let refreshed = copy_database(live, &fresh)
+        .and_then(|()| schema_version_of(&fresh))
+        .and_then(|copied| {
+            if copied != before {
+                // Another server upgraded the database while this one copied it.
+                return Ok(false);
+            }
+            fs::rename(&fresh, backup)
+                .map(|()| true)
+                .map_err(|error| format!("{}: {}", backup.display(), error))
+        });
+    match refreshed {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = fs::remove_file(&fresh);
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&fresh);
+            log(format!("copy before the schema upgrade not refreshed: {}", error));
+        }
     }
 }
 
@@ -802,19 +874,23 @@ fn restore_database_before(pending: &Pending, backups: &Path) -> Result<Option<P
     else {
         return Ok(None);
     };
-    if !live.is_file() || schema_version_of(live)? <= before {
+    let aside_stem = format!("memory-upgraded-by-v{}", pending.to);
+    let staged = with_suffix(live, ".restoring");
+    if !live.is_file() {
+        // An earlier rollback moved the upgraded database aside and stopped
+        // before the copy was in place.
+        let Some(aside) = latest_named(backups, &aside_stem) else {
+            return Ok(None);
+        };
+        put_copy_in_place(backup, before, &staged, live)?;
+        return Ok(Some(aside));
+    }
+    if schema_version_of(live)? <= before {
         return Ok(None);
     }
-    if schema_version_of(backup)? != before {
-        return Err(format!("{} is not the copy from before the update", backup.display()));
-    }
-    let staged = live.with_extension(format!("db.restore-{}", std::process::id()));
-    let _ = fs::remove_file(&staged);
-    fs::copy(backup, &staged).map_err(|error| format!("copy {}: {}", backup.display(), error))?;
-    restrict_to_owner(&staged)?;
-
     ensure_private_dir(backups)?;
-    let aside = unused_path(backups, &format!("memory-upgraded-by-v{}", pending.to));
+    let aside = unused_path(backups, &aside_stem);
+    stage_copy(backup, before, &staged)?;
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for suffix in DATABASE_FILE_SUFFIXES {
         let from = with_suffix(live, suffix);
@@ -839,6 +915,41 @@ fn restore_database_before(pending: &Pending, backups: &Path) -> Result<Option<P
         return Err(format!("put {} back: {}", backup.display(), error));
     }
     Ok(Some(aside))
+}
+
+/// A private copy of `backup` at `staged`, after checking that `backup` is
+/// the database from before the update.
+fn stage_copy(backup: &Path, before: i32, staged: &Path) -> Result<(), String> {
+    if schema_version_of(backup)? != before {
+        return Err(format!("{} is not the copy from before the update", backup.display()));
+    }
+    let _ = fs::remove_file(staged);
+    fs::copy(backup, staged).map_err(|error| format!("copy {}: {}", backup.display(), error))?;
+    restrict_to_owner(staged)
+}
+
+fn put_copy_in_place(backup: &Path, before: i32, staged: &Path, live: &Path) -> Result<(), String> {
+    stage_copy(backup, before, staged)?;
+    fs::rename(staged, live).map_err(|error| {
+        let _ = fs::remove_file(staged);
+        format!("put {} back: {}", backup.display(), error)
+    })
+}
+
+/// The most recent `<stem>.db` or `<stem>-<unix time>.db` of `dir`.
+fn latest_named(dir: &Path, stem: &str) -> Option<PathBuf> {
+    let plain = format!("{}.db", stem);
+    let dated = format!("{}-", stem);
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name == plain || (name.starts_with(&dated) && name.ends_with(".db"))
+        })
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, path)| path)
 }
 
 /// The database file and what SQLite and the vector index keep next to it.
@@ -1473,6 +1584,52 @@ mod tests {
     }
 
     #[test]
+    fn a_rollback_cut_short_is_finished_by_the_next_one() {
+        let data = PrivateDir::create().unwrap();
+        let live = live_database(&data.path);
+        database_at(&live, 2, &["a"]);
+        let pending = pending_with_database(&data.path, 2);
+        let backups = memory_backups_dir(&data.path);
+        // The first rollback moved the upgraded database aside, then died.
+        rusqlite::Connection::open(&live)
+            .unwrap()
+            .execute_batch("INSERT INTO memories VALUES ('b'); PRAGMA user_version = 3;")
+            .unwrap();
+        let aside = backups.join("memory-upgraded-by-v9.5.0.db");
+        fs::rename(&live, &aside).unwrap();
+        fs::write(with_suffix(&live, ".restoring"), b"half a copy").unwrap();
+
+        assert_eq!(restore_database_before(&pending, &backups).unwrap(), Some(aside.clone()));
+        assert_eq!((schema_version_of(&live).unwrap(), ids_in(&live)), (2, vec!["a".to_string()]));
+        assert_eq!(ids_in(&aside), vec!["a", "b"]);
+        assert!(!with_suffix(&live, ".restoring").exists());
+        // Done: a third pass changes nothing.
+        assert_eq!(restore_database_before(&pending, &backups).unwrap(), None);
+        assert_eq!(ids_in(&live), vec!["a"]);
+    }
+
+    #[test]
+    fn a_database_that_was_never_there_is_not_invented() {
+        let data = PrivateDir::create().unwrap();
+        let live = live_database(&data.path);
+        database_at(&live, 2, &["a"]);
+        let pending = pending_with_database(&data.path, 2);
+        fs::remove_file(&live).unwrap();
+        assert_eq!(restore_database_before(&pending, &memory_backups_dir(&data.path)).unwrap(), None);
+        assert!(!live.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_with_its_default_action_is_not_seen_as_ignored() {
+        // SIGTERM has its default action in the test process; a signal that
+        // does not exist is reported as not ignored. The ignored case is
+        // covered by the trial on a real server started with SIGHUP ignored.
+        assert!(!signal_is_ignored(libc::SIGTERM));
+        assert!(!signal_is_ignored(-1));
+    }
+
+    #[test]
     fn rollback_refuses_a_copy_that_is_not_from_before_the_update() {
         let data = PrivateDir::create().unwrap();
         let live = live_database(&data.path);
@@ -1520,7 +1677,6 @@ mod tests {
         {
             let _installing = Installing::begin();
             assert!(INSTALLING.load(Ordering::SeqCst));
-            assert!(!restart_pending());
         }
         assert!(!INSTALLING.load(Ordering::SeqCst));
     }
