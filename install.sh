@@ -67,13 +67,26 @@ detect_target() {
 
 # macOS lets a binary read its Keychain item without a prompt only when it is
 # signed by the team that created the item: Soflution's Developer ID.
+#
+#   check_macos_signature BINARY release   a published release binary: it is
+#                                          always signed, anything else is refused
+#   check_macos_signature BINARY local     built here from source: unsigned is
+#                                          expected, only another team is refused
 check_macos_signature() {
-    local binary="$1" team
+    local binary="$1" origin="$2" team
     [ "$(uname)" = "Darwin" ] || return 0
     team="$(codesign -dv "$binary" 2>&1 | sed -n 's/^TeamIdentifier=//p' || true)"
     if [ "$team" = "$TEAM_ID" ] && codesign --verify --strict "$binary" 2>/dev/null; then
         ok "Signed by Soflution (Developer ID ${TEAM_ID})"
+    elif [ "$team" = "$TEAM_ID" ]; then
+        fail "Signature of team ${TEAM_ID} does not verify: refusing to install it."
+        return 1
     elif [ -z "$team" ] || [ "$team" = "not set" ]; then
+        if [ "$origin" = "release" ]; then
+            fail "The downloaded release binary is not signed by Soflution (${TEAM_ID}):"
+            fail "refusing to install it. Releases are always signed."
+            return 1
+        fi
         warn "Unsigned build: if you store credentials, macOS will ask for your"
         warn "Keychain password after each update. Signed releases avoid it."
     else
@@ -102,7 +115,7 @@ try_download_prebuilt() {
             exit 1
         fi
         tar -xzf "$tmp/MemoryPilot.tar.gz" -C "$tmp"
-        if [ -f "$tmp/$BINARY_NAME" ] && ! check_macos_signature "$tmp/$BINARY_NAME"; then
+        if [ -f "$tmp/$BINARY_NAME" ] && ! check_macos_signature "$tmp/$BINARY_NAME" release; then
             rm -rf "$tmp"
             exit 1
         fi
@@ -136,7 +149,7 @@ build_from_source() {
     chmod +x "$BINARY_PATH"
     if [ "$(uname)" = "Darwin" ]; then
         xattr -cr "$BINARY_PATH" 2>/dev/null || true
-        check_macos_signature "$BINARY_PATH"
+        check_macos_signature "$BINARY_PATH" local
     fi
 }
 
