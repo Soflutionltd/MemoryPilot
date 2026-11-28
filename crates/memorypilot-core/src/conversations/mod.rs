@@ -248,16 +248,28 @@ fn sync_claude_roots(
     let titles = claude::desktop_titles(roots);
     let (files, skipped) = claude::list_sessions(roots);
     report.skipped.extend(skipped);
-    let known: std::collections::HashSet<String> = files.iter().map(|file| file.id.clone()).collect();
-    for file in &files {
+    // A session resumed from another starts with the lines of that one. They
+    // are left to it when it is known: its file is there, or it was indexed
+    // before its file was cleaned up (they would be indexed twice otherwise).
+    let mut known: std::collections::HashSet<String> = files.iter().map(|file| file.id.clone()).collect();
+    match store.origin_ids("claude-code") {
+        Ok(indexed) => known.extend(indexed),
+        Err(error) => {
+            report.errors.push(error);
+            return;
+        }
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    for group in claude::same_session(&files) {
         if over_budget(report) {
             return;
         }
-        report.origins_checked += 1;
-        let origin = if file.id.is_empty() { None } else { Some(file.id.as_str()) };
-        if let Some(origin) = origin {
+        report.origins_checked += group.len();
+        let version = claude::group_version(&group);
+        let origin = group[0].id.as_str();
+        if !origin.is_empty() {
             match store.origin_version(origin) {
-                Ok(Some(version)) if version == file.version => continue,
+                Ok(Some(stored)) if stored == version => continue,
                 Ok(_) => {}
                 Err(error) => {
                     report.errors.push(error);
@@ -265,24 +277,20 @@ fn sync_claude_roots(
                 }
             }
         }
-        let session = match claude::read_session(file, &titles, &known) {
+        let session = match claude::read_sessions(&group, &titles, &known) {
             Ok(session) => session,
             Err(error) => {
                 report.errors.push(error);
                 continue;
             }
         };
-        if session.unreadable_lines > 0 {
-            report.skipped.push(format!(
-                "Claude session {}: {} lines are not JSON and were left out",
-                file.path.display(),
-                session.unreadable_lines
-            ));
-        }
+        report.skipped.extend(session.unreadable.iter().map(|(path, lines)| {
+            format!("Claude session {}: {} lines are not JSON and were left out", path.display(), lines)
+        }));
         let source = &session.conversation;
-        if origin.is_none() {
+        if origin.is_empty() {
             match store.origin_version(&source.origin_id) {
-                Ok(Some(version)) if version == source.version => continue,
+                Ok(Some(stored)) if stored == source.version => continue,
                 Ok(_) => {}
                 Err(error) => {
                     report.errors.push(error);
@@ -292,25 +300,15 @@ fn sync_claude_roots(
         }
         let mut seen: Vec<u64> = session.messages.iter().map(|m| hash_key(&m.key)).collect();
         seen.sort_unstable();
-        match store.apply(source, true, &session.messages, &seen) {
+        // The file was read to its end: what the index holds of it and it
+        // no longer does is dropped, and a day it says nothing on was a
+        // session opened and left, not a conversation the index lost.
+        match store.apply_whole(source, &session.messages, &seen, &session.days, &today) {
             Ok(written) => {
                 report.messages_written += written;
-                report.origins_updated += 1;
+                report.origins_updated += group.len();
             }
-            Err(error) => {
-                report.errors.push(error);
-                continue;
-            }
-        }
-        let kept: std::collections::HashSet<&str> = session.messages.iter().map(|m| m.key.as_str()).collect();
-        if let Err(error) = store.prune_origin(source, &kept) {
-            report.errors.push(error);
-        }
-        // The file was read to its end: a day it says nothing on was a
-        // session opened and left, not a conversation the index lost.
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        if let Err(error) = store.forget_silent_days(&source.root_id, &session.days, &today) {
-            report.errors.push(error);
+            Err(error) => report.errors.push(error),
         }
     }
 }
@@ -360,6 +358,163 @@ mod tests {
                 "timestamp": at, "message": { "content": content }
             })
         )
+    }
+
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mp-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        dir
+    }
+
+    fn keys(store: &ConversationStore, conversation: &str) -> Vec<String> {
+        let mut statement = store
+            .conn
+            .prepare("SELECT source_key FROM segments WHERE conversation_id = ?1 AND role IN ('user', 'assistant') ORDER BY at, id")
+            .unwrap();
+        statement.query_map([conversation], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    fn text_of(store: &ConversationStore, key: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        store.conn.query_row("SELECT text FROM segments WHERE source_key = ?1", [key], |row| row.get(0)).optional().unwrap()
+    }
+
+    const TARIFS: &str = "La page des tarifs est prête avec les trois forfaits, le mensuel, l'annuel et l'offre équipe.";
+    const SEPA: &str = "Le virement SEPA est branché sur le tunnel de paiement, avec le mandat signé à la commande.";
+
+    /// The file of the first session is cleaned up, the resumed one goes
+    /// on: its copied lines used to be indexed a second time, under it.
+    #[test]
+    fn a_resumed_session_whose_original_is_gone_does_not_double_its_messages() {
+        let dir = fresh_dir("orphan");
+        let projects = dir.join("projects/-work-courly");
+        std::fs::create_dir_all(&projects).unwrap();
+        let earlier = [
+            line("user", "u1", "first", "2026-11-16T17:29:03Z", "Prépare la page des tarifs de Courly"),
+            line("assistant", "a1", "first", "2026-11-16T17:30:00Z", TARIFS),
+        ]
+        .concat();
+        let own = [
+            line("user", "u2", "resumed", "2026-11-19T09:00:00Z", "Ajoute le paiement par virement SEPA"),
+            line("assistant", "a2", "resumed", "2026-11-19T09:02:00Z", SEPA),
+        ]
+        .concat();
+        std::fs::write(projects.join("first.jsonl"), &earlier).unwrap();
+        std::fs::write(projects.join("resumed.jsonl"), format!("{}{}", earlier, own)).unwrap();
+        let mut store = ConversationStore::open(&dir.join("conversations.db")).unwrap();
+        let sync = |store: &mut ConversationStore| {
+            let mut report = SyncReport::default();
+            sync_claude_roots(store, &[dir.join("projects")], &mut report, &|_| false);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+        };
+        sync(&mut store);
+        std::fs::remove_file(projects.join("first.jsonl")).unwrap();
+        let more = line("user", "u3", "resumed", "2026-11-20T08:00:00Z", "Ajoute aussi le prélèvement mensuel automatique");
+        std::fs::write(projects.join("resumed.jsonl"), format!("{}{}{}", earlier, own, more)).unwrap();
+        sync(&mut store);
+
+        assert_eq!(keys(&store, "first"), ["claude-code:first:u1", "claude-code:first:u1#answer"]);
+        assert_eq!(
+            keys(&store, "resumed"),
+            ["claude-code:resumed:u2", "claude-code:resumed:u2#answer", "claude-code:resumed:u3"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same session file name in two folders: each took the origin
+    /// from the other, only the last one read stayed, at every sync.
+    #[test]
+    fn two_files_of_one_session_are_read_as_one() {
+        let dir = fresh_dir("same-name");
+        let (here, there) = (dir.join("projects/-work-a"), dir.join("projects/-work-b"));
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&there).unwrap();
+        let first = [
+            line("user", "u1", "same", "2026-11-16T17:29:03Z", "Prépare la page des tarifs de Courly"),
+            line("assistant", "a1", "same", "2026-11-16T17:30:00Z", TARIFS),
+        ]
+        .concat();
+        let second = [
+            line("user", "u2", "same", "2026-11-19T09:00:00Z", "Ajoute le paiement par virement SEPA"),
+            line("assistant", "a2", "same", "2026-11-19T09:02:00Z", SEPA),
+            line("user", "u3", "same", "2026-11-19T09:05:00Z", "Ajoute aussi le prélèvement mensuel automatique"),
+        ]
+        .concat();
+        std::fs::write(here.join("same.jsonl"), &first).unwrap();
+        // The second file starts with a copy of the first.
+        std::fs::write(there.join("same.jsonl"), format!("{}{}", first, second)).unwrap();
+        let mut store = ConversationStore::open(&dir.join("conversations.db")).unwrap();
+        let mut report = SyncReport::default();
+        sync_claude_roots(&mut store, &[dir.join("projects")], &mut report, &|_| false);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            keys(&store, "same"),
+            [
+                "claude-code:same:u1",
+                "claude-code:same:u1#answer",
+                "claude-code:same:u2",
+                "claude-code:same:u2#answer",
+                "claude-code:same:u3"
+            ]
+        );
+        // Nothing changed: nothing is read or written again.
+        let mut again = SyncReport::default();
+        sync_claude_roots(&mut store, &[dir.join("projects")], &mut again, &|_| false);
+        assert_eq!((again.origins_checked, again.origins_updated, again.messages_written), (2, 0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request made of an image alone opens a turn, and what the agent
+    /// writes before any request stays before it when the file is read again.
+    #[test]
+    fn a_wordless_request_opens_a_turn_and_a_reread_keeps_the_turns() {
+        let dir = fresh_dir("turns");
+        let projects = dir.join("projects/-work-courly");
+        std::fs::create_dir_all(&projects).unwrap();
+        let image = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user", "uuid": "u2", "sessionId": "s", "cwd": "/work/courly", "timestamp": "2026-11-16T17:31:00Z",
+                "message": { "content": [{ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" } }] }
+            })
+        );
+        let tool_result = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user", "uuid": "r1", "sessionId": "s", "timestamp": "2026-11-16T17:29:30Z",
+                "message": { "content": [{ "type": "tool_result", "content": "ls" }] }
+            })
+        );
+        let opening = "Voici le point de départ : le dépôt est cloné, les dépendances sont installées et les tests passent.";
+        let file = [
+            line("assistant", "a0", "s", "2026-11-16T17:28:00Z", opening),
+            line("user", "u1", "s", "2026-11-16T17:29:03Z", "Prépare la page des tarifs de Courly"),
+            tool_result,
+            line("assistant", "a1", "s", "2026-11-16T17:30:00Z", TARIFS),
+            image,
+            line("assistant", "a2", "s", "2026-11-16T17:32:00Z", SEPA),
+        ]
+        .concat();
+        std::fs::write(projects.join("s.jsonl"), &file).unwrap();
+        let mut store = ConversationStore::open(&dir.join("conversations.db")).unwrap();
+        let sync = |store: &mut ConversationStore| {
+            let mut report = SyncReport::default();
+            sync_claude_roots(store, &[dir.join("projects")], &mut report, &|_| false);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+        };
+        let check = |store: &ConversationStore| {
+            assert_eq!(text_of(store, "claude-code:s:start#answer").as_deref(), Some(opening));
+            assert_eq!(text_of(store, "claude-code:s:u1#answer").as_deref(), Some(TARIFS), "a tool result opens no turn");
+            assert_eq!(text_of(store, "claude-code:s:u2#answer").as_deref(), Some(SEPA));
+        };
+        sync(&mut store);
+        check(&store);
+        let more = line("user", "u3", "s", "2026-11-16T17:40:00Z", "Ajoute aussi le prélèvement mensuel automatique");
+        std::fs::write(projects.join("s.jsonl"), format!("{}{}", file, more)).unwrap();
+        sync(&mut store);
+        check(&store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A session resumed from another starts with the lines of that one,

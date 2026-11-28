@@ -54,6 +54,27 @@ fn days_between(earlier: &str, later: &str) -> Option<i64> {
     Some((day(later)? - day(earlier)?).num_days())
 }
 
+/// `ConversationStore::forget_silent_days` on a connection or a transaction.
+pub(super) fn forget_silent_days_in(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    days_said: &std::collections::BTreeSet<String>,
+    today: &str,
+) -> Result<(), String> {
+    let mut statement = conn
+        .prepare("SELECT day FROM activity WHERE conversation_id = ?1 AND day < ?2")
+        .map_err(|error| format!("Activity days: {}", error))?;
+    let days: Vec<String> = statement
+        .query_map(params![conversation_id, today], |row| row.get(0))
+        .and_then(|rows| rows.collect())
+        .map_err(|error| format!("Activity days: {}", error))?;
+    for day in days.iter().filter(|day| !days_said.contains(*day)) {
+        conn.execute("DELETE FROM activity WHERE conversation_id = ?1 AND day = ?2", params![conversation_id, day])
+            .map_err(|error| format!("Activity forget: {}", error))?;
+    }
+    Ok(())
+}
+
 impl ConversationStore {
     /// Keeps the outcome of a sync. Best effort: a lost line only makes
     /// the index look less recently synced than it is.
@@ -96,20 +117,7 @@ impl ConversationStore {
     /// read to the end, holds no message: it was opened and nothing was
     /// said. `today` is kept, the session may still be speaking.
     pub fn forget_silent_days(&self, conversation_id: &str, days_said: &std::collections::BTreeSet<String>, today: &str) -> Result<(), String> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT day FROM activity WHERE conversation_id = ?1 AND day < ?2")
-            .map_err(|error| format!("Activity days: {}", error))?;
-        let days: Vec<String> = statement
-            .query_map(params![conversation_id, today], |row| row.get(0))
-            .and_then(|rows| rows.collect())
-            .map_err(|error| format!("Activity days: {}", error))?;
-        for day in days.iter().filter(|day| !days_said.contains(*day)) {
-            self.conn
-                .execute("DELETE FROM activity WHERE conversation_id = ?1 AND day = ?2", params![conversation_id, day])
-                .map_err(|error| format!("Activity forget: {}", error))?;
-        }
-        Ok(())
+        forget_silent_days_in(&self.conn, conversation_id, days_said, today)
     }
 
     /// What the index may be missing, in sentences an agent can relay:

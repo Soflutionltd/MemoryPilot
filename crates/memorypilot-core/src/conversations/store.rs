@@ -132,41 +132,14 @@ impl ConversationStore {
             .map_err(|error| format!("Origin version: {}", error))
     }
 
-    /// Drops the segments of an origin read whole whose message is no
-    /// longer among `kept` (message keys). A Claude Code session resumed
-    /// from another was once read under the id of that one: its messages
-    /// stood in the earlier conversation, and leave it here once the
-    /// resumed session is indexed under its own id. Returns how many
-    /// segments were dropped.
-    pub(super) fn prune_origin(&mut self, source: &SourceConversation, kept: &std::collections::HashSet<&str>) -> Result<usize, String> {
-        let prefix = format!("{}:{}:", source.tool, source.origin_id);
-        let tx = self.conn.transaction().map_err(|error| format!("Prune transaction: {}", error))?;
-        let stale: Vec<(i64, String)> = {
-            let mut statement = tx
-                .prepare("SELECT id, source_key FROM segments WHERE origin_id = ?1")
-                .map_err(|error| format!("Prune: {}", error))?;
-            let rows: Vec<(i64, String)> = statement
-                .query_map([&source.origin_id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .and_then(|rows| rows.collect())
-                .map_err(|error| format!("Prune: {}", error))?;
-            rows.into_iter()
-                .filter(|(_, key)| {
-                    let Some(rest) = key.strip_prefix(&prefix) else { return false };
-                    let message = rest.split('#').next().unwrap_or(rest);
-                    message != "start" && !kept.contains(message)
-                })
-                .collect()
-        };
-        for (id, _) in &stale {
-            tx.execute("DELETE FROM segments_fts WHERE rowid = ?1", [id]).map_err(|error| format!("FTS delete: {}", error))?;
-            tx.execute("DELETE FROM refs WHERE segment_id = ?1", [id]).map_err(|error| format!("Refs delete: {}", error))?;
-            tx.execute("DELETE FROM segments WHERE id = ?1", [id]).map_err(|error| format!("Segment delete: {}", error))?;
-        }
-        if !stale.is_empty() {
-            refresh_totals(&tx, &source.root_id)?;
-        }
-        tx.commit().map_err(|error| format!("Prune commit: {}", error))?;
-        Ok(stale.len())
+    /// The origins of `tool` already in the index.
+    pub(super) fn origin_ids(&self, tool: &str) -> Result<std::collections::HashSet<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT o.id FROM origins o JOIN conversations c ON c.id = o.conversation_id WHERE c.tool = ?1")
+            .map_err(|error| format!("Origins: {}", error))?;
+        let rows = statement.query_map([tool], |row| row.get(0)).map_err(|error| format!("Origins: {}", error))?;
+        rows.collect::<Result<_, _>>().map_err(|error| format!("Origins: {}", error))
     }
 
     pub(super) fn seen_hashes(&self, origin_id: &str) -> Result<Vec<u64>, String> {
@@ -191,6 +164,34 @@ impl ConversationStore {
         is_main: bool,
         messages: &[Message],
         seen: &[u64],
+    ) -> Result<usize, String> {
+        self.apply_with(source, is_main, messages, seen, None)
+    }
+
+    /// `apply` for an origin read whole, from its first message (a Claude
+    /// Code session file): what the index holds of it and the source no
+    /// longer does is dropped, and the days it was seen running without
+    /// saying anything are forgotten, in the same transaction as the
+    /// version that marks the file as read. Done apart, a sync stopped in
+    /// between left the stale messages in place for good.
+    pub(crate) fn apply_whole(
+        &mut self,
+        source: &SourceConversation,
+        messages: &[Message],
+        seen: &[u64],
+        days_said: &std::collections::BTreeSet<String>,
+        today: &str,
+    ) -> Result<usize, String> {
+        self.apply_with(source, true, messages, seen, Some(Whole { days_said, today }))
+    }
+
+    fn apply_with(
+        &mut self,
+        source: &SourceConversation,
+        is_main: bool,
+        messages: &[Message],
+        seen: &[u64],
+        whole: Option<Whole>,
     ) -> Result<usize, String> {
         // Every source (Cursor, Claude Code, importers) lands here: secrets
         // are masked before anything is hashed, indexed or embedded.
@@ -239,15 +240,21 @@ impl ConversationStore {
         // what it wrote at length on the way (a draft, a plan), and the
         // actions of the turn. Its short progress notes ("checking X") are
         // nine messages out of ten and carry no recall value.
-        let mut current_turn: Option<String> = tx
-            .query_row(
-                "SELECT source_key FROM segments WHERE origin_id = ?1 AND role = 'user' AND source_key NOT GLOB '*#p[0-9]*'
-                 ORDER BY at DESC, id DESC LIMIT 1",
-                [&source.origin_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| format!("Current turn: {}", error))?;
+        // New messages continue the last turn the index holds; a source
+        // read from its first message starts before any turn (what the
+        // agent wrote first would otherwise be filed under the last request).
+        let mut current_turn: Option<String> = match whole {
+            Some(_) => None,
+            None => tx
+                .query_row(
+                    "SELECT source_key FROM segments WHERE origin_id = ?1 AND role = 'user' AND source_key NOT GLOB '*#p[0-9]*'
+                     ORDER BY at DESC, id DESC LIMIT 1",
+                    [&source.origin_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("Current turn: {}", error))?,
+        };
         let turn_key = |turn: &Option<String>| turn.clone().unwrap_or_else(|| format!("{}:{}:start", source.tool, source.origin_id));
         let mut answer: Option<&Message> = None;
         let mut actions: Vec<&str> = Vec::new();
@@ -355,6 +362,11 @@ impl ConversationStore {
         )
         .map_err(|error| format!("Origin upsert: {}", error))?;
 
+        if let Some(whole) = whole {
+            let kept: std::collections::HashSet<&str> = messages.iter().map(|message| message.key.as_str()).collect();
+            prune_in(&tx, source, &kept)?;
+            super::coverage::forget_silent_days_in(&tx, &source.root_id, whole.days_said, whole.today)?;
+        }
         refresh_totals(&tx, &source.root_id)?;
         tx.commit().map_err(|error| format!("Sync commit: {}", error))?;
         Ok(written)
@@ -594,6 +606,45 @@ pub fn project_name(workspace: &str) -> String {
         .next()
         .unwrap_or(workspace)
         .to_string()
+}
+
+/// What `apply_whole` needs beyond the messages.
+#[derive(Clone, Copy)]
+struct Whole<'a> {
+    days_said: &'a std::collections::BTreeSet<String>,
+    today: &'a str,
+}
+
+/// Drops the segments of an origin read whole whose message is no longer
+/// among `kept` (message keys). A Claude Code session resumed from another
+/// was once read under the id of that one: its messages stood in the
+/// earlier conversation, and leave it once the resumed session is indexed
+/// under its own id. Returns how many segments were dropped.
+fn prune_in(tx: &rusqlite::Transaction, source: &SourceConversation, kept: &std::collections::HashSet<&str>) -> Result<usize, String> {
+    let prefix = format!("{}:{}:", source.tool, source.origin_id);
+    let stale: Vec<i64> = {
+        let mut statement = tx
+            .prepare("SELECT id, source_key FROM segments WHERE origin_id = ?1")
+            .map_err(|error| format!("Prune: {}", error))?;
+        let rows: Vec<(i64, String)> = statement
+            .query_map([&source.origin_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .and_then(|rows| rows.collect())
+            .map_err(|error| format!("Prune: {}", error))?;
+        rows.into_iter()
+            .filter(|(_, key)| {
+                let Some(rest) = key.strip_prefix(&prefix) else { return false };
+                let message = rest.split('#').next().unwrap_or(rest);
+                message != "start" && !kept.contains(message)
+            })
+            .map(|(id, _)| id)
+            .collect()
+    };
+    for id in &stale {
+        tx.execute("DELETE FROM segments_fts WHERE rowid = ?1", [id]).map_err(|error| format!("FTS delete: {}", error))?;
+        tx.execute("DELETE FROM refs WHERE segment_id = ?1", [id]).map_err(|error| format!("Refs delete: {}", error))?;
+        tx.execute("DELETE FROM segments WHERE id = ?1", [id]).map_err(|error| format!("Segment delete: {}", error))?;
+    }
+    Ok(stale.len())
 }
 
 fn refresh_totals(tx: &rusqlite::Transaction, conversation_id: &str) -> Result<(), String> {

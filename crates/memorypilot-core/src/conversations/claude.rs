@@ -31,7 +31,7 @@ pub struct SessionFile {
 
 /// Bumped when the reader changes what it takes from a file, so that
 /// every session is read again once.
-const READER_VERSION: u32 = 2;
+const READER_VERSION: u32 = 3;
 
 /// Session logs under `roots`, and what could not be listed (a folder or
 /// file that cannot be read), so nothing is left out without a word.
@@ -193,6 +193,97 @@ pub struct Session {
     pub unreadable_lines: usize,
 }
 
+/// The files of one session, together. Two files carry the same session id
+/// when a session went on from another folder: read apart, each took the
+/// origin from the other at every sync, and only the messages of the last
+/// one read stayed. Files without an id in their name stay alone.
+pub fn same_session(files: &[SessionFile]) -> Vec<Vec<&SessionFile>> {
+    let mut groups: Vec<Vec<&SessionFile>> = Vec::new();
+    let mut place: HashMap<&str, usize> = HashMap::new();
+    for file in files {
+        match place.get(file.id.as_str()).filter(|_| !file.id.is_empty()) {
+            Some(index) => groups[*index].push(file),
+            None => {
+                place.insert(file.id.as_str(), groups.len());
+                groups.push(vec![file]);
+            }
+        }
+    }
+    for group in &mut groups {
+        group.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    groups
+}
+
+/// The version of a session: that of its file, or of all its files.
+pub fn group_version(group: &[&SessionFile]) -> String {
+    group.iter().map(|file| file.version.as_str()).collect::<Vec<_>>().join("+")
+}
+
+/// A session read from all its files.
+pub struct MergedSession {
+    pub conversation: SourceConversation,
+    pub messages: Vec<Message>,
+    pub days: BTreeSet<String>,
+    /// Files holding lines that are not JSON, and how many.
+    pub unreadable: Vec<(PathBuf, usize)>,
+}
+
+/// Reads the files of one session (see `same_session`) as one: each message
+/// once, in the order it was said.
+pub fn read_sessions(
+    group: &[&SessionFile],
+    titles: &HashMap<String, String>,
+    known_sessions: &HashSet<String>,
+) -> Result<MergedSession, String> {
+    let mut merged: Option<MergedSession> = None;
+    for file in group {
+        let session = read_session(file, titles, known_sessions)?;
+        let unreadable = (session.unreadable_lines > 0).then(|| (file.path.clone(), session.unreadable_lines));
+        match merged.as_mut() {
+            None => {
+                merged = Some(MergedSession {
+                    conversation: session.conversation,
+                    messages: session.messages,
+                    days: session.days,
+                    unreadable: unreadable.into_iter().collect(),
+                });
+            }
+            Some(whole) => {
+                let held: HashSet<String> = whole.messages.iter().map(|message| message.key.clone()).collect();
+                whole.messages.extend(session.messages.into_iter().filter(|message| !held.contains(&message.key)));
+                whole.days.extend(session.days);
+                whole.unreadable.extend(unreadable);
+                let earlier = match (&session.conversation.created_at, &whole.conversation.created_at) {
+                    (Some(this), Some(first)) => this < first,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if earlier {
+                    whole.conversation = session.conversation;
+                }
+            }
+        }
+    }
+    let mut whole = merged.ok_or("no session file to read")?;
+    if group.len() > 1 {
+        // In the order said. A message without a time stays right after
+        // the one before it in its file.
+        let mut last = String::new();
+        let mut timed: Vec<(String, Message)> = Vec::with_capacity(whole.messages.len());
+        for message in std::mem::take(&mut whole.messages) {
+            if let Some(at) = &message.at {
+                last = at.clone();
+            }
+            timed.push((last.clone(), message));
+        }
+        timed.sort_by(|left, right| left.0.cmp(&right.0));
+        whole.messages = timed.into_iter().map(|(_, message)| message).collect();
+    }
+    whole.conversation.version = group_version(group);
+    Ok(whole)
+}
+
 /// Reads one session file. A session resumed from another one starts
 /// with the lines of that session, under its id: those are left to the
 /// file of that session when it is among `known_sessions`, so that each
@@ -263,7 +354,11 @@ pub fn read_session(
         let Some(content) = line.message.and_then(|m| m.content) else { continue };
         let text = text_of(&content);
         let actions = if role == Role::Assistant { actions_of(&content) } else { Vec::new() };
-        if text.trim().is_empty() && actions.is_empty() {
+        // A request made of an image alone has no text to index, but it
+        // opens a turn: the answer that follows is the answer to it, not
+        // to the request before.
+        let wordless_request = role == Role::User && has_attachment(&content);
+        if text.trim().is_empty() && actions.is_empty() && !wordless_request {
             continue;
         }
         let Some(key) = line.uuid else { continue };
@@ -306,6 +401,15 @@ fn text_of(content: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// Whether the user attached something to a message (an image, a document).
+/// Tool results, which also come as user lines, are not attachments.
+fn has_attachment(content: &Value) -> bool {
+    let Value::Array(blocks) = content else { return false };
+    blocks
+        .iter()
+        .any(|block| matches!(block.get("type").and_then(Value::as_str), Some("image") | Some("document")))
 }
 
 /// The tool calls of a message, as action lines.
