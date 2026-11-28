@@ -6,7 +6,7 @@
 use super::{fold_timestamp, Message, Role, SourceConversation};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub fn default_roots() -> Vec<PathBuf> {
@@ -23,30 +23,67 @@ pub fn default_roots() -> Vec<PathBuf> {
 
 pub struct SessionFile {
     pub path: PathBuf,
+    /// The session the file holds: its name. Claude Code names the file
+    /// after the session, and its hooks report that id.
+    pub id: String,
     pub version: String,
 }
 
-/// Session logs under `roots`. `audit.jsonl` files from the desktop app
-/// are event logs, not conversations.
-pub fn list_sessions(roots: &[PathBuf]) -> Vec<SessionFile> {
+/// Bumped when the reader changes what it takes from a file, so that
+/// every session is read again once.
+const READER_VERSION: u32 = 2;
+
+/// Session logs under `roots`, and what could not be listed (a folder or
+/// file that cannot be read), so nothing is left out without a word.
+/// `audit.jsonl` files from the desktop app are event logs, not
+/// conversations.
+pub fn list_sessions(roots: &[PathBuf]) -> (Vec<SessionFile>, Vec<String>) {
     let mut files = Vec::new();
+    let mut skipped = Vec::new();
     for root in roots {
-        collect(root, 0, &mut files);
+        collect(root, 0, &mut files, &mut skipped);
     }
-    files
+    (files, skipped)
 }
 
-fn collect(dir: &Path, depth: usize, out: &mut Vec<SessionFile>) {
-    if depth > 9 {
+const MAX_DEPTH: usize = 9;
+
+fn collect(dir: &Path, depth: usize, out: &mut Vec<SessionFile>, skipped: &mut Vec<String>) {
+    if depth > MAX_DEPTH {
+        // Plugin and skill folders go deeper with no session in them:
+        // only a folder that holds session logs is worth a word.
+        let logs = count_logs(dir);
+        if logs > 0 {
+            skipped.push(format!("{} Claude session logs under {} not read: deeper than {} folders", logs, dir.display(), MAX_DEPTH));
+        }
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            skipped.push(format!("Claude sessions under {} not read: {}", dir.display(), error));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                skipped.push(format!("An entry of {} not read: {}", dir.display(), error));
+                continue;
+            }
+        };
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else { continue };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                skipped.push(format!("{} not read: {}", path.display(), error));
+                continue;
+            }
+        };
         if file_type.is_dir() {
             if entry.file_name() != "subagents" {
-                collect(&path, depth + 1, out);
+                collect(&path, depth + 1, out, skipped);
             }
             continue;
         }
@@ -55,15 +92,38 @@ fn collect(dir: &Path, depth: usize, out: &mut Vec<SessionFile>) {
         if !is_session {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(error) => {
+                skipped.push(format!("Claude session {} not read: {}", path.display(), error));
+                continue;
+            }
+        };
         let modified = meta
             .modified()
             .ok()
             .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        out.push(SessionFile { path, version: format!("{}:{}", meta.len(), modified) });
+        let id = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        out.push(SessionFile { path, id, version: format!("{}:{}:{}", READER_VERSION, meta.len(), modified) });
     }
+}
+
+/// Session logs anywhere under `dir`.
+fn count_logs(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => count_logs(&path),
+                Ok(_) if path.extension().is_some_and(|e| e == "jsonl") && path.file_name().is_some_and(|n| n != "audit.jsonl") => 1,
+                _ => 0,
+            }
+        })
+        .sum()
 }
 
 /// Desktop session titles, keyed by the Claude Code session id they wrap.
@@ -125,21 +185,58 @@ struct LineMessage {
 pub struct Session {
     pub conversation: SourceConversation,
     pub messages: Vec<Message>,
+    /// Days (UTC, `YYYY-MM-DD`) on which the file holds a request or an
+    /// answer, tool results included.
+    pub days: BTreeSet<String>,
+    /// Lines that are not JSON, the last one excepted while it is being
+    /// written.
+    pub unreadable_lines: usize,
 }
 
-pub fn read_session(file: &SessionFile, titles: &HashMap<String, String>) -> Result<Session, String> {
+/// Reads one session file. A session resumed from another one starts
+/// with the lines of that session, under its id: those are left to the
+/// file of that session when it is among `known_sessions`, so that each
+/// session is indexed under its own id and its messages once.
+pub fn read_session(
+    file: &SessionFile,
+    titles: &HashMap<String, String>,
+    known_sessions: &HashSet<String>,
+) -> Result<Session, String> {
     let raw = std::fs::read_to_string(&file.path)
         .map_err(|error| format!("Claude session {}: {}", file.path.display(), error))?;
-    let mut session_id = None;
+    let mut first_session_id = None;
     let mut cwd = None;
     let mut created_at = None;
     let mut summary = None;
     let mut messages = Vec::new();
+    let mut days = BTreeSet::new();
+    let mut unreadable_lines = 0;
+    let own_id = (!file.id.is_empty()).then_some(file.id.as_str());
+    let complete = raw.ends_with('\n');
+    let line_count = raw.lines().count();
 
-    for line in raw.lines() {
-        let Ok(line) = serde_json::from_str::<Line>(line) else { continue };
-        if session_id.is_none() {
-            session_id = line.session_id.clone();
+    for (index, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let line = match serde_json::from_str::<Line>(line) {
+            Ok(line) => line,
+            Err(_) => {
+                if complete || index + 1 < line_count {
+                    unreadable_lines += 1;
+                }
+                continue;
+            }
+        };
+        let foreign = match (own_id, line.session_id.as_deref()) {
+            (Some(own), Some(other)) => other != own && known_sessions.contains(other),
+            _ => false,
+        };
+        if foreign {
+            continue;
+        }
+        if first_session_id.is_none() {
+            first_session_id = line.session_id.clone();
         }
         if cwd.is_none() {
             cwd = line.cwd.clone();
@@ -157,6 +254,9 @@ pub fn read_session(file: &SessionFile, titles: &HashMap<String, String>) -> Res
             }
             _ => continue,
         };
+        if let Some(day) = at.as_deref().and_then(|at| at.get(..10)) {
+            days.insert(day.to_string());
+        }
         if line.is_meta || line.is_sidechain {
             continue;
         }
@@ -170,12 +270,10 @@ pub fn read_session(file: &SessionFile, titles: &HashMap<String, String>) -> Res
         messages.push(Message { key, role, at, order: None, text, actions });
     }
 
-    let fallback_id = file
-        .path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let id = session_id.unwrap_or(fallback_id);
+    let id = own_id.map(str::to_string).or(first_session_id).unwrap_or_default();
+    if id.is_empty() {
+        return Err(format!("Claude session {}: no session id", file.path.display()));
+    }
     let title = titles.get(&id).cloned().or(summary);
     Ok(Session {
         conversation: SourceConversation {
@@ -189,6 +287,8 @@ pub fn read_session(file: &SessionFile, titles: &HashMap<String, String>) -> Res
             source_path: Some(file.path.to_string_lossy().to_string()),
         },
         messages,
+        days,
+        unreadable_lines,
     })
 }
 
@@ -238,11 +338,27 @@ mod tests {
             ),
         )
         .unwrap();
-        let file = SessionFile { path, version: "1".into() };
-        let session = read_session(&file, &HashMap::new()).unwrap();
+        let file = SessionFile { path, id: "s1".into(), version: "1".into() };
+        let session = read_session(&file, &HashMap::new(), &HashSet::new()).unwrap();
         assert_eq!(session.conversation.origin_id, "s1");
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[1].text, "Elle est payée sur Revolut.");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_too_deep_folder_is_reported_only_when_it_holds_sessions() {
+        let dir = std::env::temp_dir().join(format!("mp-claude-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let deep = (0..=MAX_DEPTH + 1).fold(dir.clone(), |path, level| path.join(format!("d{}", level)));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("schema.xsd"), "").unwrap();
+        let (files, skipped) = list_sessions(std::slice::from_ref(&dir));
+        assert!(files.is_empty() && skipped.is_empty(), "{skipped:?}");
+        std::fs::write(deep.join("lost.jsonl"), "").unwrap();
+        let (_, skipped) = list_sessions(std::slice::from_ref(&dir));
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].starts_with("1 Claude session logs under"), "{}", skipped[0]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -258,7 +374,7 @@ mod tests {
             "message": { "content": format!("Lance le push avec GITHUB_TOKEN=ghp_{}", &token[4..]) }
         });
         std::fs::write(&path, format!("{}\n", line)).unwrap();
-        let session = read_session(&SessionFile { path, version: "1".into() }, &HashMap::new()).unwrap();
+        let session = read_session(&SessionFile { path, id: "s2".into(), version: "1".into() }, &HashMap::new(), &HashSet::new()).unwrap();
         let mut store = super::super::ConversationStore::open(&dir.join("conversations.db")).unwrap();
         store.apply(&session.conversation, true, &session.messages, &[]).unwrap();
         let text: String = store

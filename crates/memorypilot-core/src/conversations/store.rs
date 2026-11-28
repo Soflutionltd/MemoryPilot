@@ -132,6 +132,43 @@ impl ConversationStore {
             .map_err(|error| format!("Origin version: {}", error))
     }
 
+    /// Drops the segments of an origin read whole whose message is no
+    /// longer among `kept` (message keys). A Claude Code session resumed
+    /// from another was once read under the id of that one: its messages
+    /// stood in the earlier conversation, and leave it here once the
+    /// resumed session is indexed under its own id. Returns how many
+    /// segments were dropped.
+    pub(super) fn prune_origin(&mut self, source: &SourceConversation, kept: &std::collections::HashSet<&str>) -> Result<usize, String> {
+        let prefix = format!("{}:{}:", source.tool, source.origin_id);
+        let tx = self.conn.transaction().map_err(|error| format!("Prune transaction: {}", error))?;
+        let stale: Vec<(i64, String)> = {
+            let mut statement = tx
+                .prepare("SELECT id, source_key FROM segments WHERE origin_id = ?1")
+                .map_err(|error| format!("Prune: {}", error))?;
+            let rows: Vec<(i64, String)> = statement
+                .query_map([&source.origin_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .and_then(|rows| rows.collect())
+                .map_err(|error| format!("Prune: {}", error))?;
+            rows.into_iter()
+                .filter(|(_, key)| {
+                    let Some(rest) = key.strip_prefix(&prefix) else { return false };
+                    let message = rest.split('#').next().unwrap_or(rest);
+                    message != "start" && !kept.contains(message)
+                })
+                .collect()
+        };
+        for (id, _) in &stale {
+            tx.execute("DELETE FROM segments_fts WHERE rowid = ?1", [id]).map_err(|error| format!("FTS delete: {}", error))?;
+            tx.execute("DELETE FROM refs WHERE segment_id = ?1", [id]).map_err(|error| format!("Refs delete: {}", error))?;
+            tx.execute("DELETE FROM segments WHERE id = ?1", [id]).map_err(|error| format!("Segment delete: {}", error))?;
+        }
+        if !stale.is_empty() {
+            refresh_totals(&tx, &source.root_id)?;
+        }
+        tx.commit().map_err(|error| format!("Prune commit: {}", error))?;
+        Ok(stale.len())
+    }
+
     pub(super) fn seen_hashes(&self, origin_id: &str) -> Result<Vec<u64>, String> {
         let blob: Option<Vec<u8>> = self
             .conn
@@ -318,19 +355,7 @@ impl ConversationStore {
         )
         .map_err(|error| format!("Origin upsert: {}", error))?;
 
-        tx.execute(
-            "UPDATE conversations SET
-                message_count = (SELECT COUNT(*) FROM segments WHERE conversation_id = ?1 AND role IN ('user', 'assistant')
-                                 AND source_key NOT GLOB '*#p[0-9]*'),
-                updated_at = COALESCE((SELECT MAX(at) FROM segments WHERE conversation_id = ?1), updated_at),
-                project = CASE WHEN project_pinned = 1 THEN project ELSE COALESCE(
-                    (SELECT value FROM refs WHERE conversation_id = ?1 AND kind = 'project'
-                     GROUP BY value ORDER BY COUNT(*) DESC LIMIT 1),
-                    project) END
-             WHERE id = ?1",
-            [&source.root_id],
-        )
-        .map_err(|error| format!("Conversation totals: {}", error))?;
+        refresh_totals(&tx, &source.root_id)?;
         tx.commit().map_err(|error| format!("Sync commit: {}", error))?;
         Ok(written)
     }
@@ -569,6 +594,23 @@ pub fn project_name(workspace: &str) -> String {
         .next()
         .unwrap_or(workspace)
         .to_string()
+}
+
+fn refresh_totals(tx: &rusqlite::Transaction, conversation_id: &str) -> Result<(), String> {
+    tx.execute(
+        "UPDATE conversations SET
+            message_count = (SELECT COUNT(*) FROM segments WHERE conversation_id = ?1 AND role IN ('user', 'assistant')
+                             AND source_key NOT GLOB '*#p[0-9]*'),
+            updated_at = COALESCE((SELECT MAX(at) FROM segments WHERE conversation_id = ?1), updated_at),
+            project = CASE WHEN project_pinned = 1 THEN project ELSE COALESCE(
+                (SELECT value FROM refs WHERE conversation_id = ?1 AND kind = 'project'
+                 GROUP BY value ORDER BY COUNT(*) DESC LIMIT 1),
+                project) END
+         WHERE id = ?1",
+        [conversation_id],
+    )
+    .map_err(|error| format!("Conversation totals: {}", error))?;
+    Ok(())
 }
 
 fn upsert_segment(

@@ -182,7 +182,10 @@ pub fn run_hook(event: &str, args: &[String]) {
         return;
     }
     if matches!(event, "session-start" | "sessionStart" | "SessionStart" | "user-prompt" | "userPromptSubmit" | "UserPromptSubmit") {
-        note_active_conversation(&agent, &payload);
+        // Claude Code starts a session (or reopens one) without a word
+        // said: only a request means there is something to index that day.
+        let said = agent != "claude" || matches!(event, "user-prompt" | "userPromptSubmit" | "UserPromptSubmit");
+        note_active_conversation(&agent, &payload, said);
     }
     let output = match event {
         "session-start" | "sessionStart" | "SessionStart" => {
@@ -253,7 +256,7 @@ pub fn run_hook(event: &str, args: &[String]) {
 
 /// Leaves the trace `find_conversation` reads to know which conversation
 /// its caller is in.
-fn note_active_conversation(agent: &str, payload: &Value) {
+fn note_active_conversation(agent: &str, payload: &Value, said: bool) {
     let Some(conversation) = conversation_id(payload) else { return };
     crate::active_session::record(
         &crate::active_session::state_path(),
@@ -266,7 +269,7 @@ fn note_active_conversation(agent: &str, payload: &Value) {
     // The index is told a session ran today, to say so if it never reads
     // it. Only for the agents it reads: a Codex session is never indexed,
     // and would be reported as missing for ever.
-    if !matches!(agent, "cursor" | "claude") {
+    if !said || !matches!(agent, "cursor" | "claude") {
         return;
     }
     if let Ok(store) = memorypilot_core::conversations::ConversationStore::open_default() {
