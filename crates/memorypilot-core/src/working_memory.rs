@@ -239,12 +239,21 @@ fn significant_terms(query: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The working memory is one store for the whole process: a test holds
+    /// this from its first write to its last read.
+    static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hold_store() -> std::sync::MutexGuard<'static, ()> {
+        STORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn clear_all() {
         let _ = clear(&WorkingMemoryFilter::default(), true);
     }
 
     #[test]
     fn remembers_and_recalls_scoped_items() {
+        let _store = hold_store();
         clear_all();
         let _ = remember(
             "Current task is refactoring the MCP working memory.",
@@ -281,6 +290,7 @@ mod tests {
 
     #[test]
     fn clear_removes_only_matching_scope() {
+        let _store = hold_store();
         clear_all();
         let _ = remember(
             "Keep me",
