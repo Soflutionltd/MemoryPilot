@@ -15,8 +15,15 @@ permissions:
   contents: write
 
 jobs:
+  # A tag whose tests fail on Linux publishes nothing.
+  test:
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
   build:
     name: build (${{ matrix.target }})
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,29 +39,44 @@ jobs:
             target: aarch64-unknown-linux-gnu
             cross: false
     steps:
-      - uses: actions/checkout@v4
+      # A manual run rebuilds the tag it names, never the branch it is
+      # started from: its archives replace the ones of that release.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Check that the sources are the tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          if [ "v${version}" != "$TAG" ]; then
+            echo "::error::${TAG} checked out, but Cargo.toml says v${version}"
+            exit 1
+          fi
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
 
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --locked
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
 
       - name: Build release (native)
         if: matrix.cross == false
-        run: cargo build --release --features http --target ${{ matrix.target }} --bin MemoryPilot
+        run: cargo build --release --locked --features http --target ${{ matrix.target }} --bin MemoryPilot
 
       - name: Build release (cross)
         if: matrix.cross == true
-        run: cross build --release --features http --target ${{ matrix.target }} --bin MemoryPilot
+        run: cross build --release --locked --features http --target ${{ matrix.target }} --bin MemoryPilot
 
       - name: Package artifact
         shell: bash
@@ -68,7 +90,7 @@ jobs:
           ls -lh "$archive"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: MemoryPilot-${{ matrix.target }}
           path: |
@@ -81,7 +103,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Resolve tag
         id: tag
@@ -93,7 +115,7 @@ jobs:
           fi
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true

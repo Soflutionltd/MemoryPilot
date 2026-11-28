@@ -1,0 +1,39 @@
+name: test
+
+# The test suite on Linux. Runs on every push to main and to a work branch,
+# and before the release workflow builds anything (macOS runs the same suite
+# in scripts/release-macos.sh).
+on:
+  push:
+    branches:
+      - main
+      - "wip/**"
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cargo test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: test
+
+      - name: Test
+        run: cargo test --workspace --locked --features http
