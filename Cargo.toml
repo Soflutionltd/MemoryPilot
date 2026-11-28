@@ -40,6 +40,8 @@ sha2 = "0.11"
 [target.'cfg(unix)'.dependencies]
 # poll(2) on stdin between requests, liveness of crashed-boot markers.
 rustix = { version = "1", default-features = false, features = ["std", "event", "process"] }
+# A signal that ends a server on probation is a normal stop, not a crash.
+signal-hook = "0.4"
 
 [features]
 default = ["http"]

@@ -144,9 +144,12 @@ fn memory_backups_dir(root: &Path) -> PathBuf {
 /// freshly installed version (rollback after repeated startup crashes).
 pub fn startup_guard() {
     let Some(exe) = executable() else { return };
+    if stays_as_started(&exe.path).is_some() {
+        return;
+    }
     let Some(dir) = update_dir() else { return };
     let mut state = read_state(&dir);
-    let action = on_boot(&mut state, VERSION, crashed_boots(&dir, VERSION));
+    let action = on_boot(&mut state, VERSION, &exe.path, crashed_boots(&dir, VERSION));
     if let Err(error) = write_state(&dir, &state) {
         log(error);
     }
@@ -156,6 +159,7 @@ pub fn startup_guard() {
             if let Err(error) = create_boot_marker(&dir) {
                 log(error);
             }
+            clear_boot_marker_on_signals();
         }
         BootAction::RollBack => {
             remove_boot_markers(&dir, VERSION);
@@ -213,13 +217,67 @@ fn check_loop() {
 
 /// True once the binary on disk differs from the one this process started
 /// from: an update was installed and this process should switch to it.
+/// Never true for a process that must stay as it was started.
 pub fn restart_pending() -> bool {
     if RESTART_FAILED.load(Ordering::Relaxed) {
         return false;
     }
     let Some(exe) = executable() else { return false };
+    static STAYS: OnceLock<bool> = OnceLock::new();
+    if *STAYS.get_or_init(|| stays_as_started(&exe.path).is_some()) {
+        return false;
+    }
     exe.fingerprint.is_some() && exe.path.is_file() && fingerprint(&exe.path) != exe.fingerprint
 }
+
+/// Why this process neither switches to a binary installed under it nor
+/// takes part in the probation of an update, if it does not: the user turned
+/// updates off for it, or it is a development build, which shares the state
+/// directory with the installed binary without being the one that was updated.
+fn stays_as_started(exe: &Path) -> Option<&'static str> {
+    if auto_update_disabled(std::env::var("MEMORYPILOT_AUTO_UPDATE").ok().as_deref()) {
+        return Some("MEMORYPILOT_AUTO_UPDATE=0");
+    }
+    development_build(exe, cfg!(debug_assertions))
+}
+
+fn development_build(exe: &Path, debug_build: bool) -> Option<&'static str> {
+    if debug_build {
+        return Some("debug build");
+    }
+    if exe.components().any(|component| component.as_os_str() == "target") {
+        return Some("binary inside a cargo target directory");
+    }
+    None
+}
+
+/// A signal that ends the process (session closed, service restarted, machine
+/// shutting down) is a normal stop: without this, three of them during the
+/// probation of an update would count as three startup crashes and roll a
+/// working version back.
+#[cfg(unix)]
+fn clear_boot_marker_on_signals() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = match signal_hook::iterator::Signals::new([SIGHUP, SIGINT, SIGTERM]) {
+        Ok(signals) => signals,
+        Err(error) => {
+            log(format!("cannot watch termination signals: {}", error));
+            return;
+        }
+    };
+    std::thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            mark_clean_exit();
+            if let Err(error) = signal_hook::low_level::emulate_default_handler(signal) {
+                log(format!("signal {}: {}", signal, error));
+                std::process::exit(128 + signal);
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn clear_boot_marker_on_signals() {}
 
 /// Replaces this process with the binary on disk, same arguments, same open
 /// stdin and stdout. Call only when no request is in progress. Returns only
@@ -274,10 +332,11 @@ pub fn mark_healthy() {
     }
     let Some(dir) = update_dir() else { return };
     let mut state = read_state(&dir);
+    let own = executable().filter(|exe| stays_as_started(&exe.path).is_none());
     let Some(from) = state
         .pending
         .as_ref()
-        .filter(|pending| pending.to == VERSION)
+        .filter(|pending| own.is_some_and(|exe| pending.is_for(VERSION, &exe.path)))
         .map(|pending| pending.from.clone())
     else {
         mark_clean_exit();
@@ -346,11 +405,8 @@ pub fn run_cli(check_only: bool) -> i32 {
 
 /// Why this binary must not replace itself, if it must not.
 fn installation_blocked(exe: &Path, debug_build: bool) -> Option<&'static str> {
-    if debug_build {
-        return Some("debug build");
-    }
-    if exe.components().any(|component| component.as_os_str() == "target") {
-        return Some("binary inside a cargo target directory");
+    if let Some(reason) = development_build(exe, debug_build) {
+        return Some(reason);
     }
     let path = exe.to_string_lossy();
     if path.contains("/Cellar/") || path.contains("/homebrew/") || path.contains("/linuxbrew/") {
@@ -433,6 +489,7 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
     state.pending = Some(Pending {
         from: VERSION.to_string(),
         to: manifest.version.clone(),
+        exe: Some(exe.path.clone()),
     });
     write_state(&dir, &state)?;
     prune_backups(&memory_backups_dir(&data), BACKUPS_KEPT);
@@ -751,6 +808,18 @@ struct UpdateState {
 struct Pending {
     from: String,
     to: String,
+    /// The binary that was replaced. Absent in a state written before v4.15.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exe: Option<PathBuf>,
+}
+
+impl Pending {
+    /// True for a process running version `running` from the binary this
+    /// update replaced: another binary of the same version (a local build)
+    /// says nothing about the installed one.
+    fn is_for(&self, running: &str, exe: &Path) -> bool {
+        self.to == running && self.exe.as_deref().is_none_or(|updated| updated == exe)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -760,10 +829,13 @@ enum BootAction {
     RollBack,
 }
 
-fn on_boot(state: &mut UpdateState, running: &str, crashed: usize) -> BootAction {
+fn on_boot(state: &mut UpdateState, running: &str, exe: &Path, crashed: usize) -> BootAction {
     let Some(pending) = state.pending.as_ref() else {
         return BootAction::Continue;
     };
+    if pending.exe.as_deref().is_some_and(|updated| updated != exe) {
+        return BootAction::Continue;
+    }
     if pending.to != running {
         // A process still on the previous version says nothing about the
         // new one; a newer version than the one on probation supersedes it.
@@ -1084,22 +1156,53 @@ mod tests {
 
     #[test]
     fn version_crashing_at_startup_is_rolled_back() {
-        let pending = || Some(Pending { from: "4.11.1".into(), to: "4.12.0".into() });
+        let installed = Path::new("/Users/someone/.local/bin/MemoryPilot");
+        let pending = || {
+            Some(Pending {
+                from: "4.11.1".into(),
+                to: "4.12.0".into(),
+                exe: Some(installed.to_path_buf()),
+            })
+        };
         let mut state = UpdateState { pending: pending(), rejected: vec![] };
         for crashed in 0..MAX_CRASHED_BOOTS {
-            assert_eq!(on_boot(&mut state, "4.12.0", crashed), BootAction::Probation);
+            assert_eq!(on_boot(&mut state, "4.12.0", installed, crashed), BootAction::Probation);
         }
-        assert_eq!(on_boot(&mut state, "4.12.0", MAX_CRASHED_BOOTS), BootAction::RollBack);
+        assert_eq!(on_boot(&mut state, "4.12.0", installed, MAX_CRASHED_BOOTS), BootAction::RollBack);
         assert_eq!(state.pending, None);
         assert_eq!(state.rejected, vec!["4.12.0".to_string()]);
 
         let mut other = UpdateState { pending: pending(), rejected: vec![] };
         // A process still on the previous version leaves the probation alone.
-        assert_eq!(on_boot(&mut other, "4.11.1", 5), BootAction::Continue);
+        assert_eq!(on_boot(&mut other, "4.11.1", installed, 5), BootAction::Continue);
         assert_eq!(other.pending, pending());
+        // Another binary of the version on probation (a local build) neither
+        // rolls the installed one back nor confirms it.
+        let local = Path::new("/Users/someone/src/MemoryPilot/out/MemoryPilot");
+        assert_eq!(on_boot(&mut other, "4.12.0", local, MAX_CRASHED_BOOTS), BootAction::Continue);
+        assert_eq!(other.pending, pending());
+        assert!(!pending().unwrap().is_for("4.12.0", local));
+        assert!(pending().unwrap().is_for("4.12.0", installed));
         // A newer version than the one on probation supersedes it.
-        assert_eq!(on_boot(&mut other, "4.13.0", 0), BootAction::Continue);
+        assert_eq!(on_boot(&mut other, "4.13.0", installed, 0), BootAction::Continue);
         assert_eq!(other.pending, None);
+    }
+
+    #[test]
+    fn state_written_before_the_binary_was_recorded_still_applies() {
+        let old: UpdateState =
+            serde_json::from_str(r#"{"pending":{"from":"4.14.1","to":"4.15.0"},"rejected":[]}"#).unwrap();
+        let mut state = old;
+        let anywhere = Path::new("/usr/local/bin/MemoryPilot");
+        assert_eq!(on_boot(&mut state, "4.15.0", anywhere, MAX_CRASHED_BOOTS), BootAction::RollBack);
+    }
+
+    #[test]
+    fn development_builds_stay_out_of_updates() {
+        let installed = Path::new("/Users/someone/.local/bin/MemoryPilot");
+        assert_eq!(development_build(installed, false), None);
+        assert_eq!(development_build(installed, true), Some("debug build"));
+        assert!(development_build(Path::new("/repo/target/release/MemoryPilot"), false).is_some());
     }
 
     #[test]
@@ -1137,7 +1240,7 @@ mod tests {
         let dir = PrivateDir::create().unwrap();
         assert_eq!(read_state(&dir.path), UpdateState::default());
         let state = UpdateState {
-            pending: Some(Pending { from: "4.11.1".into(), to: "4.12.0".into() }),
+            pending: Some(Pending { from: "4.11.1".into(), to: "4.12.0".into(), exe: None }),
             rejected: vec!["4.11.5".into()],
         };
         write_state(&dir.path, &state).unwrap();
