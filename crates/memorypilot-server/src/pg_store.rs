@@ -785,7 +785,7 @@ impl PgStore {
             })
             .collect();
         let texts: Vec<&str> = inputs.iter().map(String::as_str).collect();
-        let vectors = memorypilot_core::embedding::embed_batch(&texts);
+        let vectors = memorypilot_core::embedding::embed_batch(&texts)?;
         if vectors.len() != rows.len() {
             return Err(format!(
                 "Embedding: {} vectors for {} memories",

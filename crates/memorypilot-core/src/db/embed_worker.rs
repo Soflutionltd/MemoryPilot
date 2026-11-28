@@ -168,10 +168,12 @@ fn queue_embedding_jobs(jobs: Vec<(String, String, String)>) {
     ensure_embed_worker();
 }
 
-pub(super) fn cached_embed_text(text: &str) -> Vec<f32> {
+/// The vector of a query, from the cache when it was asked before. `Err`
+/// when the embedding model is unavailable: the search goes on by words.
+pub(super) fn cached_embed_text(text: &str) -> Result<Vec<f32>, String> {
     if let Ok(cache) = embed_cache().lock() {
         if let Some(embedding) = cache.get(text) {
-            return embedding.clone();
+            return Ok(embedding.clone());
         }
     }
 
@@ -179,15 +181,15 @@ pub(super) fn cached_embed_text(text: &str) -> Vec<f32> {
         if let Ok(mut cache) = embed_cache().lock() {
             cache.insert(text.to_string(), embedding.clone());
         }
-        return embedding;
+        return Ok(embedding);
     }
 
-    let embedding = crate::embedding::embed_query(text);
+    let embedding = crate::embedding::embed_query(text)?;
     if let Ok(mut cache) = embed_cache().lock() {
         cache.insert(text.to_string(), embedding.clone());
     }
     write_disk_query_cache(text, &embedding);
-    embedding
+    Ok(embedding)
 }
 
 /// Disk cache key. Salted with the active model label: a cached query
@@ -303,8 +305,13 @@ pub(super) fn store_embedding(conn: &Connection, id: &str, content: &str, blob: 
     .unwrap_or(0)
 }
 
+/// With the model unavailable, the queue is left alone for this long: its
+/// memories keep their text and are embedded once the model is back.
+const EMBED_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn embed_worker_loop() {
     let mut backlog = false;
+    let mut model_down_since: Option<std::time::Instant> = None;
     loop {
         // With a backlog, pause just long enough for a waiting `recall`
         // to grab the embedding session between two slices — the
@@ -312,12 +319,16 @@ fn embed_worker_loop() {
         // would starve interactive queries for the whole backfill.
         std::thread::sleep(std::time::Duration::from_millis(if backlog { 25 } else { 100 }));
 
+        if model_down_since.is_some_and(|since| since.elapsed() >= EMBED_RETRY) {
+            model_down_since = None;
+        }
         let jobs: Vec<EmbedJob> = {
             let mut queue = match embed_queue().lock() {
                 Ok(queue) => queue,
                 Err(_) => continue,
             };
-            let take = queue.len().min(EMBED_SLICE);
+            // While the model is down the jobs wait where they are.
+            let take = if model_down_since.is_some() { 0 } else { queue.len().min(EMBED_SLICE) };
             let mut slice: Vec<EmbedJob> = queue.drain(..take).collect();
             backlog = !queue.is_empty();
             // Same memory queued twice (double open, rapid edits): keep
@@ -356,7 +367,20 @@ fn embed_worker_loop() {
         }
 
         let texts: Vec<&str> = jobs.iter().map(|job| job.embed_text.as_str()).collect();
-        let embeddings = crate::embedding::embed_batch(&texts);
+        let embeddings = match crate::embedding::embed_batch(&texts) {
+            Ok(embeddings) => embeddings,
+            Err(_) => {
+                // Back at the head of the queue, in their order, for the next try.
+                if let Ok(mut queue) = embed_queue().lock() {
+                    for job in jobs.into_iter().rev() {
+                        queue.insert(0, job);
+                    }
+                }
+                model_down_since = Some(std::time::Instant::now());
+                backlog = false;
+                continue;
+            }
+        };
 
         let ann = embed_ann_index();
         let mut ann_pushed = 0usize;

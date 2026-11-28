@@ -1859,7 +1859,13 @@ fn handle_search(db: &Database, args: &Value) -> Value {
                 "confidence": confidence,
                 "results": listed
             });
-            if confidence.abstain {
+            if let Some(degraded) = confidence.degraded {
+                // An agent must not take a search by words for a full one.
+                output["warning"] = json!(degraded);
+                output["note"] = json!(
+                    "The embedding model is unavailable, so only memories that share words with the query were searched. A memory worded differently was not looked at: do not conclude that something is absent, and search again later or with other words."
+                );
+            } else if confidence.abstain {
                 output["note"] = json!(
                     "No stored memory answers this query with confidence; treat the results as loosely related context, not as an answer. Finding nothing does not prove that nothing happened: sessions may be missing from the index. Do not store 'it never happened' as a fact; say it was not found."
                 );

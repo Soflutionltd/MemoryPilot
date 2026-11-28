@@ -831,7 +831,7 @@ impl Database {
         );
 
         let texts: Vec<&str> = to_embed.iter().map(|(_, _, t)| t.as_str()).collect();
-        let embeddings = crate::embedding::embed_batch(&texts);
+        let embeddings = crate::embedding::embed_batch(&texts).map_err(|error| format!("Embeddings not computed: {}", error))?;
         let mut count = 0;
         for ((id, content, _), emb) in to_embed.iter().zip(embeddings.iter()) {
             let blob = crate::embedding::vec_to_blob(emb);

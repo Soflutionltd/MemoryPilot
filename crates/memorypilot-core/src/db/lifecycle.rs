@@ -154,7 +154,11 @@ impl Database {
             return;
         }
         if missing.len() <= SYNC_BACKFILL_MAX {
-            let _ = self.backfill_embeddings();
+            // Without the model the database still opens: these memories
+            // are handed to the background worker, which tries again.
+            if self.backfill_embeddings().is_err() {
+                queue_startup_backfill(missing);
+            }
             return;
         }
         let count = missing.len();

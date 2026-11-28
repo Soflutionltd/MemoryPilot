@@ -270,7 +270,7 @@ pub fn embed_pending(store: &mut ConversationStore, budget: Option<Duration>) ->
             return Ok(done);
         }
         let texts: Vec<&str> = batch.iter().map(|(_, text)| text.as_str()).collect();
-        let vectors = crate::embedding::embed_batch(&texts);
+        let vectors = crate::embedding::embed_batch(&texts)?;
         if vectors.len() != batch.len() {
             return Err(format!("Embedding batch returned {} vectors for {} texts", vectors.len(), batch.len()));
         }

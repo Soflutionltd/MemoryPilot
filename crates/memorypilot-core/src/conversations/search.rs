@@ -161,8 +161,8 @@ impl ConversationStore {
             let expression = or_expression(translated_terms.iter().map(|(_, alt)| alt.as_str()));
             add_lane(self.fts_ranked(&expression, None)?, TRANSLATED_WEIGHT, "translated");
         }
-        if options.use_vectors {
-            let query_vector = crate::embedding::embed_query(&options.query);
+        // Without the embedding model the lanes of words answer alone.
+        if let Some(query_vector) = options.use_vectors.then(|| crate::embedding::embed_query(&options.query).ok()).flatten() {
             add_lane(self.vector_ranked(&query_vector, None)?, VECTOR_WEIGHT, "vector");
         }
         if scores.is_empty() {
@@ -521,8 +521,7 @@ impl ConversationStore {
             let expression = or_expression(translated_terms.iter().map(|(_, alt)| alt.as_str()));
             add_lane(self.fts_ranked(&expression, Some(conversation_id))?, TRANSLATED_WEIGHT);
         }
-        if use_vectors && !query.trim().is_empty() {
-            let query_vector = crate::embedding::embed_query(query);
+        if let Some(query_vector) = (use_vectors && !query.trim().is_empty()).then(|| crate::embedding::embed_query(query).ok()).flatten() {
             add_lane(self.vector_ranked(&query_vector, Some(conversation_id))?, VECTOR_WEIGHT);
         }
 

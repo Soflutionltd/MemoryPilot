@@ -303,7 +303,7 @@ impl Database {
                 .iter()
                 .map(|(_, t)| t.as_str())
                 .collect();
-            let chunk_embeddings = crate::embedding::embed_batch(&chunk_texts);
+            let chunk_embeddings = crate::embedding::embed_batch(&chunk_texts)?;
             for (ci, emb) in chunk_embeddings.into_iter().enumerate() {
                 let key = &turns_to_embed[chunk_start + ci].0;
                 if let Some(conn) = cache_conn.as_ref() {

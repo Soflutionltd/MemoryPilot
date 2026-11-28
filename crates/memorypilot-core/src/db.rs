@@ -256,6 +256,10 @@ pub struct SearchConfidence {
     pub margin: f64,
     pub level: &'static str,
     pub abstain: bool,
+    /// Set when the search ran without the embedding model: the results
+    /// come from word matching only and may miss what is worded otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<&'static str>,
 }
 
 impl SearchConfidence {
@@ -297,6 +301,22 @@ impl SearchConfidence {
         }
     }
 
+    /// What a search says of itself when the embedding model is unavailable.
+    pub const WORDS_ONLY: &'static str = "embedding model unavailable: these results come from word matching only and may miss memories worded differently";
+
+    /// The verdict of a search made without the embedding model: there is
+    /// no cosine to judge the top hit, so it never claims to be sure.
+    fn words_only(cross_score: Option<f32>, margin: f64) -> Self {
+        Self {
+            cross_score,
+            margin,
+            level: "low",
+            abstain: true,
+            degraded: Some(Self::WORDS_ONLY),
+            ..Self::default()
+        }
+    }
+
     fn assess(top_cosine: f32, peak: f32, cross_score: Option<f32>, margin: f64) -> Self {
         let floor = Self::abstain_cosine();
         let cross_vouches = cross_score
@@ -320,6 +340,7 @@ impl SearchConfidence {
             margin,
             level,
             abstain,
+            degraded: None,
         }
     }
 }

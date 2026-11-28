@@ -221,7 +221,8 @@ impl Database {
             return Ok(Vec::new());
         }
         let canonical = Self::canonical_project(project);
-        let query_emb = super::cached_embed_text(query);
+        // Without the model, episodes are ranked on their words alone.
+        let query_emb = super::cached_embed_text(query).ok();
         let query_terms = significant_terms(query);
 
         let sql = "SELECT id, project, level, title, summary, embedding, start_at, end_at, \
@@ -248,7 +249,8 @@ impl Database {
             }
             let dense = blob
                 .as_ref()
-                .map(|b| embedding::similarity_with_blob(&query_emb, b))
+                .zip(query_emb.as_ref())
+                .map(|(b, query_emb)| embedding::similarity_with_blob(query_emb, b))
                 .unwrap_or(0.0)
                 .max(0.0) as f64;
             let haystack = format!(
@@ -535,7 +537,8 @@ impl Database {
         let entities = self.entities_for_memories(&source_ids);
 
         let embed_text = format!("{}\n{}", title, summary);
-        let blob = embedding::vec_to_blob(&embedding::embed_text(&embed_text));
+        // An episode is derived: without the model it is built at a later rollup.
+        let blob = embedding::vec_to_blob(&embedding::embed_text(&embed_text)?);
 
         self.write_episode(
             "interval",
@@ -598,7 +601,8 @@ impl Database {
         entities.truncate(24);
 
         let embed_text = format!("{}\n{}", title, summary);
-        let blob = embedding::vec_to_blob(&embedding::embed_text(&embed_text));
+        // An episode is derived: without the model it is built at a later rollup.
+        let blob = embedding::vec_to_blob(&embedding::embed_text(&embed_text)?);
 
         self.write_episode(
             level,

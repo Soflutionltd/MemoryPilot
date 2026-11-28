@@ -291,7 +291,9 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     store.expire_memories();
 
     let embed_start = std::time::Instant::now();
-    let query_emb = cached_embed_text(query);
+    // Without the embedding model the search goes on by words: the vector
+    // lanes are skipped and the confidence says so.
+    let query_emb: Option<Vec<f32>> = cached_embed_text(query).ok();
     if let Some(t) = trace.as_mut() {
         t.timing_ms_embed_query = embed_start.elapsed().as_secs_f64() * 1000.0;
     }
@@ -385,7 +387,10 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     // 2a. Optional ANN pre-filter. Marks candidates with `vector_ann` so the
     // explain output exposes which retrieval stage surfaced them. The full
     // scan below stays authoritative for ranking — ANN only annotates here.
-    let ann_hits: Vec<(String, f32)> = store.approximate_neighbours(&query_emb, 200);
+    let ann_hits: Vec<(String, f32)> = query_emb
+        .as_deref()
+        .map(|query_emb| store.approximate_neighbours(query_emb, 200))
+        .unwrap_or_default();
     for (id, _) in &ann_hits {
         candidate_sources
             .entry(id.clone())
@@ -421,12 +426,10 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
 
     let vector_start = std::time::Instant::now();
     let vector_results = {
-        let rows = store.vector_candidates(
-            &query_emb,
-            canonical_project.as_deref(),
-            kind,
-            restricted_ids.as_deref(),
-        )?;
+        let rows = match query_emb.as_deref() {
+            Some(query_emb) => store.vector_candidates(query_emb, canonical_project.as_deref(), kind, restricted_ids.as_deref())?,
+            None => Vec::new(),
+        };
         let mut vector_scores: Vec<(String, f32)> = Vec::new();
         for (mem, similarity) in rows {
             all_memories
@@ -837,15 +840,16 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
     // MMR redundancy term and the confidence cosine.
     let finalist_ids: Vec<&String> = results.iter().map(|r| &r.memory.id).collect();
     let finalist_vectors = store.batch_memory_vectors(&finalist_ids);
+    let cosine_to_query = |vector: &Vec<f32>| query_emb.as_deref().map(|query_emb| crate::embedding::cosine_similarity(query_emb, vector));
     let finalist_cosines: Vec<f32> = results
         .iter()
         .filter_map(|result| finalist_vectors.get(&result.memory.id))
-        .map(|vector| crate::embedding::cosine_similarity(&query_emb, vector))
+        .filter_map(cosine_to_query)
         .collect();
     let top_cosine = results
         .first()
         .and_then(|top| finalist_vectors.get(&top.memory.id))
-        .map(|vector| crate::embedding::cosine_similarity(&query_emb, vector))
+        .and_then(cosine_to_query)
         .unwrap_or(0.0);
     let peak = if finalist_cosines.len() >= 3 {
         let others: Vec<f32> = finalist_cosines.iter().skip(1).copied().collect();
@@ -863,7 +867,9 @@ pub fn hybrid_search<S: MemoryStore + RecallStore + ?Sized>(
 
     results = final_order(query, results, &finalist_vectors, limit, wide);
 
-    let confidence = if results.is_empty() {
+    let confidence = if query_emb.is_none() {
+        SearchConfidence::words_only(cross_score, margin)
+    } else if results.is_empty() {
         SearchConfidence::none()
     } else {
         SearchConfidence::assess(top_cosine, peak, cross_score, margin)

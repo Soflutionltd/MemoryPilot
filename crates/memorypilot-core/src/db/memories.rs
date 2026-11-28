@@ -364,8 +364,9 @@ impl Database {
             let id = Uuid::new_v4().to_string();
             let now = Utc::now().to_rfc3339();
             let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
-            let emb = crate::embedding::embed_text(content);
-            let emb_blob = crate::embedding::vec_to_blob(&emb);
+            // Without the model the memory is imported all the same: its
+            // vector is computed at the next start.
+            let emb_blob = crate::embedding::embed_text(content).ok().map(|emb| crate::embedding::vec_to_blob(&emb));
             tx.execute(
                 "INSERT INTO memories (id,content,kind,project,tags,source,importance,embedding,created_at,updated_at,access_count) VALUES (?1,?2,?3,?4,?5,?6,3,?7,?8,?9,0)",
                 params![id, content, kind, canonical_project.as_deref(), tags_json, source, emb_blob, now, now],

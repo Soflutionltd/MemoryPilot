@@ -30,7 +30,7 @@
 /// produced by another, so the database records the active model label
 /// and re-embeds everything when it changes (see `Database::open_at`).
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Legacy 384-dim layouts kept for backwards compatibility on existing
 /// on-disk blobs (small model). Anything else is rejected as unknown.
@@ -316,15 +316,27 @@ impl OrtEmbedder {
 // ─── Engine pool ────────────────────────────────────
 
 enum Engine {
-    Ort(OrtEmbedder),
+    Ort(Box<OrtEmbedder>),
+    /// The model could not be loaded: why, and when it was tried.
+    Unavailable(String, std::time::Instant),
 }
 
+/// A model that failed to load is tried again after this long.
+const UNAVAILABLE_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a caller waits for the model to load. From the cache it takes
+/// under a second; a first download goes on in the background past this,
+/// and is picked up by the first call made after it ends. Below the ten
+/// seconds an agent gives a prompt hook.
+const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
 impl Engine {
-    fn embed(&mut self, texts: Vec<String>) -> Vec<Vec<f32>> {
+    fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        if matches!(self, Engine::Unavailable(_, tried) if tried.elapsed() >= UNAVAILABLE_RETRY) || (matches!(self, Engine::Unavailable(..)) && load_has_ended()) {
+            *self = build_engine();
+        }
         match self {
-            Engine::Ort(model) => model
-                .embed(&texts)
-                .unwrap_or_else(|error| panic!("[MemoryPilot] jina embed failed: {}", error)),
+            Engine::Ort(model) => model.embed(&texts).map_err(|error| format!("embedding failed: {}", error)),
+            Engine::Unavailable(error, _) => Err(error.clone()),
         }
     }
 }
@@ -343,15 +355,94 @@ impl Engine {
 /// at 8 to keep memory predictable). 
 static EMBED_POOL: OnceLock<crate::pool::IdlePool<Engine>> = OnceLock::new();
 
+/// A load that outlived `LOAD_DEADLINE` (a first download, a network that
+/// accepts and does not answer), with when it began: the next attempt reads
+/// its outcome instead of starting a second one over the same files.
+struct RunningLoad {
+    began: std::time::Instant,
+    outcome: std::sync::mpsc::Receiver<Result<OrtEmbedder, String>>,
+}
+
+static PENDING_LOAD: Mutex<Option<RunningLoad>> = Mutex::new(None);
+
+/// A load that has not ended after this long is given up: its thread is
+/// left to itself and a new attempt is made.
+const LOAD_ABANDONED: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn pending_load() -> std::sync::MutexGuard<'static, Option<RunningLoad>> {
+    match PENDING_LOAD.lock() {
+        Ok(pending) => pending,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Whether a load left running in the background is worth another look:
+/// it has ended, or it is given up.
+fn load_has_ended() -> bool {
+    let mut pending = pending_load();
+    let Some(running) = pending.take() else {
+        return false;
+    };
+    match running.outcome.try_recv() {
+        Err(std::sync::mpsc::TryRecvError::Empty) if running.began.elapsed() < LOAD_ABANDONED => {
+            *pending = Some(running);
+            false
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => true,
+        // Its outcome goes back in the slot for `build_engine` to read.
+        outcome => {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let _ = sender.send(outcome.unwrap_or_else(|_| Err("the loading thread stopped without an answer".to_string())));
+            *pending = Some(RunningLoad { began: running.began, outcome: receiver });
+            true
+        }
+    }
+}
+
+/// The embedding engine, or why there is none. Never stops the process: a
+/// search falls back on words, a write keeps its memory and embeds it later.
 fn build_engine() -> Engine {
     let model = selected_model();
-    Engine::Ort(OrtEmbedder::load(model).unwrap_or_else(|error| {
-        panic!(
-            "[MemoryPilot] jina embedding init failed ({}): {} — cannot start without embedding engine",
+    let unavailable = |error: String| {
+        eprintln!(
+            "[MemoryPilot] Embedding model {} unavailable: {}. Searches use word matching only; new memories are embedded once it is back.",
             model.label(),
             error
-        )
-    }))
+        );
+        Engine::Unavailable(error, std::time::Instant::now())
+    };
+    let mut pending = pending_load();
+    let loaded = match pending.take() {
+        Some(running) if running.began.elapsed() < LOAD_ABANDONED => match running.outcome.try_recv() {
+            Ok(loaded) => loaded,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let waiting = running.began.elapsed().as_secs();
+                *pending = Some(running);
+                Err(format!("still loading after {} s (download in progress, or a network that does not answer)", waiting))
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the loading thread stopped without an answer".to_string()),
+        },
+        _ => {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let began = std::time::Instant::now();
+            let spawned = std::thread::Builder::new().name("mp-embed-load".into()).spawn(move || {
+                let _ = sender.send(OrtEmbedder::load(model));
+            });
+            match spawned.map(|_| receiver.recv_timeout(LOAD_DEADLINE)) {
+                Ok(Ok(loaded)) => loaded,
+                Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
+                    *pending = Some(RunningLoad { began, outcome: receiver });
+                    Err(format!("still loading after {} s (download in progress, or a network that does not answer)", LOAD_DEADLINE.as_secs()))
+                }
+                Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => Err("the loading thread stopped without an answer".to_string()),
+                Err(error) => Err(format!("cannot start the loading thread: {}", error)),
+            }
+        }
+    };
+    match loaded {
+        Ok(engine) => Engine::Ort(Box::new(engine)),
+        Err(error) => unavailable(error),
+    }
 }
 
 fn embed_pool() -> &'static crate::pool::IdlePool<Engine> {
@@ -399,27 +490,42 @@ fn with_prefix(text: &str, prefix: &str) -> String {
     prefixed
 }
 
-fn embed_prefixed(texts: Vec<String>) -> Vec<Vec<f32>> {
+fn embed_prefixed(texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    // A test of the outage fails its own calls, not the engine every other
+    // test shares.
+    #[cfg(test)]
+    if outage::is_on() {
+        return Err("embedding model unavailable (test)".to_string());
+    }
+    let expected = texts.len();
     let mut pooled = embed_pool().acquire();
-    pooled.get().embed(texts)
+    let vectors = pooled.get().embed(texts)?;
+    if vectors.len() != expected {
+        return Err(format!("embedding returned {} vectors for {} texts", vectors.len(), expected));
+    }
+    Ok(vectors)
+}
+
+fn embed_one(text: &str, prefix: &str) -> Result<Vec<f32>, String> {
+    embed_prefixed(vec![with_prefix(text, prefix)])?
+        .pop()
+        .ok_or_else(|| "embedding returned no vector".to_string())
 }
 
 /// Embed a *search query*. Use this for the text a user is looking
-/// with, never for stored content.
-pub fn embed_query(text: &str) -> Vec<f32> {
-    embed_prefixed(vec![with_prefix(text, JINA_QUERY_PREFIX)])
-        .pop()
-        .unwrap_or_else(|| vec![0.0; vector_dim()])
+/// with, never for stored content. `Err` when the model is unavailable:
+/// the caller searches by words, it does not stop.
+pub fn embed_query(text: &str) -> Result<Vec<f32>, String> {
+    embed_one(text, JINA_QUERY_PREFIX)
 }
 
-/// Embed one stored memory (document side).
-pub fn embed_text(text: &str) -> Vec<f32> {
-    embed_prefixed(vec![with_prefix(text, JINA_DOCUMENT_PREFIX)])
-        .pop()
-        .unwrap_or_else(|| vec![0.0; vector_dim()])
+/// Embed one stored memory (document side). `Err` when the model is
+/// unavailable: the memory is kept without a vector and embedded later.
+pub fn embed_text(text: &str) -> Result<Vec<f32>, String> {
+    embed_one(text, JINA_DOCUMENT_PREFIX)
 }
 
 /// Downloads the active model's files into the cache (Docker image, first
@@ -433,7 +539,7 @@ pub fn prefetch() -> Result<(), String> {
 }
 
 /// Embed a batch of stored memories (document side).
-pub fn embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
+pub fn embed_batch(texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
     embed_prefixed(
         texts
             .iter()
@@ -528,9 +634,57 @@ pub fn similarity_with_blob(query: &[f32], blob: &[u8]) -> f32 {
     }
 }
 
+/// Tests of what happens without the model: an outage for the calls of the
+/// current thread only.
+#[cfg(test)]
+pub(crate) mod outage {
+    thread_local! {
+        static ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(crate) fn is_on() -> bool {
+        ON.with(|on| on.get())
+    }
+
+    /// The model is down for this thread until the guard is dropped.
+    pub(crate) struct Outage;
+
+    pub(crate) fn start() -> Outage {
+        ON.with(|on| on.set(true));
+        Outage
+    }
+
+    impl Drop for Outage {
+        fn drop(&mut self) {
+            ON.with(|on| on.set(false));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embed_query(text: &str) -> Vec<f32> {
+        super::embed_query(text).expect("embedding model")
+    }
+
+    fn embed_text(text: &str) -> Vec<f32> {
+        super::embed_text(text).expect("embedding model")
+    }
+
+    fn embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
+        super::embed_batch(texts).expect("embedding model")
+    }
+
+    #[test]
+    fn an_outage_is_an_error_not_a_stop() {
+        let _outage = outage::start();
+        assert!(super::embed_query("anything").is_err());
+        assert!(super::embed_text("anything").is_err());
+        assert!(super::embed_batch(&["a", "b"]).is_err());
+        assert_eq!(super::embed_batch(&[]), Ok(Vec::new()), "nothing to embed needs no model");
+    }
 
     #[test]
     fn test_similar_texts() {
