@@ -27,6 +27,22 @@ const MIGRATIONS: &[(i32, &str)] = &[
 /// The schema version this binary writes.
 pub const SCHEMA_VERSION: i32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
+/// A database stamped with a schema this binary does not know was written by
+/// a newer MemoryPilot: opening it would run this version's upgrades on
+/// tables it cannot read correctly. It is refused before anything is written.
+pub(super) fn refuse_newer_schema(conn: &Connection) -> Result<(), String> {
+    let found: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| format!("Read schema version: {}", error))?;
+    if found > SCHEMA_VERSION {
+        return Err(format!(
+            "this database was written by a newer MemoryPilot (schema {}, this version knows {}).              Nothing was changed. Update MemoryPilot (`MemoryPilot update`), or put back a copy              from the backups/memory folder.",
+            found, SCHEMA_VERSION
+        ));
+    }
+    Ok(())
+}
+
 impl Database {
     pub(super) fn schema_version(&self) -> Result<i32, String> {
         self.conn

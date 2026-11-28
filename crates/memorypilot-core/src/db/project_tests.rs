@@ -115,6 +115,39 @@ fn schema_is_stamped_with_the_current_version() {
 }
 
 #[test]
+fn a_database_from_a_newer_version_is_refused_untouched() {
+    let workspace = Workspace::new("schema-newer");
+    drop(workspace.open());
+    let newer = SCHEMA_VERSION + 1;
+    {
+        let conn = rusqlite::Connection::open(workspace.db_path()).expect("database");
+        conn.execute_batch(&format!(
+            "ALTER TABLE memories RENAME COLUMN importance TO importance_next; PRAGMA user_version = {};",
+            newer
+        ))
+        .expect("newer schema");
+    }
+    let columns = |path: &std::path::Path| -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).expect("database");
+        let mut statement = conn.prepare("SELECT name FROM pragma_table_info('memories')").expect("columns");
+        let names = statement.query_map([], |row| row.get(0)).expect("rows");
+        names.map(|name| name.expect("name")).collect()
+    };
+    let before = columns(&workspace.db_path());
+
+    let refused = Database::open_at(&workspace.db_path()).err().expect("refused");
+    assert!(refused.contains("newer MemoryPilot"), "{}", refused);
+    let self_test = Database::check_schema_at(&workspace.db_path()).err().expect("refused");
+    assert!(self_test.contains(&format!("schema {}", newer)), "{}", self_test);
+
+    assert_eq!(columns(&workspace.db_path()), before);
+    assert!(!before.contains(&"importance".to_string()));
+    let conn = rusqlite::Connection::open(workspace.db_path()).expect("database");
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
+    assert_eq!(version, newer);
+}
+
+#[test]
 fn a_database_from_before_versioning_is_migrated_without_losing_projects() {
     let workspace = Workspace::new("schema-upgrade");
     {

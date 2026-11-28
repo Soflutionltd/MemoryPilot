@@ -13,6 +13,7 @@ impl Database {
 
     pub fn open_at(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("SQLite open: {}", e))?;
+        migrations::refuse_newer_schema(&conn)?;
         schema::configure_connection(&conn)?;
         set_embed_db_path(path);
 
@@ -73,6 +74,7 @@ impl Database {
     /// open per job on a thread and drop when the job is done.
     pub(crate) fn open_maintenance(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("SQLite open: {}", e))?;
+        migrations::refuse_newer_schema(&conn)?;
         schema::configure_connection(&conn)?;
         let read_pool = schema::open_read_pool(path, 1)?;
         Ok(Self {
