@@ -36,8 +36,11 @@ pub(super) fn refuse_newer_schema(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("Read schema version: {}", error))?;
     if found > SCHEMA_VERSION {
         return Err(format!(
-            "this database was written by a newer MemoryPilot (schema {}, this version knows {}).              Nothing was changed. Update MemoryPilot (`MemoryPilot update`), or put back a copy              from the backups/memory folder.",
-            found, SCHEMA_VERSION
+            "this database was written by a newer MemoryPilot (schema {}, this version knows {}). {} {}",
+            found,
+            SCHEMA_VERSION,
+            "Nothing was changed. Update MemoryPilot (`MemoryPilot update`),",
+            "or put back a copy from the backups/memory folder."
         ));
     }
     Ok(())
