@@ -476,17 +476,57 @@ fn ask_running_server(payload: &Value) -> ServerAnswer {
         return ServerAnswer::Unreachable;
     }
     let read = |area, name| memorypilot_core::layout::path(area, name).and_then(|path| std::fs::read_to_string(path).ok());
-    let Some(port) = read(memorypilot_core::layout::Area::State, SERVER_PORT_FILE).and_then(|raw| raw.trim().parse::<u16>().ok()) else {
+    let Some((pid, port)) = read(memorypilot_core::layout::Area::State, SERVER_PORT_FILE).and_then(|raw| server_address(&raw)) else {
         return ServerAnswer::Unreachable;
     };
+    // The file outlives a server that stopped, and its port may then belong
+    // to any program: the token and the prompt go to a MemoryPilot server
+    // that is still running, or nowhere.
+    if !is_running_server(pid) {
+        return ServerAnswer::Unreachable;
+    }
     let Some(token) = read(memorypilot_core::layout::Area::Config, "http.token").map(|raw| raw.trim().to_string()).filter(|token| !token.is_empty()) else {
         return ServerAnswer::Unreachable;
     };
     ask_server_at(port, &token, payload)
 }
 
+/// What the running server wrote in its port file: its process and its port.
+pub(crate) fn server_address_line(pid: u32, port: u16) -> String {
+    format!("{} {}", pid, port)
+}
+
+fn server_address(raw: &str) -> Option<(u32, u16)> {
+    let (pid, port) = raw.trim().split_once(' ')?;
+    Some((pid.parse().ok()?, port.parse().ok()?))
+}
+
+/// Whether this command line is a MemoryPilot HTTP server.
+fn is_server_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let program = words.next().unwrap_or("");
+    Path::new(program).file_name().is_some_and(|name| name == "MemoryPilot") && words.any(|word| word == "--http")
+}
+
+/// Whether the process the port file names still runs, as a MemoryPilot
+/// HTTP server (a process number is reused once its process is gone).
+fn is_running_server(pid: u32) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| is_server_command(&String::from_utf8_lossy(&output.stdout)))
+}
+
 fn ask_server_at(port: u16, token: &str, payload: &Value) -> ServerAnswer {
     let agent: ureq::Agent = ureq::Agent::config_builder()
+        // Straight to this machine: a proxy named by the environment would
+        // be handed the token and the prompt.
+        .proxy(None)
         .timeout_connect(Some(SERVER_CONNECT_TIMEOUT))
         .timeout_global(Some(SERVER_ANSWER_TIMEOUT))
         .build()
@@ -501,7 +541,8 @@ fn ask_server_at(port: u16, token: &str, payload: &Value) -> ServerAnswer {
         .and_then(|mut response| response.body_mut().read_to_string().map_err(|error| error.to_string()))
         .and_then(|body| serde_json::from_str::<Value>(&body).map_err(|error| error.to_string()))
         .and_then(|body| match body.get("context") {
-            Some(Value::String(context)) => Ok(Some(context.clone())),
+            // As long as what this process would have written itself, no more.
+            Some(Value::String(context)) => Ok(Some(truncate_chars(context, MAX_PROMPT_CONTEXT_CHARS))),
             Some(Value::Null) => Ok(None),
             _ => Err("answer without a context field".to_string()),
         });
@@ -1262,6 +1303,37 @@ mod tests {
 
         let (port, served) = one_answer_server("200 OK", r#"{"context":null}"#);
         assert!(matches!(ask_server_at(port, "secret-token", &payload), ServerAnswer::Answered(None)), "nothing to inject is an answer, not a failure");
+        served.join().expect("server");
+    }
+
+    #[test]
+    fn the_token_goes_to_a_running_memorypilot_server_only() {
+        assert_eq!(server_address(&server_address_line(4242, 7437)), Some((4242, 7437)));
+        assert_eq!(server_address("7437"), None, "a port without its process is not trusted");
+        assert_eq!(server_address("x 7437"), None);
+        assert_eq!(server_address(""), None);
+
+        assert!(is_server_command("/Users/someone/.local/bin/MemoryPilot --http 7437"));
+        assert!(!is_server_command("/Users/someone/.local/bin/MemoryPilot --hook user-prompt --agent claude"));
+        assert!(!is_server_command("/usr/bin/python3 -m http.server --http 7437"));
+        assert!(!is_server_command("/tmp/NotMemoryPilot --http 7437"));
+        assert!(!is_server_command(""));
+
+        // This test process is alive and is not a server; no process has this number.
+        assert!(!is_running_server(std::process::id()));
+        assert!(!is_running_server(u32::MAX - 1));
+    }
+
+    #[test]
+    fn a_long_answer_of_the_server_is_cut_as_a_local_one() {
+        let long = "x".repeat(MAX_PROMPT_CONTEXT_CHARS * 3);
+        let body: &'static str = Box::leak(json!({ "context": long }).to_string().into_boxed_str());
+        let (port, served) = one_answer_server("200 OK", body);
+        let payload = json!({ "prompt": "how is the update server deployed", "session_id": "s1" });
+        let ServerAnswer::Answered(Some(context)) = ask_server_at(port, "secret-token", &payload) else {
+            panic!("no answer");
+        };
+        assert!(context.chars().count() <= MAX_PROMPT_CONTEXT_CHARS + 16, "{} characters", context.chars().count());
         served.join().expect("server");
     }
 

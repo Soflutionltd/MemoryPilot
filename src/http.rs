@@ -113,9 +113,16 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
     }
     let server = Arc::new(server_result.unwrap());
     // The prompt hook asks this server instead of loading the models again:
-    // it finds the port here.
-    if let Some(path) = memorypilot_core::layout::path(memorypilot_core::layout::Area::State, crate::hooks::SERVER_PORT_FILE) {
-        if let Err(error) = std::fs::write(&path, actual_port.to_string()) {
+    // it finds the process and the port here. A server opened on another
+    // database (MEMORYPILOT_DB, a test or a trial) does not answer for the
+    // installation: it would give the hooks the memories of that database.
+    let on_another_database = std::env::var("MEMORYPILOT_DB").is_ok_and(|path| !path.trim().is_empty());
+    if let Some(path) = memorypilot_core::layout::path(memorypilot_core::layout::Area::State, crate::hooks::SERVER_PORT_FILE).filter(|_| !on_another_database) {
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&path, crate::hooks::server_address_line(std::process::id(), actual_port)));
+        if let Err(error) = written {
             eprintln!("[MemoryPilot] Port not written to {}: {}", path.display(), error);
         }
     }
