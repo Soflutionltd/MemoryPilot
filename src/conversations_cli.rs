@@ -305,6 +305,7 @@ pub fn handle_find_conversation(db: &Database, args: &Value) -> Value {
     if query.is_none() && reference.is_none() {
         return tool_error("query or reference required");
     }
+    // Bounds that keep offset + limit + 2 within `search::MAX_RESULTS`.
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5).clamp(1, 20) as usize;
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0).min(200) as usize;
     let mut store = match ConversationStore::open_default() {

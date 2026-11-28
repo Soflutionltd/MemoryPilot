@@ -19,6 +19,10 @@ use std::sync::{Mutex, OnceLock};
 
 const RRF_K: f64 = 60.0;
 const LANE_DEPTH: usize = 300;
+/// The most conversations one search returns. `find_conversation` pages
+/// through them (offset up to 200, 20 a page, two to spare): a lower cap
+/// ended the pages early without saying so.
+pub const MAX_RESULTS: usize = 250;
 const FUZZY_WEIGHT: f64 = 0.6;
 /// The same words in the other language (French and English): they find
 /// what was written in it, below what matches the words typed.
@@ -130,7 +134,7 @@ fn coverage(forms: &[TermForms], body: &str) -> f64 {
 
 impl ConversationStore {
     pub fn search(&self, options: &SearchOptions) -> Result<Vec<ConversationHit>, String> {
-        let limit = options.limit.clamp(1, 50);
+        let limit = options.limit.clamp(1, MAX_RESULTS);
         let terms = text::query_terms(&options.query);
         if terms.is_empty() && options.query.trim().is_empty() {
             return Ok(Vec::new());
@@ -943,6 +947,32 @@ mod tests {
         // The scope of one search does not leak into the next.
         assert_eq!(search(&|options| options.project = Some("alpha".into())).len(), 5);
         assert!(!search(&|_| {}).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_search_returns_as_many_conversations_as_the_pages_ask_for() {
+        let ids: Vec<String> = (0..70).map(|index| format!("c-{}", index)).collect();
+        let said: &[(&str, &str)] = &[("user", "Vérifie la facture du fournisseur avant le virement de fin de mois")];
+        let conversations: Vec<(&str, &[(&str, &str)])> = ids.iter().map(|id| (id.as_str(), said)).collect();
+        let (store, dir) = store_with("pages", &conversations);
+        let asked = |limit: usize| -> usize {
+            let options = SearchOptions {
+                query: "facture fournisseur".into(),
+                limit,
+                tool: None,
+                project: None,
+                project_aliases: Vec::new(),
+                after: None,
+                before: None,
+                use_vectors: false,
+            };
+            store.search(&options).unwrap().len()
+        };
+        // offset 40, 20 a page, one more to know whether a page follows.
+        assert_eq!(asked(61), 61);
+        assert_eq!(asked(500), 70);
+        assert!(MAX_RESULTS >= 200 + 20 + 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 
