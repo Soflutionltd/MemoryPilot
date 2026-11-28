@@ -145,9 +145,21 @@ impl ConversationStore {
             }
         };
 
+        // The filters narrow every lane before it is cut to its depth:
+        // applied afterwards, a conversation that matches was lost whenever
+        // 300 messages of other projects, tools or dates ranked above it.
+        let wanted_projects = options.project.as_deref().map(|project| wanted_names(project, &options.project_aliases));
+        let filtered = options.tool.is_some() || wanted_projects.is_some() || options.after.is_some() || options.before.is_some();
+        let scope = if filtered {
+            self.fill_scope(options.tool.as_deref(), wanted_projects.as_deref())?;
+            Scope::Filtered { after: options.after.as_deref(), before: options.before.as_deref() }
+        } else {
+            Scope::All
+        };
+
         let exact = exact_expression(&terms);
         if let Some(expression) = exact {
-            add_lane(self.fts_ranked(&expression, None)?, EXACT_WEIGHT, "exact");
+            add_lane(self.fts_ranked(&expression, scope)?, EXACT_WEIGHT, "exact");
         }
         let fuzzy_terms = self.fuzzy_expansions(&terms)?;
         let translated_terms = crate::lexicon::translated(&terms);
@@ -155,15 +167,15 @@ impl ConversationStore {
         let forms = term_forms(&terms, &other_spellings);
         if !fuzzy_terms.is_empty() {
             let expression = or_expression(fuzzy_terms.iter().map(|(_, alt)| alt.as_str()));
-            add_lane(self.fts_ranked(&expression, None)?, FUZZY_WEIGHT, "fuzzy");
+            add_lane(self.fts_ranked(&expression, scope)?, FUZZY_WEIGHT, "fuzzy");
         }
         if !translated_terms.is_empty() {
             let expression = or_expression(translated_terms.iter().map(|(_, alt)| alt.as_str()));
-            add_lane(self.fts_ranked(&expression, None)?, TRANSLATED_WEIGHT, "translated");
+            add_lane(self.fts_ranked(&expression, scope)?, TRANSLATED_WEIGHT, "translated");
         }
         // Without the embedding model the lanes of words answer alone.
         if let Some(query_vector) = options.use_vectors.then(|| crate::embedding::embed_query(&options.query).ok()).flatten() {
-            add_lane(self.vector_ranked(&query_vector, None)?, VECTOR_WEIGHT, "vector");
+            add_lane(self.vector_ranked(&query_vector, scope)?, VECTOR_WEIGHT, "vector");
         }
         if scores.is_empty() {
             return Ok(Vec::new());
@@ -229,21 +241,8 @@ impl ConversationStore {
                     continue;
                 }
             }
-            if let Some(project) = options.project.as_deref() {
-                // "My App", "my_app" and "my-app" are one name: a project is
-                // given in its canonical spelling, a folder is not.
-                let plain = |name: &str| -> String { name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect() };
-                let wanted: Vec<String> = std::iter::once(project)
-                    .chain(options.project_aliases.iter().map(String::as_str))
-                    .map(plain)
-                    .filter(|name| !name.is_empty())
-                    .collect();
-                let matches_project = [hit.project.as_deref(), hit.workspace.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .map(plain)
-                    .any(|filed| wanted.iter().any(|name| filed.contains(name.as_str())));
-                if !matches_project {
+            if let Some(wanted) = wanted_projects.as_deref() {
+                if !filed_under(hit.project.as_deref(), hit.workspace.as_deref(), wanted) {
                     continue;
                 }
             }
@@ -264,23 +263,76 @@ impl ConversationStore {
 
     /// Messages matching an FTS expression, best first; `within` keeps
     /// only those of one conversation.
-    fn fts_ranked(&self, expression: &str, within: Option<&str>) -> Result<Vec<i64>, String> {
-        let sql = match within {
-            None => "SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-            Some(_) => {
-                "SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1
-                   AND rowid IN (SELECT id FROM segments WHERE conversation_id = ?3)
-                 ORDER BY rank LIMIT ?2"
+    /// Fills `temp.search_scope` with the conversations of `tool` filed
+    /// under one of the `projects` names.
+    fn fill_scope(&self, tool: Option<&str>, projects: Option<&[String]>) -> Result<(), String> {
+        let failed = |error: rusqlite::Error| format!("Search scope: {}", error);
+        self.conn
+            .execute_batch("CREATE TEMP TABLE IF NOT EXISTS search_scope (id TEXT PRIMARY KEY); DELETE FROM temp.search_scope;")
+            .map_err(failed)?;
+        let conversations: Vec<(String, String, Option<String>, Option<String>)> = {
+            let mut statement = self
+                .conn
+                .prepare_cached("SELECT id, tool, project, workspace FROM conversations")
+                .map_err(failed)?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                .map_err(failed)?;
+            rows.collect::<Result<_, _>>().map_err(failed)?
+        };
+        let mut insert = self.conn.prepare_cached("INSERT INTO temp.search_scope (id) VALUES (?1)").map_err(failed)?;
+        for (id, filed_tool, project, workspace) in &conversations {
+            if tool.is_some_and(|tool| !filed_tool.eq_ignore_ascii_case(tool)) {
+                continue;
+            }
+            if projects.is_some_and(|wanted| !filed_under(project.as_deref(), workspace.as_deref(), wanted)) {
+                continue;
+            }
+            insert.execute([id]).map_err(failed)?;
+        }
+        Ok(())
+    }
+
+    fn fts_ranked(&self, expression: &str, scope: Scope) -> Result<Vec<i64>, String> {
+        let read = |row: &rusqlite::Row| row.get::<_, i64>(0);
+        let failed = |error: rusqlite::Error| format!("FTS search: {}", error);
+        let depth = LANE_DEPTH as i64;
+        let rows: Vec<i64> = match scope {
+            Scope::All => {
+                let mut statement = self
+                    .conn
+                    .prepare_cached("SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1 ORDER BY rank LIMIT ?2")
+                    .map_err(failed)?;
+                let rows = statement.query_map(params![expression, depth], read).map_err(failed)?;
+                rows.filter_map(Result::ok).collect()
+            }
+            Scope::Conversation(conversation) => {
+                let mut statement = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1
+                           AND rowid IN (SELECT id FROM segments WHERE conversation_id = ?3)
+                         ORDER BY rank LIMIT ?2",
+                    )
+                    .map_err(failed)?;
+                let rows = statement.query_map(params![expression, depth, conversation], read).map_err(failed)?;
+                rows.filter_map(Result::ok).collect()
+            }
+            Scope::Filtered { after, before } => {
+                let mut statement = self
+                    .conn
+                    .prepare_cached(&format!(
+                        "SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1
+                           AND rowid IN (SELECT s.id FROM segments s WHERE {})
+                         ORDER BY rank LIMIT ?2",
+                        IN_SCOPE
+                    ))
+                    .map_err(failed)?;
+                let rows = statement.query_map(params![expression, depth, after, before], read).map_err(failed)?;
+                rows.filter_map(Result::ok).collect()
             }
         };
-        let mut statement = self.conn.prepare_cached(sql).map_err(|error| format!("FTS search: {}", error))?;
-        let read = |row: &rusqlite::Row| row.get::<_, i64>(0);
-        let rows = match within {
-            None => statement.query_map(params![expression, LANE_DEPTH as i64], read),
-            Some(conversation) => statement.query_map(params![expression, LANE_DEPTH as i64, conversation], read),
-        }
-        .map_err(|error| format!("FTS search: {}", error))?;
-        Ok(rows.filter_map(Result::ok).collect())
+        Ok(rows)
     }
 
     /// Vocabulary words close to a query word the index barely knows.
@@ -356,20 +408,36 @@ impl ConversationStore {
         Ok(vocabulary)
     }
 
-    fn vector_ranked(&self, query: &[f32], within: Option<&str>) -> Result<Vec<i64>, String> {
-        let sql = match within {
-            None => "SELECT id, embedding FROM segments WHERE embed_state = 2",
-            Some(_) => "SELECT id, embedding FROM segments WHERE embed_state = 2 AND conversation_id = ?1",
-        };
-        let mut statement = self.conn.prepare_cached(sql).map_err(|error| format!("Vector scan: {}", error))?;
+    fn vector_ranked(&self, query: &[f32], scope: Scope) -> Result<Vec<i64>, String> {
         let read = |row: &rusqlite::Row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?));
-        let rows = match within {
-            None => statement.query_map([], read),
-            Some(conversation) => statement.query_map([conversation], read),
-        }
-        .map_err(|error| format!("Vector scan: {}", error))?;
+        let failed = |error: rusqlite::Error| format!("Vector scan: {}", error);
+        let rows: Vec<(i64, Vec<u8>)> = match scope {
+            Scope::All => {
+                let mut statement =
+                    self.conn.prepare_cached("SELECT id, embedding FROM segments WHERE embed_state = 2").map_err(failed)?;
+                let rows = statement.query_map([], read).map_err(failed)?;
+                rows.filter_map(Result::ok).collect()
+            }
+            Scope::Conversation(conversation) => {
+                let mut statement = self
+                    .conn
+                    .prepare_cached("SELECT id, embedding FROM segments WHERE embed_state = 2 AND conversation_id = ?1")
+                    .map_err(failed)?;
+                let rows = statement.query_map([conversation], read).map_err(failed)?;
+                rows.filter_map(Result::ok).collect()
+            }
+            Scope::Filtered { after, before } => {
+                let mut statement = self
+                    .conn
+                    .prepare_cached(&format!("SELECT s.id, s.embedding FROM segments s WHERE s.embed_state = 2 AND {}", IN_SCOPE))
+                    .map_err(failed)?;
+                // ?1 and ?2 are the expression and the depth of the FTS lane.
+                let rows = statement.query_map(params![None::<String>, None::<i64>, after, before], read).map_err(failed)?;
+                rows.filter_map(Result::ok).collect()
+            }
+        };
         let mut scored: Vec<(f32, i64)> = rows
-            .filter_map(Result::ok)
+            .into_iter()
             .map(|(id, blob)| (crate::embedding::similarity_with_blob(query, &blob), id))
             .collect();
         let depth = LANE_DEPTH.min(scored.len());
@@ -507,7 +575,7 @@ impl ConversationStore {
             }
         };
         if let Some(expression) = exact_expression(&terms) {
-            add_lane(self.fts_ranked(&expression, Some(conversation_id))?, EXACT_WEIGHT);
+            add_lane(self.fts_ranked(&expression, Scope::Conversation(conversation_id))?, EXACT_WEIGHT);
         }
         let fuzzy_terms = self.fuzzy_expansions(&terms)?;
         let translated_terms = crate::lexicon::translated(&terms);
@@ -515,14 +583,14 @@ impl ConversationStore {
         let forms = term_forms(&terms, &other_spellings);
         if !fuzzy_terms.is_empty() {
             let expression = or_expression(fuzzy_terms.iter().map(|(_, alt)| alt.as_str()));
-            add_lane(self.fts_ranked(&expression, Some(conversation_id))?, FUZZY_WEIGHT);
+            add_lane(self.fts_ranked(&expression, Scope::Conversation(conversation_id))?, FUZZY_WEIGHT);
         }
         if !translated_terms.is_empty() {
             let expression = or_expression(translated_terms.iter().map(|(_, alt)| alt.as_str()));
-            add_lane(self.fts_ranked(&expression, Some(conversation_id))?, TRANSLATED_WEIGHT);
+            add_lane(self.fts_ranked(&expression, Scope::Conversation(conversation_id))?, TRANSLATED_WEIGHT);
         }
         if let Some(query_vector) = (use_vectors && !query.trim().is_empty()).then(|| crate::embedding::embed_query(query).ok()).flatten() {
-            add_lane(self.vector_ranked(&query_vector, Some(conversation_id))?, VECTOR_WEIGHT);
+            add_lane(self.vector_ranked(&query_vector, Scope::Conversation(conversation_id))?, VECTOR_WEIGHT);
         }
 
         // An extract is cut around the words typed, else around their counterparts.
@@ -691,6 +759,46 @@ fn exact_expression(terms: &[String]) -> Option<String> {
     Some(or_expression(alternatives.iter().map(String::as_str)))
 }
 
+/// Which messages a lane ranks.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    All,
+    Conversation(&'a str),
+    /// The conversations listed in `temp.search_scope`, between two dates.
+    Filtered { after: Option<&'a str>, before: Option<&'a str> },
+}
+
+/// Condition on `segments s` for `Scope::Filtered`: `?3` and `?4` are the
+/// dates. A message without a date only passes when no date is asked, as
+/// in `within`.
+const IN_SCOPE: &str = "s.conversation_id IN (SELECT id FROM temp.search_scope)
+    AND (?3 IS NULL OR s.at >= ?3) AND (?4 IS NULL OR s.at < ?4)";
+
+/// The names a project filter accepts, reduced to letters and digits:
+/// "My App", "my_app" and "my-app" are one name.
+fn wanted_names(project: &str, aliases: &[String]) -> Vec<String> {
+    std::iter::once(project)
+        .chain(aliases.iter().map(String::as_str))
+        .map(plain_name)
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn plain_name(name: &str) -> String {
+    name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// Whether a conversation filed under `project`, in the folder `workspace`,
+/// belongs to one of the `wanted` names: a project is given in its
+/// canonical spelling, a folder is not.
+fn filed_under(project: Option<&str>, workspace: Option<&str>, wanted: &[String]) -> bool {
+    [project, workspace]
+        .into_iter()
+        .flatten()
+        .map(plain_name)
+        .any(|filed| wanted.iter().any(|name| filed.contains(name.as_str())))
+}
+
 fn within(at: Option<&str>, after: Option<&str>, before: Option<&str>) -> bool {
     let Some(at) = at else { return after.is_none() && before.is_none() };
     after.is_none_or(|after| at >= after) && before.is_none_or(|before| at < before)
@@ -784,6 +892,58 @@ mod tests {
             store.apply(&source, true, &messages, &[]).unwrap();
         }
         (store, dir)
+    }
+
+    /// 320 conversations of one project say the word several times, one
+    /// conversation of another says it once: it ranks far below the depth
+    /// of a lane. Filtering after the cut found nothing.
+    #[test]
+    fn a_filter_narrows_the_lanes_before_they_are_cut() {
+        let ids: Vec<String> = (0..320).map(|index| format!("alpha-{}", index)).collect();
+        let loud: &[(&str, &str)] = &[("user", "Les tarifs, encore les tarifs : revois la grille des tarifs et les tarifs annuels")];
+        let quiet: &[(&str, &str)] = &[("user", "Ajoute une ligne sur les tarifs dans le courrier de relance aux anciens clients")];
+        let mut conversations: Vec<(&str, &[(&str, &str)])> = ids.iter().map(|id| (id.as_str(), loud)).collect();
+        conversations.push(("beta-1", quiet));
+        let (mut store, dir) = store_with("lanes", &conversations);
+        for id in &ids {
+            store.set_identity(id, Some("alpha"), None, true).unwrap();
+        }
+        store.set_identity("beta-1", Some("beta"), None, true).unwrap();
+        store.conn.execute("UPDATE conversations SET tool = 'claude-code' WHERE id = 'beta-1'", []).unwrap();
+        store.conn.execute("UPDATE segments SET at = '2026-11-02T08:00:00.000Z' WHERE conversation_id = 'beta-1'", []).unwrap();
+
+        let search = |change: &dyn Fn(&mut SearchOptions)| -> Vec<String> {
+            let mut options = SearchOptions {
+                query: "tarifs".into(),
+                limit: 5,
+                tool: None,
+                project: None,
+                project_aliases: Vec::new(),
+                after: None,
+                before: None,
+                use_vectors: false,
+            };
+            change(&mut options);
+            store.search(&options).unwrap().into_iter().map(|hit| hit.conversation_id).collect()
+        };
+        assert!(!search(&|_| {}).contains(&"beta-1".to_string()), "unfiltered, it is below the cut");
+        assert_eq!(search(&|options| options.project = Some("beta".into())), ["beta-1"]);
+        assert_eq!(search(&|options| options.tool = Some("Claude-Code".into())), ["beta-1"]);
+        assert_eq!(search(&|options| options.after = Some("2026-11-01T00:00:00.000Z".into())), ["beta-1"]);
+        assert!(!search(&|options| options.before = Some("2026-11-01T00:00:00.000Z".into())).contains(&"beta-1".to_string()));
+        // Two filters at once, and a filter nothing matches.
+        assert_eq!(
+            search(&|options| {
+                options.project = Some("beta".into());
+                options.after = Some("2026-11-01T00:00:00.000Z".into());
+            }),
+            ["beta-1"]
+        );
+        assert!(search(&|options| options.project = Some("gamma".into())).is_empty());
+        // The scope of one search does not leak into the next.
+        assert_eq!(search(&|options| options.project = Some("alpha".into())).len(), 5);
+        assert!(!search(&|_| {}).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
