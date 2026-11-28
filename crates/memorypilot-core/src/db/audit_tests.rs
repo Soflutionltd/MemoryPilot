@@ -704,6 +704,31 @@ fn an_import_without_the_model_keeps_the_memories_for_a_later_vector() {
     cleanup(&path);
 }
 
+/// A recall whose hints were searched by words says so, as a search does:
+/// it is the first tool an agent calls.
+#[test]
+fn a_recall_says_when_its_hints_were_searched_without_the_model() {
+    let path = temp_db_path("recall-without-model");
+    {
+        let db = Database::open_at(&path).expect("db");
+        add(&db, "The bandicootmailer queue is drained every five minutes", "fact", "proj");
+        let recall = |hints: Option<&str>| {
+            db.recall(Some("proj"), None, hints, super::RecallMode::Safe, false, true, &MemoryScope::default()).expect("recall")
+        };
+        let normal = recall(Some("bandicootmailer queue drained"));
+        assert!(normal.get("warning").is_none(), "{normal}");
+
+        let _outage = crate::embedding::outage::start();
+        let degraded = recall(Some("bandicootmailer queue drained every"));
+        assert_eq!(degraded["warning"], super::SearchConfidence::WORDS_ONLY);
+        assert!(degraded["compact"].as_str().expect("compact").starts_with("! embedding model unavailable"), "{degraded}");
+        assert!(degraded["compact"].as_str().unwrap().contains("bandicootmailer"), "the words still find the memory");
+        // Nothing was searched: nothing to warn about.
+        assert!(recall(None).get("warning").is_none());
+    }
+    cleanup(&path);
+}
+
 /// Episodes are ranked on their words when the query has no vector.
 #[test]
 fn episodes_are_searched_by_words_without_the_model() {
