@@ -744,8 +744,15 @@ fn backup_database(data: &Path, version: &str) -> Result<Option<PathBuf>, String
     Ok(Some(target))
 }
 
+/// The database the servers of this machine open: `MEMORYPILOT_DB` when the
+/// process that updates has it, else `data/memory.db`.
 fn live_database(data: &Path) -> PathBuf {
-    memorypilot_core::layout::path_in(data, memorypilot_core::layout::Area::Data, "memory.db")
+    database_chosen(std::env::var("MEMORYPILOT_DB").ok().as_deref())
+        .unwrap_or_else(|| memorypilot_core::layout::path_in(data, memorypilot_core::layout::Area::Data, "memory.db"))
+}
+
+fn database_chosen(raw: Option<&str>) -> Option<PathBuf> {
+    raw.filter(|path| !path.trim().is_empty()).map(PathBuf::from)
 }
 
 fn schema_version_of(database: &Path) -> Result<i32, String> {
@@ -1533,6 +1540,13 @@ mod tests {
         let replayed = note_manifest(&mut state, &fixture()).unwrap_err();
         assert!(replayed.contains("older than one already seen"), "{}", replayed);
         assert_eq!(state.manifest_seen, 1_790_000_600);
+    }
+
+    #[test]
+    fn the_database_chosen_by_the_environment_is_the_one_copied() {
+        assert_eq!(database_chosen(None), None);
+        assert_eq!(database_chosen(Some("  ")), None);
+        assert_eq!(database_chosen(Some("/srv/memory/team.db")), Some(PathBuf::from("/srv/memory/team.db")));
     }
 
     #[test]
