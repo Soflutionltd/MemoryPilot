@@ -719,8 +719,12 @@ fn discard_corrupt_files(spec: OrtRerankerSpec) -> String {
     notes
 }
 
-/// Rerank runs on 12 short query/document pairs; two threads saturate
-/// it. `MEMORYPILOT_RERANK_THREADS` overrides.
+/// Threads of one rerank: half the cores, between 2 and 4. Memories are
+/// often long (pairs of up to 512 tokens), and on 12 of them four threads
+/// answer in two thirds of the time two take (measured on an M2 Max: 3.2 s
+/// with 2, 2.2 s with 4, 1.8 s with 8, model load included); beyond four,
+/// concurrent searches would fight for the cores.
+/// `MEMORYPILOT_RERANK_THREADS` overrides.
 fn rerank_intra_threads() -> usize {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -728,8 +732,12 @@ fn rerank_intra_threads() -> usize {
     std::env::var("MEMORYPILOT_RERANK_THREADS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or_else(|| available.min(2))
+        .unwrap_or_else(|| default_rerank_threads(available))
         .clamp(1, available.max(1))
+}
+
+fn default_rerank_threads(available: usize) -> usize {
+    (available / 2).clamp(2, 4)
 }
 
 fn cross_reranker_model() -> RerankerChoice {
@@ -916,6 +924,13 @@ const STOPWORDS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rerank_threads_follow_the_machine_between_two_and_four() {
+        for (cores, threads) in [(1, 2), (2, 2), (4, 2), (6, 3), (8, 4), (12, 4), (32, 4)] {
+            assert_eq!(super::default_rerank_threads(cores), threads, "{cores} cores");
+        }
+    }
+
     use super::*;
     use crate::db::Memory;
 
