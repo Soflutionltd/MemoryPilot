@@ -96,7 +96,8 @@ impl PinnedRepo {
                 continue;
             }
             forget(&path);
-            if verify(&path, file).is_err() {
+            // Only a file that is gone counts: an error reading it is not a removal.
+            if verify(&path, file).is_err() && !path.exists() {
                 removed += 1;
             }
         }
@@ -140,8 +141,14 @@ fn verify(path: &Path, file: &PinnedFile) -> Result<(), String> {
     }
     let found = if sized { sha256_of(path)? } else { String::new() };
     if found == file.sha256 {
-        let state = state.ok_or_else(|| format!("{}: size or modification time cannot be read", path.display()))?;
-        std::fs::write(marker(path), state).map_err(|error| format!("{}: {}", marker(path).display(), error))?;
+        // The file is sound whether or not the marker can be written (a
+        // cache mounted read-only): it is then hashed again at the next load.
+        let noted = state
+            .ok_or_else(|| "size or modification time cannot be read".to_string())
+            .and_then(|state| std::fs::write(marker(path), state).map_err(|error| error.to_string()));
+        if let Err(error) = noted {
+            eprintln!("[MemoryPilot] {} checked, but not noted as such ({}): it is hashed again at the next load", path.display(), error);
+        }
         return Ok(());
     }
     let size = std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0);
@@ -274,6 +281,22 @@ mod tests {
         let error = verify(&path, &HELLO).expect_err("rewritten");
         assert!(error.contains("does not match its pinned print"), "{}", error);
         assert!(!path.exists() && !blob.exists() && !marker(&path).exists());
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sound_file_in_a_read_only_cache_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let (cache, path, blob) = cache_with("read-only", b"hello");
+        let folder = path.parent().expect("snapshot folder").to_path_buf();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).expect("read-only");
+        let checked = REPO.file(&cache, &HELLO, false);
+        let repaired = REPO.repair(&cache, &[HELLO]);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("writable again");
+        assert_eq!(checked, Ok(path.clone()));
+        assert_eq!(repaired, 0, "nothing was removed");
+        assert!(path.exists() && blob.exists() && !marker(&path).exists());
         let _ = std::fs::remove_dir_all(cache);
     }
 
