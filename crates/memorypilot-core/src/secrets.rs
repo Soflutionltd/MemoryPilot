@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 const MASK_OPEN: &str = "[secret masqué : ";
 
@@ -179,7 +179,18 @@ impl KnownSecrets {
 }
 
 static KNOWN: RwLock<Option<Arc<KnownSecrets>>> = RwLock::new(None);
-static KNOWN_LOADED: OnceLock<()> = OnceLock::new();
+/// What the known secrets were last loaded from, and how many stored
+/// credentials could not be read then.
+#[derive(Default)]
+struct Loaded {
+    signature: Option<String>,
+    unreadable: usize,
+    at: Option<std::time::Instant>,
+}
+
+static LOADED: Mutex<Loaded> = Mutex::new(Loaded { signature: None, unreadable: 0, at: None });
+/// A vault that could not be read is tried again, but not at every call.
+const UNREADABLE_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Replaces the known secrets used by `redact` and `findings`.
 pub fn set_known_secrets(known: KnownSecrets) {
@@ -192,32 +203,93 @@ fn known_secrets() -> Option<Arc<KnownSecrets>> {
     KNOWN.read().ok().and_then(|slot| slot.clone())
 }
 
-/// Loads the known secrets once per process (see `reload_known_secrets`).
+/// Loads the known secrets if they were never loaded or if their sources
+/// changed since (a credential stored, a print added): a server that runs
+/// for days would otherwise index in clear a value saved after it started.
 pub fn ensure_known_secrets() {
-    KNOWN_LOADED.get_or_init(|| {
-        reload_known_secrets();
-    });
+    let signature = sources_signature(known_secrets_path().as_deref(), memory_db_path().as_deref());
+    {
+        let Ok(loaded) = LOADED.lock() else { return };
+        let current = loaded.signature.as_deref() == Some(signature.as_str());
+        let waiting = loaded.unreadable > 0 && loaded.at.is_some_and(|at| at.elapsed() < UNREADABLE_RETRY);
+        if current && (loaded.unreadable == 0 || waiting) {
+            return;
+        }
+    }
+    reload_known_secrets();
 }
 
 /// Loads the known secrets again from both sources: the prints file and
-/// the credentials of memory.db. A missing file, database or vault key
-/// only leaves that source out. Returns how many prints are held.
+/// the credentials of memory.db. Returns how many prints are held.
 pub fn reload_known_secrets() -> usize {
-    let known = load_known_secrets_from(known_secrets_path().as_deref(), memory_db_path().as_deref());
+    let file = known_secrets_path();
+    let memory_db = memory_db_path();
+    let signature = sources_signature(file.as_deref(), memory_db.as_deref());
+    let (known, unreadable) = load_known_secrets_from(file.as_deref(), memory_db.as_deref());
     let count = known.len();
     set_known_secrets(known);
+    if let Ok(mut loaded) = LOADED.lock() {
+        *loaded = Loaded { signature: Some(signature), unreadable, at: Some(std::time::Instant::now()) };
+    }
     count
 }
 
-pub fn load_known_secrets_from(file: Option<&Path>, memory_db: Option<&Path>) -> KnownSecrets {
+/// Stored credentials whose value could not be read at the last load (vault
+/// key out of reach, database unreadable): values the filter does not know.
+/// Nothing may be indexed while there are some.
+pub fn unreadable_credentials() -> usize {
+    LOADED.lock().map(|loaded| loaded.unreadable).unwrap_or(0)
+}
+
+/// Changes whenever a print is added or a credential stored, changed or
+/// removed. Carries no value.
+fn sources_signature(file: Option<&Path>, memory_db: Option<&Path>) -> String {
+    let stamp = |path: Option<&Path>| -> String {
+        path.and_then(|path| std::fs::metadata(path).ok())
+            .map(|meta| {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|since| since.as_nanos())
+                    .unwrap_or(0);
+                format!("{}:{}", meta.len(), modified)
+            })
+            .unwrap_or_else(|| "absent".into())
+    };
+    let credentials = memory_db
+        .filter(|db| db.exists())
+        .map(|db| match crate::db::credentials_signature(db) {
+            Ok((stored, changed)) => format!("{}:{}", stored, changed),
+            Err(error) => format!("unreadable:{}", error),
+        })
+        .unwrap_or_else(|| "absent".into());
+    format!("{}|{}", stamp(file), credentials)
+}
+
+/// The known secrets of both sources, and how many stored credentials could
+/// not be read (all of them when the database itself cannot be).
+pub fn load_known_secrets_from(file: Option<&Path>, memory_db: Option<&Path>) -> (KnownSecrets, usize) {
     let mut known = KnownSecrets::default();
     if let Some(file) = file {
         known.read_file(file);
     }
+    let mut unreadable = 0;
     if let Some(db) = memory_db.filter(|db| db.exists()) {
-        known.insert_credential_texts(&crate::db::credential_clear_texts(db).unwrap_or_default());
+        let read = crate::db::credentials_signature(db)
+            .and_then(|(stored, _)| crate::db::credential_clear_texts(db).map(|texts| (stored, texts)));
+        match read {
+            Ok((stored, texts)) => {
+                unreadable = stored.saturating_sub(texts.len());
+                known.insert_credential_texts(&texts);
+            }
+            Err(error) => {
+                eprintln!("[MemoryPilot] stored credentials not read ({}): their values are not known to the secret filter", error);
+                unreadable = 1;
+            }
+        }
     }
-    known
+    (known, unreadable)
 }
 
 /// The folder of conversations.db / memory.db (`MEMORYPILOT_CONVERSATIONS_DB`,
@@ -1278,7 +1350,8 @@ pub(crate) mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        let known = load_known_secrets_from(Some(&file), None);
+        let (known, unreadable) = load_known_secrets_from(Some(&file), None);
+        assert_eq!(unreadable, 0);
         let masked = mask("known", &token);
         assert_eq!(masked.len(), mask("generic", &token).len() - "generic".len() + "known".len());
         assert_eq!(redact_with(&text, &known), format!("export BREVO_KEY_ID={} puis `{}`.", masked, masked));
@@ -1299,11 +1372,37 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(stored.content.starts_with(crate::db::SEAL_PREFIX));
         }
-        let known = load_known_secrets_from(Some(&dir.join(KNOWN_SECRETS_FILE)), Some(&path));
+        let prints = dir.join(KNOWN_SECRETS_FILE);
+        let before = sources_signature(Some(&prints), Some(&path));
+        let (known, unreadable) = load_known_secrets_from(Some(&prints), Some(&path));
+        assert_eq!(unreadable, 0);
         let text = format!("le token {} du compte {} (admin@example.com)", token, account);
         let out = redact_with(&text, &known);
         assert_eq!(out, format!("le token {} du compte {} (admin@example.com)", mask("known", &token), account));
         assert!(redact_with(&text, &KnownSecrets::default()).contains(&token));
+
+        // A credential stored later changes what the secrets are loaded
+        // from: a server already running loads them again.
+        assert_eq!(sources_signature(Some(&prints), Some(&path)), before);
+        let later = fake_hex("stored-later");
+        {
+            let db = crate::db::Database::open_at(&path).unwrap();
+            db.add_memory(&format!("Clé de l'API de facturation {}", later), "credential", Some("test"), &[], "test", 3, None, None, &Default::default())
+                .unwrap();
+        }
+        assert_ne!(sources_signature(Some(&prints), Some(&path)), before);
+        let (known, unreadable) = load_known_secrets_from(Some(&prints), Some(&path));
+        assert_eq!(unreadable, 0);
+        assert!(!redact_with(&format!("clé {}", later), &known).contains(&later));
+
+        // A credential whose value cannot be read back is counted: its
+        // value is one the filter does not know.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE memories SET metadata = '{}' WHERE kind = 'credential' AND content LIKE '%' AND rowid = (SELECT MAX(rowid) FROM memories WHERE kind = 'credential')", [])
+            .unwrap();
+        let (_, unreadable) = load_known_secrets_from(Some(&prints), Some(&path));
+        assert_eq!(unreadable, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

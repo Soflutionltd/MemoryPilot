@@ -88,6 +88,17 @@ pub struct SyncOptions {
 pub fn sync(store: &mut ConversationStore, options: &SyncOptions) -> SyncReport {
     let started = Instant::now();
     let mut report = SyncReport::default();
+    // A stored credential whose value cannot be read (vault key out of
+    // reach) is a value the filter does not know: a conversation quoting it
+    // would be indexed in clear. Nothing is read until it can be.
+    let unreadable = crate::secrets::unreadable_credentials();
+    if unreadable > 0 {
+        report.errors.push(format!(
+            "{} stored credential(s) cannot be read (vault key out of reach): their values would not be masked. Nothing was indexed.",
+            unreadable
+        ));
+        return report;
+    }
     let over_budget = |report: &mut SyncReport| -> bool {
         let over = options.budget.is_some_and(|budget| started.elapsed() > budget);
         report.timed_out |= over;

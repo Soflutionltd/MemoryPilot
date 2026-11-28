@@ -161,6 +161,22 @@ pub fn credentials_readable(db_path: &std::path::Path) -> Result<(usize, usize),
     Ok((total as usize, credential_clear_texts(db_path)?.len()))
 }
 
+/// How many credentials the database holds and when one last changed: a
+/// value that moves whenever a credential is stored, changed or removed.
+pub(crate) fn credentials_signature(db_path: &std::path::Path) -> Result<(usize, String), String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open {}: {}", db_path.display(), e))?;
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM memories WHERE kind = 'credential'",
+        [],
+        |row| Ok((row.get::<_, i64>(0)? as usize, row.get(1)?)),
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub(crate) fn credential_clear_texts(db_path: &std::path::Path) -> Result<Vec<String>, String> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
