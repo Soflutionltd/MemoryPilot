@@ -29,6 +29,7 @@
 /// produced by one model are mathematically incompatible with queries
 /// produced by another, so the database records the active model label
 /// and re-embeds everything when it changes (see `Database::open_at`).
+use crate::model_pin::PinnedFile;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -38,7 +39,42 @@ const LEGACY_SMALL_DIM: usize = 384;
 const LEGACY_SMALL_QUANTIZED_BLOB_LEN: usize = 4 + LEGACY_SMALL_DIM;
 const LEGACY_SMALL_F32_BLOB_LEN: usize = LEGACY_SMALL_DIM * 4;
 
-const JINA_REPO: &str = "jinaai/jina-embeddings-v5-text-nano-retrieval";
+/// The embedding model, at the revision its files below were hashed at:
+/// a repository followed on its main branch can change under an
+/// installation. Moving to a later revision means new prints here.
+const JINA: crate::model_pin::PinnedRepo = crate::model_pin::PinnedRepo {
+    repo: "jinaai/jina-embeddings-v5-text-nano-retrieval",
+    revision: "ac5d898c8d382b17167c33e5c8af644a3519b47d",
+};
+const JINA_TOKENIZER: PinnedFile = PinnedFile {
+    path: "tokenizer.json",
+    bytes: 17_210_235,
+    sha256: "98d4a1d32152d6cedf85b5e88f3b205106dca1fe72aaab34e0ac13c238421069",
+};
+const JINA_QUANTIZED: [PinnedFile; 2] = [
+    PinnedFile {
+        path: "onnx/model_quantized.onnx",
+        bytes: 131_365,
+        sha256: "ac93a7417c216e5076e37da2b3599f7ef16513934098a477680440c09f735a08",
+    },
+    PinnedFile {
+        path: "onnx/model_quantized.onnx_data",
+        bytes: 247_006_208,
+        sha256: "ee7870eb143a7353be08b33f79992a51de3e32b41f684ccd82953a710c2f2f9c",
+    },
+];
+const JINA_Q4: [PinnedFile; 2] = [
+    PinnedFile {
+        path: "onnx/model_q4.onnx",
+        bytes: 129_099,
+        sha256: "a44811eb61f90bfcc24720c04e774ce9f5dc1d1539fe32a814aa40b16efbaa1f",
+    },
+    PinnedFile {
+        path: "onnx/model_q4.onnx_data",
+        bytes: 137_824_256,
+        sha256: "6f63e71508c585ac8221f0d6a3c1afd3200ab2952cbd08421e10e9aa1f9e7c46",
+    },
+];
 const JINA_QUERY_PREFIX: &str = "Query: ";
 const JINA_DOCUMENT_PREFIX: &str = "Document: ";
 /// Memories are short (a few hundred tokens at most); capping the
@@ -66,14 +102,26 @@ impl SelectedModel {
         768
     }
 
-    /// ONNX graph file inside the jina repository. Both variants ship
-    /// their weights as an external `.onnx_data` sibling, resolved by
-    /// ONNX Runtime relative to the graph path.
-    fn jina_onnx_file(self) -> &'static str {
-        match self {
-            SelectedModel::JinaV5Nano => "onnx/model_quantized.onnx",
-            SelectedModel::JinaV5NanoQ4 => "onnx/model_q4.onnx",
-        }
+    /// The ONNX graph and its weights, an external `.onnx_data` sibling
+    /// ONNX Runtime resolves relative to the graph path, then the tokenizer.
+    fn files(self) -> [PinnedFile; 3] {
+        let [graph, weights] = match self {
+            SelectedModel::JinaV5Nano => JINA_QUANTIZED,
+            SelectedModel::JinaV5NanoQ4 => JINA_Q4,
+        };
+        [graph, weights, JINA_TOKENIZER]
+    }
+
+    /// The files of the model in the cache, checked against their prints
+    /// (hashed once, see `model_pin`), downloaded on first use. Returns the
+    /// graph and the tokenizer.
+    fn fetch(self, show_progress: bool) -> Result<(PathBuf, PathBuf), String> {
+        let cache = fastembed_cache_dir();
+        let [graph, weights, tokenizer] = self.files();
+        let graph_path = JINA.file(&cache, &graph, show_progress)?;
+        JINA.file(&cache, &weights, show_progress)?;
+        let tokenizer_path = JINA.file(&cache, &tokenizer, show_progress)?;
+        Ok((graph_path, tokenizer_path))
     }
 
     /// Human-readable label "name (dim-dim)" for logs and the HTTP /info
@@ -178,13 +226,29 @@ struct OrtEmbedder {
 }
 
 impl OrtEmbedder {
+    /// Loads the model. When it does not load, its files are hashed again:
+    /// a damaged one is removed and the load is tried once more, which
+    /// downloads it. A model whose files are sound fails for another
+    /// reason, reported as it is.
     fn load(model: SelectedModel) -> Result<Self, String> {
-        let onnx = model.jina_onnx_file();
-        let graph_path = hf_file(JINA_REPO, onnx, true)?;
-        // External weights: fetched for their side effect (present next
-        // to the graph); ONNX Runtime opens them by relative path.
-        hf_file(JINA_REPO, &format!("{}_data", onnx), true)?;
-        let tokenizer_path = hf_file(JINA_REPO, "tokenizer.json", true)?;
+        match Self::load_from_cache(model) {
+            Ok(loaded) => Ok(loaded),
+            Err(error) => {
+                let removed = JINA.repair(&fastembed_cache_dir(), &model.files());
+                if removed == 0 {
+                    return Err(error);
+                }
+                eprintln!(
+                    "[MemoryPilot] {} file(s) of the embedding model were damaged ({}): removed, downloading again",
+                    removed, error
+                );
+                Self::load_from_cache(model)
+            }
+        }
+    }
+
+    fn load_from_cache(model: SelectedModel) -> Result<Self, String> {
+        let (graph_path, tokenizer_path) = model.fetch(true)?;
         let tokenizer = crate::tokenizer::ByteLevelBpe::from_file(&tokenizer_path)
             .map_err(|error| format!("tokenizer load: {}", error))?;
 
@@ -551,22 +615,15 @@ pub fn embed_text(text: &str) -> Result<Vec<f32>, String> {
 /// Whether the files of the active model are in the cache: loading it then
 /// needs no network and takes under a second.
 pub fn is_cached() -> bool {
-    let onnx = selected_model().jina_onnx_file();
-    let repo = hf_hub::Cache::new(fastembed_cache_dir()).model(JINA_REPO.to_string());
-    [onnx.to_string(), format!("{}_data", onnx), "tokenizer.json".to_string()]
-        .iter()
-        .all(|file| repo.get(file).is_some())
+    let cache = fastembed_cache_dir();
+    selected_model().files().iter().all(|file| JINA.is_cached(&cache, file))
 }
 
 /// Downloads the active model's files into the cache (Docker image, first
 /// boot, a command that needs the model whatever the wait). Does not run
 /// inference.
 pub fn prefetch() -> Result<(), String> {
-    let onnx = selected_model().jina_onnx_file();
-    hf_file(JINA_REPO, onnx, true)?;
-    hf_file(JINA_REPO, &format!("{}_data", onnx), true)?;
-    hf_file(JINA_REPO, "tokenizer.json", true)?;
-    Ok(())
+    selected_model().fetch(true).map(|_| ())
 }
 
 /// Embed a batch of stored memories (document side).

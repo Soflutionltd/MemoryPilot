@@ -19,6 +19,7 @@ pub mod lexicon;
 pub mod llm;
 pub mod onepassword;
 pub mod model_mirror;
+pub mod model_pin;
 pub mod onnx_external;
 pub mod pool;
 pub mod reader;
