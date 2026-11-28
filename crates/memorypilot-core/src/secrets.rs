@@ -238,7 +238,8 @@ pub fn reload_known_secrets() -> usize {
 /// key out of reach, database unreadable): values the filter does not know.
 /// Nothing may be indexed while there are some.
 pub fn unreadable_credentials() -> usize {
-    LOADED.lock().map(|loaded| loaded.unreadable).unwrap_or(0)
+    // A lock that cannot be read says nothing: taken as unreadable.
+    LOADED.lock().map(|loaded| loaded.unreadable).unwrap_or(usize::MAX)
 }
 
 /// Changes whenever a print is added or a credential stored, changed or

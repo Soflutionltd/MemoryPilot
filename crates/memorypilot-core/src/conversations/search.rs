@@ -325,9 +325,12 @@ impl ConversationStore {
             Scope::Filtered { after, before } => {
                 let mut statement = self
                     .conn
+                    // A join, not `rowid IN (…)`: that form made the full
+                    // text index look up every message of the scope, one
+                    // by one (seconds on an index of 40,000 messages).
                     .prepare_cached(&format!(
-                        "SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?1
-                           AND rowid IN (SELECT s.id FROM segments s WHERE {})
+                        "SELECT f.rowid FROM segments_fts f JOIN segments s ON s.id = f.rowid
+                         WHERE segments_fts MATCH ?1 AND {}
                          ORDER BY rank LIMIT ?2",
                         IN_SCOPE
                     ))

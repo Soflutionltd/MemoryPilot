@@ -97,6 +97,8 @@ pub fn sync(store: &mut ConversationStore, options: &SyncOptions) -> SyncReport 
             "{} stored credential(s) cannot be read (vault key out of reach): their values would not be masked. Nothing was indexed.",
             unreadable
         ));
+        // Recorded: the coverage warnings then say the index is not kept up.
+        store.record_sync(&report, chrono::Utc::now());
         return report;
     }
     let over_budget = |report: &mut SyncReport| -> bool {
@@ -279,10 +281,14 @@ fn sync_claude_roots(
         report.origins_checked += group.len();
         let version = claude::group_version(&group);
         let origin = group[0].id.as_str();
+        // Files this session was last read from: when one has gone since,
+        // what it alone held stays in the index.
+        let mut files_before = 0;
         if !origin.is_empty() {
             match store.origin_version(origin) {
                 Ok(Some(stored)) if stored == version => continue,
-                Ok(_) => {}
+                Ok(Some(stored)) => files_before = claude::files_in_version(&stored),
+                Ok(None) => {}
                 Err(error) => {
                     report.errors.push(error);
                     continue;
@@ -303,7 +309,8 @@ fn sync_claude_roots(
         if origin.is_empty() {
             match store.origin_version(&source.origin_id) {
                 Ok(Some(stored)) if stored == source.version => continue,
-                Ok(_) => {}
+                Ok(Some(stored)) => files_before = claude::files_in_version(&stored),
+                Ok(None) => {}
                 Err(error) => {
                     report.errors.push(error);
                     continue;
@@ -315,7 +322,8 @@ fn sync_claude_roots(
         // The file was read to its end: what the index holds of it and it
         // no longer does is dropped, and a day it says nothing on was a
         // session opened and left, not a conversation the index lost.
-        match store.apply_whole(source, &session.messages, &seen, &session.days, &today) {
+        let drop_what_is_gone = group.len() >= files_before;
+        match store.apply_whole(source, &session.messages, &seen, &session.days, &today, drop_what_is_gone) {
             Ok(written) => {
                 report.messages_written += written;
                 report.origins_updated += group.len();
@@ -474,6 +482,80 @@ mod tests {
         let mut again = SyncReport::default();
         sync_claude_roots(&mut store, &[dir.join("projects")], &mut again, &|_| false);
         assert_eq!((again.origins_checked, again.origins_updated, again.messages_written), (2, 0, 0));
+
+        // One of the two files is cleaned up: what it alone held stays.
+        std::fs::remove_file(there.join("same.jsonl")).unwrap();
+        let all = keys(&store, "same");
+        for _ in 0..2 {
+            let mut after = SyncReport::default();
+            sync_claude_roots(&mut store, &[dir.join("projects")], &mut after, &|_| false);
+            assert!(after.errors.is_empty(), "{:?}", after.errors);
+            assert_eq!(keys(&store, "same"), all);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index written by the reader that cut action lines before masking
+    /// them: the cut lines go when the index is opened, and a session read
+    /// again writes its actions anew instead of adding to the old ones.
+    #[test]
+    fn action_lines_cut_before_masking_leave_the_index() {
+        let dir = fresh_dir("cut-lines");
+        let projects = dir.join("projects/-work-courly");
+        std::fs::create_dir_all(&projects).unwrap();
+        let call = |uuid: &str, at: &str, command: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant", "uuid": uuid, "sessionId": "s", "timestamp": at,
+                    "message": { "content": [{ "type": "tool_use", "name": "Bash", "input": { "command": command } }] }
+                })
+            )
+        };
+        let file = [
+            line("user", "u1", "s", "2026-11-16T17:29:03Z", "Ouvre un ticket chez le fournisseur"),
+            call("a1", "2026-11-16T17:29:10Z", "gh issue create --repo vendor/sdk --title 'Audio'"),
+        ]
+        .concat();
+        std::fs::write(projects.join("s.jsonl"), &file).unwrap();
+        let path = dir.join("conversations.db");
+        let fragment = format!("ghp_{}", crate::secrets::tests::fake(20, 82));
+        {
+            let mut store = ConversationStore::open(&path).unwrap();
+            let mut report = SyncReport::default();
+            sync_claude_roots(&mut store, &[dir.join("projects")], &mut report, &|_| false);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            // What the former reader left: a line cut across a token, on
+            // this turn and on a turn of a source that is not read again.
+            let cut = format!("Bash: {} {}…", "x".repeat(260), fragment);
+            store.conn.execute("UPDATE segments SET text = text || char(10) || ?1 WHERE source_key = 'claude-code:s:u1#actions'", [&cut]).unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO segments (conversation_id, origin_id, source_key, role, at, text, text_hash)
+                     SELECT conversation_id, origin_id, 'cursor:c:b1#actions', 'action', at, ?1, 'old' FROM segments LIMIT 1",
+                    [&cut],
+                )
+                .unwrap();
+            store.conn.execute("DELETE FROM upkeep", []).unwrap();
+        }
+        let mut store = ConversationStore::open(&path).unwrap();
+        let holding: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM segments WHERE instr(text, ?1) > 0", [&fragment], |row| row.get(0))
+            .unwrap();
+        assert_eq!(holding, 0, "the cut lines are gone as soon as the index opens");
+
+        // The session grows: its actions are written again, whole.
+        let more = call("a2", "2026-11-16T17:30:00Z", "gh issue comment 42 --repo vendor/sdk --body 'Logs joints'");
+        std::fs::write(projects.join("s.jsonl"), format!("{}{}", file, more)).unwrap();
+        let mut report = SyncReport::default();
+        sync_claude_roots(&mut store, &[dir.join("projects")], &mut report, &|_| false);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            text_of(&store, "claude-code:s:u1#actions").as_deref(),
+            Some("Bash: gh issue create --repo vendor/sdk --title 'Audio'\nBash: gh issue comment 42 --repo vendor/sdk --body 'Logs joints'")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

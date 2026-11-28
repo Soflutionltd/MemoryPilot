@@ -220,6 +220,11 @@ pub fn group_version(group: &[&SessionFile]) -> String {
     group.iter().map(|file| file.version.as_str()).collect::<Vec<_>>().join("+")
 }
 
+/// How many files a version written by `group_version` stands for.
+pub fn files_in_version(version: &str) -> usize {
+    version.split('+').count()
+}
+
 /// A session read from all its files.
 pub struct MergedSession {
     pub conversation: SourceConversation,

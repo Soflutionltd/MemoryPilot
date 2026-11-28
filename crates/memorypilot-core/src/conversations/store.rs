@@ -113,6 +113,8 @@ impl ConversationStore {
                 _ => {}
             }
         }
+        let mut conn = conn;
+        drop_action_lines_cut_before_masking(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -181,8 +183,9 @@ impl ConversationStore {
         seen: &[u64],
         days_said: &std::collections::BTreeSet<String>,
         today: &str,
+        drop_what_is_gone: bool,
     ) -> Result<usize, String> {
-        self.apply_with(source, true, messages, seen, Some(Whole { days_said, today }))
+        self.apply_with(source, true, messages, seen, Some(Whole { days_said, today, drop_what_is_gone }))
     }
 
     fn apply_with(
@@ -193,6 +196,16 @@ impl ConversationStore {
         seen: &[u64],
         whole: Option<Whole>,
     ) -> Result<usize, String> {
+        // Every writer lands here (Cursor, Claude Code, the archive, the
+        // importers): with a stored credential whose value cannot be read,
+        // a conversation quoting it would be written in clear.
+        let unreadable = secrets::unreadable_credentials();
+        if unreadable > 0 {
+            return Err(format!(
+                "{} stored credential(s) cannot be read (vault key out of reach): their values would not be masked. Nothing was written.",
+                if unreadable == usize::MAX { "The".to_string() } else { unreadable.to_string() }
+            ));
+        }
         // Every source (Cursor, Claude Code, importers) lands here: secrets
         // are masked before anything is hashed, indexed or embedded.
         let redacted = SourceConversation {
@@ -337,7 +350,7 @@ impl ConversationStore {
                 }
                 Role::User => {
                     written += flush(&tx, &current_turn, answer.take(), std::mem::take(&mut previous_kept))?;
-                    written += upsert_actions(&tx, source, &turn_key(&current_turn), actions_at.take(), &std::mem::take(&mut actions))?;
+                    written += upsert_actions(&tx, source, &turn_key(&current_turn), actions_at.take(), &std::mem::take(&mut actions), whole.is_some())?;
                     let key = format!("{}:{}:{}", source.tool, source.origin_id, message.key);
                     let body = text::typed_text(&message.text);
                     if body.chars().count() >= MIN_USER_CHARS {
@@ -348,7 +361,7 @@ impl ConversationStore {
             }
         }
         written += flush(&tx, &current_turn, answer.take(), previous_kept)?;
-        written += upsert_actions(&tx, source, &turn_key(&current_turn), actions_at, &actions)?;
+        written += upsert_actions(&tx, source, &turn_key(&current_turn), actions_at, &actions, whole.is_some())?;
 
         let mut blob = Vec::with_capacity(seen.len() * 8);
         for hash in seen {
@@ -363,8 +376,10 @@ impl ConversationStore {
         .map_err(|error| format!("Origin upsert: {}", error))?;
 
         if let Some(whole) = whole {
-            let kept: std::collections::HashSet<&str> = messages.iter().map(|message| message.key.as_str()).collect();
-            prune_in(&tx, source, &kept)?;
+            if whole.drop_what_is_gone {
+                let kept: std::collections::HashSet<&str> = messages.iter().map(|message| message.key.as_str()).collect();
+                prune_in(&tx, source, &kept)?;
+            }
             super::coverage::forget_silent_days_in(&tx, &source.root_id, whole.days_said, whole.today)?;
         }
         refresh_totals(&tx, &source.root_id)?;
@@ -613,6 +628,9 @@ pub fn project_name(workspace: &str) -> String {
 struct Whole<'a> {
     days_said: &'a std::collections::BTreeSet<String>,
     today: &'a str,
+    /// False when a file of the session has gone since it was last read:
+    /// the messages it alone held are then kept.
+    drop_what_is_gone: bool,
 }
 
 /// Drops the segments of an origin read whole whose message is no longer
@@ -796,31 +814,38 @@ fn delete_segment(tx: &rusqlite::Transaction, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Adds the actions of a turn to the ones already stored for it: a turn
-/// is read in several syncs while it runs.
+/// Writes the actions of a turn. A source read as it grows (Cursor) adds
+/// them to the ones already stored: a turn is read in several syncs while
+/// it runs. A source read whole gives every action of the turn, and
+/// `replace` then drops what was stored: lines written by an earlier
+/// reader are not kept beside the new ones.
 fn upsert_actions(
     tx: &rusqlite::Transaction,
     source: &SourceConversation,
     turn_key: &str,
     at: Option<&str>,
     actions: &[&str],
+    replace: bool,
 ) -> Result<usize, String> {
     if actions.is_empty() {
         return Ok(0);
     }
     let key = format!("{}#actions", turn_key);
-    let mut stored = String::new();
-    for index in 0..MAX_PARTS {
-        let part_key = if index == 0 { key.clone() } else { format!("{}#p{}", key, index + 1) };
-        let part: Option<String> = tx
-            .query_row("SELECT text FROM segments WHERE source_key = ?1", [&part_key], |row| row.get(0))
-            .optional()
-            .map_err(|error| format!("Actions lookup: {}", error))?;
-        let Some(part) = part else { break };
-        stored.push_str(&part);
-        stored.push('\n');
+    let mut lines: Vec<String> = Vec::new();
+    if !replace {
+        let mut stored = String::new();
+        for index in 0..MAX_PARTS {
+            let part_key = if index == 0 { key.clone() } else { format!("{}#p{}", key, index + 1) };
+            let part: Option<String> = tx
+                .query_row("SELECT text FROM segments WHERE source_key = ?1", [&part_key], |row| row.get(0))
+                .optional()
+                .map_err(|error| format!("Actions lookup: {}", error))?;
+            let Some(part) = part else { break };
+            stored.push_str(&part);
+            stored.push('\n');
+        }
+        lines = stored.lines().map(str::to_string).filter(|line| !line.is_empty()).collect();
     }
-    let mut lines: Vec<String> = stored.lines().map(str::to_string).filter(|line| !line.is_empty()).collect();
     for action in actions {
         let action = secrets::redact(action).into_owned();
         if !lines.contains(&action) {
@@ -828,6 +853,50 @@ fn upsert_actions(
         }
     }
     upsert_parts(tx, source, "action", &key, at, &lines.join("\n"), text::MAX_ANSWER_CHARS)
+}
+
+/// Once per index: drops the action segments holding a line cut by the
+/// reader that cut before masking. A secret across the cut stayed there in
+/// clear, too short for the filter to recognise, so no later masking pass
+/// finds it. Sessions read whole write their actions again at the next
+/// sync; a Cursor turn gets them back when its conversation is read again.
+/// Returns how many segments were dropped.
+fn drop_action_lines_cut_before_masking(conn: &mut Connection) -> Result<usize, String> {
+    const DONE: &str = "action-lines-cut-before-masking";
+    let failed = |error: rusqlite::Error| format!("Conversations upkeep: {}", error);
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS upkeep (name TEXT PRIMARY KEY, at TEXT NOT NULL)").map_err(failed)?;
+    let done: Option<String> =
+        conn.query_row("SELECT at FROM upkeep WHERE name = ?1", [DONE], |row| row.get(0)).optional().map_err(failed)?;
+    if done.is_some() {
+        return Ok(0);
+    }
+    let tx = conn.transaction().map_err(failed)?;
+    let cut: Vec<String> = {
+        let mut statement = tx.prepare("SELECT source_key, text FROM segments WHERE role = 'action'").map_err(failed)?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(failed)?;
+        let mut turns = std::collections::BTreeSet::new();
+        for row in rows {
+            let (key, text) = row.map_err(failed)?;
+            if text.lines().any(|line| line.ends_with('…')) {
+                // `turn#actions`, `turn#actions#p2`…: every part of the turn goes.
+                turns.insert(key.split_once("#actions").map(|(turn, _)| format!("{}#actions", turn)).unwrap_or(key));
+            }
+        }
+        turns.into_iter().collect()
+    };
+    let mut dropped = 0;
+    for key in &cut {
+        for part in 0..MAX_PARTS {
+            let part_key = if part == 0 { key.clone() } else { format!("{}#p{}", key, part + 1) };
+            if segment_exists(&tx, &part_key)? {
+                delete_segment(&tx, &part_key)?;
+                dropped += 1;
+            }
+        }
+    }
+    tx.execute("INSERT INTO upkeep (name, at) VALUES (?1, ?2)", params![DONE, chrono::Utc::now().to_rfc3339()]).map_err(failed)?;
+    tx.commit().map_err(failed)?;
+    Ok(dropped)
 }
 
 /// Writes the FTS row and the references of a segment whose old ones
