@@ -338,6 +338,18 @@ No LLM needed — pure regex + keyword heuristics. The AI can still override by 
 
 One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components, and **team members** (auto-detected person entities). Supports `compact: true` for AAAK compression.
 
+## What's new in v4.15
+
+A reliability release, after an independent audit of four areas: no new tool. On the project's deterministic benchmarks (LongMemEval retrieval, the French and the episodic sets) the results are the same as v4.14.1; search and recall differ only where graph expansion used to bring in memories of another project.
+
+- **The embedding model can fail without taking MemoryPilot down**: when it cannot be loaded (no network at first start, a network that never answers, a damaged file), search answers by word matching and says so (`warning`, `confidence.degraded`), memories are stored and get their vector once the model is back. Before, the server stopped and could not open its database again.
+- **The embedding model is pinned and checked**: its files come from one revision, each with a size and a SHA-256; a damaged file is removed and downloaded again by itself.
+- **Automatic updates** (see [Automatic updates](#automatic-updates)): a server stopped by a signal during the probation of an update no longer counts as a crash (three of them rolled a working version back for good); the copy of the database is never deleted before the new one is written; a binary refuses a database written by a newer schema instead of altering it, and a rollback puts the copy from before the update back when the schema had been upgraded; `MEMORYPILOT_AUTO_UPDATE=0` and development builds neither switch nor take part in a probation; a signed manifest older than the latest one seen is ignored; `install.sh` refuses a downloaded binary that is not signed by Soflution.
+- **Memory life cycle**: writes are atomic (a memory and its index entry are written together or not at all), an expired memory is removed everywhere, an archived memory keeps its expiry, a credential is never sealed twice, forgetting a memory removes it from the episodes built on it, and graph neighbours stay inside the project and the kinds asked for.
+- **Conversation finder**: a project, tool or date filter now narrows the search before it is cut (a conversation that matched was missed whenever 300 messages of other projects ranked above it); pages go to the end of the results; a resumed Claude Code session no longer doubles the messages of the one it resumes; a request made of an image alone opens a turn; the action lines of a turn are masked before they are cut (part of a token could stay readable); known secrets are loaded again when a credential is stored, and nothing is indexed while a stored credential cannot be read.
+- **Faster automatic recall**: the `UserPromptSubmit` hook asks the running server instead of loading the models in a new process, and the reranker uses up to four threads. Measured on one machine: 3.3 s before, 1.7 to 2.2 s now, same memories injected.
+- **Release chain**: the test suite runs on Linux before anything is built or published, the release workflow rebuilds the tag it is asked for, and the actions it uses are pinned by commit.
+
 ## What's new in v4.14.1
 
 A security release: no change in behaviour, search results are identical to v4.14.0 on the project's deterministic benchmarks.
@@ -456,7 +468,7 @@ Not updated automatically: Homebrew installs (`brew upgrade memorypilot`), binar
 ```bash
 # Via Cargo, pinned to a release tag — works anywhere Rust runs
 # (unsigned on macOS: Keychain prompt after each update if you store credentials):
-cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.14.1 --bin MemoryPilot
+cargo install --git https://github.com/Soflutionltd/MemoryPilot --tag v4.15.0 --bin MemoryPilot
 
 # Local clone + auto-config (same installer, run from inside the repo):
 git clone https://github.com/Soflutionltd/MemoryPilot.git && cd MemoryPilot && ./install.sh
