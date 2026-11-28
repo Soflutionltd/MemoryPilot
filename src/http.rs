@@ -29,6 +29,10 @@ fn load_or_create_token() -> Result<String, String> {
     use chacha20poly1305::aead::{KeyInit, OsRng};
     let bytes = chacha20poly1305::XChaCha20Poly1305::generate_key(&mut OsRng);
     let token: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    // A new installation has no config folder yet.
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder).map_err(|e| format!("write token: {}", e))?;
+    }
     std::fs::write(&path, &token).map_err(|e| format!("write token: {}", e))?;
     #[cfg(unix)]
     {
