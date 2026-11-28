@@ -46,6 +46,7 @@ def new(args: argparse.Namespace) -> dict:
     return {
         "version": args.version,
         "published_at": now,
+        "issued_at": now,
         "paused": False,
         "rollout": {
             "percent": args.percent,
@@ -64,6 +65,9 @@ def edit(args: argparse.Namespace) -> dict:
     else:
         manifest["paused"] = False
         manifest["rollout"] = {"percent": 100, "full_at": int(time.time())}
+    # Every signed manifest is later than the previous one: an installation
+    # refuses one older than the latest it has seen (replay of a paused rollout).
+    manifest["issued_at"] = max(int(time.time()), manifest.get("issued_at", 0) + 1, manifest.get("published_at", 0) + 1)
     return manifest
 
 

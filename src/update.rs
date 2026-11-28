@@ -63,6 +63,19 @@ struct Manifest {
     #[serde(default)]
     paused: bool,
     assets: HashMap<String, String>,
+    /// Unix time of the release, and of the last change to its rollout
+    /// (pause, resume, full); the latter is absent before v4.15.
+    #[serde(default)]
+    published_at: u64,
+    #[serde(default)]
+    issued_at: u64,
+}
+
+impl Manifest {
+    /// When this manifest was signed: later for every new one.
+    fn signed_at(&self) -> u64 {
+        self.issued_at.max(self.published_at)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,6 +491,10 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
     let _lock = UpdateLock::acquire(&dir)?;
 
     let manifest = fetch_manifest()?;
+    let mut seen = read_state(&dir);
+    if note_manifest(&mut seen, &manifest)? {
+        write_state(&dir, &seen)?;
+    }
     if !is_newer(&manifest.version, VERSION) {
         return Ok(Outcome::UpToDate);
     }
@@ -559,6 +576,19 @@ fn verify_manifest(body: &[u8], signature: &str, public_key: &str) -> Result<Man
         return Err("malformed manifest: version or rollout".into());
     }
     Ok(manifest)
+}
+
+/// A signed manifest older than one this machine has already seen is a
+/// replay: whoever serves the release could bring back a paused rollout or an
+/// earlier version that way. Returns whether `state` changed.
+fn note_manifest(state: &mut UpdateState, manifest: &Manifest) -> Result<bool, String> {
+    let signed_at = manifest.signed_at();
+    if signed_at < state.manifest_seen {
+        return Err("the release manifest is older than one already seen on this machine: ignored".into());
+    }
+    let newer = signed_at > state.manifest_seen;
+    state.manifest_seen = signed_at;
+    Ok(newer)
 }
 
 fn rollout_allows(manifest: &Manifest, bucket: u8, now: u64) -> bool {
@@ -942,6 +972,13 @@ struct UpdateState {
     /// Versions rolled back on this machine: never offered automatically again.
     #[serde(default)]
     rejected: Vec<String>,
+    /// `Manifest::signed_at` of the latest manifest seen here.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    manifest_seen: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1332,7 +1369,7 @@ mod tests {
                 schema_before: None,
             })
         };
-        let mut state = UpdateState { pending: pending(), rejected: vec![] };
+        let mut state = UpdateState { pending: pending(), rejected: vec![], manifest_seen: 0 };
         for crashed in 0..MAX_CRASHED_BOOTS {
             assert_eq!(on_boot(&mut state, "4.12.0", installed, crashed), BootAction::Probation);
         }
@@ -1340,7 +1377,7 @@ mod tests {
         assert_eq!(state.pending, None);
         assert_eq!(state.rejected, vec!["4.12.0".to_string()]);
 
-        let mut other = UpdateState { pending: pending(), rejected: vec![] };
+        let mut other = UpdateState { pending: pending(), rejected: vec![], manifest_seen: 0 };
         // A process still on the previous version leaves the probation alone.
         assert_eq!(on_boot(&mut other, "4.11.1", installed, 5), BootAction::Continue);
         assert_eq!(other.pending, pending());
@@ -1479,6 +1516,26 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_older_than_one_already_seen_is_refused() {
+        let mut manifest = fixture();
+        assert_eq!(manifest.signed_at(), 1_790_000_000);
+        let mut state = UpdateState::default();
+        assert_eq!(note_manifest(&mut state, &manifest), Ok(true));
+        assert_eq!(note_manifest(&mut state, &manifest), Ok(false));
+
+        // The rollout is paused: a later manifest for the same version.
+        manifest.paused = true;
+        manifest.issued_at = 1_790_000_600;
+        assert_eq!(note_manifest(&mut state, &manifest), Ok(true));
+        assert_eq!(state.manifest_seen, 1_790_000_600);
+
+        // Whoever serves the release brings the manifest from before the pause back.
+        let replayed = note_manifest(&mut state, &fixture()).unwrap_err();
+        assert!(replayed.contains("older than one already seen"), "{}", replayed);
+        assert_eq!(state.manifest_seen, 1_790_000_600);
+    }
+
+    #[test]
     fn development_builds_stay_out_of_updates() {
         let installed = Path::new("/Users/someone/.local/bin/MemoryPilot");
         assert_eq!(development_build(installed, false), None);
@@ -1523,6 +1580,7 @@ mod tests {
         let state = UpdateState {
             pending: Some(Pending { from: "4.11.1".into(), to: "4.12.0".into(), exe: None, database: None, backup: None, schema_before: None }),
             rejected: vec!["4.11.5".into()],
+            manifest_seen: 1_790_000_000,
         };
         write_state(&dir.path, &state).unwrap();
         assert_eq!(read_state(&dir.path), state);
