@@ -341,6 +341,7 @@ impl Database {
             .unchecked_transaction()
             .map_err(|e| format!("Tx: {}", e))?;
         let mut count = 0;
+        let mut without_vector: Vec<(String, String)> = Vec::new();
         for (content, kind, project, tags, source) in memories {
             // As any other write: a value is masked, and a text whose value
             // cannot be masked is left to the vault (sealed at next start).
@@ -364,9 +365,12 @@ impl Database {
             let id = Uuid::new_v4().to_string();
             let now = Utc::now().to_rfc3339();
             let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
-            // Without the model the memory is imported all the same: its
-            // vector is computed at the next start.
+            // Without the model the memory is imported all the same, and
+            // handed to the background worker once the import is written.
             let emb_blob = crate::embedding::embed_text(content).ok().map(|emb| crate::embedding::vec_to_blob(&emb));
+            if emb_blob.is_none() {
+                without_vector.push((id.clone(), content.to_string()));
+            }
             tx.execute(
                 "INSERT INTO memories (id,content,kind,project,tags,source,importance,embedding,created_at,updated_at,access_count) VALUES (?1,?2,?3,?4,?5,?6,3,?7,?8,?9,0)",
                 params![id, content, kind, canonical_project.as_deref(), tags_json, source, emb_blob, now, now],
@@ -386,6 +390,9 @@ impl Database {
             count += 1;
         }
         tx.commit().map_err(|e| format!("Commit: {}", e))?;
+        for (id, content) in &without_vector {
+            queue_embedding_job(id, content, content);
+        }
         Ok(count)
     }
 

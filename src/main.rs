@@ -108,6 +108,16 @@ fn main() {
     if args.iter().any(|a| a == "--rollback-update") {
         std::process::exit(hooks::alone_on_agents_updates(|| auto_update::rollback_cli(&args)));
     }
+    // A command run by hand that embeds waits for the model, a first
+    // download included: a server answers by words meanwhile, a command
+    // would only fail.
+    let embeds = args.iter().any(|a| a == "--backfill" || a == "--backfill-force" || a.starts_with("--benchmark") || a == "--index-conversations")
+        && !args.iter().any(|a| a == "--no-embed");
+    if embeds && !memorypilot_core::embedding::is_cached() {
+        if let Err(error) = memorypilot_core::embedding::prefetch() {
+            eprintln!("[MemoryPilot] Embedding model not downloaded: {}", error);
+        }
+    }
     if args.iter().any(|a| a == "--index-conversations") {
         conversations_cli::run_index(&args);
         return;

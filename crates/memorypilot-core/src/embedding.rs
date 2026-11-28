@@ -490,6 +490,19 @@ fn with_prefix(text: &str, prefix: &str) -> String {
     prefixed
 }
 
+/// Whether the last embedding asked for failed.
+static MODEL_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the embedding model was unavailable the last time it was asked:
+/// what a caller that only read results (a recall) tells its reader.
+pub fn model_is_down() -> bool {
+    #[cfg(test)]
+    if outage::is_on() {
+        return true;
+    }
+    MODEL_DOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn embed_prefixed(texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
         return Ok(Vec::new());
@@ -501,12 +514,19 @@ fn embed_prefixed(texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         return Err("embedding model unavailable (test)".to_string());
     }
     let expected = texts.len();
-    let mut pooled = embed_pool().acquire();
-    let vectors = pooled.get().embed(texts)?;
-    if vectors.len() != expected {
-        return Err(format!("embedding returned {} vectors for {} texts", vectors.len(), expected));
+    let embedded = {
+        let mut pooled = embed_pool().acquire();
+        pooled.get().embed(texts)
     }
-    Ok(vectors)
+    .and_then(|vectors| {
+        if vectors.len() == expected {
+            Ok(vectors)
+        } else {
+            Err(format!("embedding returned {} vectors for {} texts", vectors.len(), expected))
+        }
+    });
+    MODEL_DOWN.store(embedded.is_err(), std::sync::atomic::Ordering::Relaxed);
+    embedded
 }
 
 fn embed_one(text: &str, prefix: &str) -> Result<Vec<f32>, String> {
@@ -528,8 +548,19 @@ pub fn embed_text(text: &str) -> Result<Vec<f32>, String> {
     embed_one(text, JINA_DOCUMENT_PREFIX)
 }
 
+/// Whether the files of the active model are in the cache: loading it then
+/// needs no network and takes under a second.
+pub fn is_cached() -> bool {
+    let onnx = selected_model().jina_onnx_file();
+    let repo = hf_hub::Cache::new(fastembed_cache_dir()).model(JINA_REPO.to_string());
+    [onnx.to_string(), format!("{}_data", onnx), "tokenizer.json".to_string()]
+        .iter()
+        .all(|file| repo.get(file).is_some())
+}
+
 /// Downloads the active model's files into the cache (Docker image, first
-/// boot). Does not run inference.
+/// boot, a command that needs the model whatever the wait). Does not run
+/// inference.
 pub fn prefetch() -> Result<(), String> {
     let onnx = selected_model().jina_onnx_file();
     hf_file(JINA_REPO, onnx, true)?;
@@ -675,6 +706,15 @@ mod tests {
 
     fn embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
         super::embed_batch(texts).expect("embedding model")
+    }
+
+    #[test]
+    fn an_engine_that_could_not_load_answers_with_its_reason_until_the_next_try() {
+        let mut engine = Engine::Unavailable("model file missing".to_string(), std::time::Instant::now());
+        assert_eq!(engine.embed(vec!["a text".to_string()]), Err("model file missing".to_string()));
+        // Asked again at once: the same reason, no new load.
+        assert_eq!(engine.embed(vec!["another".to_string()]), Err("model file missing".to_string()));
+        assert!(matches!(engine, Engine::Unavailable(..)));
     }
 
     #[test]

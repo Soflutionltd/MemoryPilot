@@ -7,6 +7,18 @@ const COMPACT_LINE_BYTES: usize = 200;
 /// Id prefix shown on a cut line; `get_memory` accepts it.
 const SHORT_ID_LEN: usize = 8;
 
+/// What a recall was asked.
+#[derive(Clone, Copy)]
+struct RecallRequest<'a> {
+    project: Option<&'a str>,
+    working_dir: Option<&'a str>,
+    hints: Option<&'a str>,
+    mode: RecallMode,
+    explain: bool,
+    compact: bool,
+    scope: &'a MemoryScope,
+}
+
 impl Database {
     pub(super) fn preview_snippet(content: &str) -> String {
         let trimmed = content.trim().replace('\n', " ");
@@ -428,6 +440,8 @@ impl Database {
         }
     }
 
+    /// The context of a session. When its hints were searched without the
+    /// embedding model, the answer says so, as `search_memory` does.
     pub fn recall(
         &self,
         project: Option<&str>,
@@ -438,6 +452,19 @@ impl Database {
         compact: bool,
         scope: &MemoryScope,
     ) -> Result<serde_json::Value, String> {
+        let mut recalled = self.recall_from_store(&RecallRequest { project, working_dir, hints, mode, explain, compact, scope })?;
+        let searched = hints.is_some_and(|hints| !hints.trim().is_empty());
+        if searched && crate::embedding::model_is_down() {
+            recalled["warning"] = serde_json::json!(SearchConfidence::WORDS_ONLY);
+            if let Some(text) = recalled.get("compact").and_then(|compact| compact.as_str()) {
+                recalled["compact"] = serde_json::json!(format!("! {}\n{}", SearchConfidence::WORDS_ONLY, text));
+            }
+        }
+        Ok(recalled)
+    }
+
+    fn recall_from_store(&self, request: &RecallRequest) -> Result<serde_json::Value, String> {
+        let RecallRequest { project, working_dir, hints, mode, explain, compact, scope } = *request;
         // ~4 chars per token — 800 token budget = 3200 chars for memories
         const TOKEN_BUDGET_CHARS: usize = 3200;
         /// Requests without an answer listed at the top of a recall.

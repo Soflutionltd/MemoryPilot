@@ -305,6 +305,29 @@ pub(super) fn store_embedding(conn: &Connection, id: &str, content: &str, blob: 
     .unwrap_or(0)
 }
 
+/// Jobs taken for a batch that could not be embedded go back to the head of
+/// the queue, in their order, ahead of what was queued meanwhile.
+fn put_back_first(queue: &mut Vec<EmbedJob>, jobs: Vec<EmbedJob>) {
+    queue.splice(0..0, jobs);
+}
+
+#[cfg(test)]
+mod requeue_tests {
+    use super::{put_back_first, EmbedJob};
+
+    fn job(id: &str) -> EmbedJob {
+        EmbedJob { id: id.to_string(), content: id.to_string(), embed_text: id.to_string() }
+    }
+
+    #[test]
+    fn a_batch_that_could_not_be_embedded_keeps_its_place_and_order() {
+        let mut queue = vec![job("later-1"), job("later-2")];
+        put_back_first(&mut queue, vec![job("first"), job("second"), job("third")]);
+        let order: Vec<&str> = queue.iter().map(|job| job.id.as_str()).collect();
+        assert_eq!(order, ["first", "second", "third", "later-1", "later-2"]);
+    }
+}
+
 /// With the model unavailable, the queue is left alone for this long: its
 /// memories keep their text and are embedded once the model is back.
 const EMBED_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -370,11 +393,8 @@ fn embed_worker_loop() {
         let embeddings = match crate::embedding::embed_batch(&texts) {
             Ok(embeddings) => embeddings,
             Err(_) => {
-                // Back at the head of the queue, in their order, for the next try.
                 if let Ok(mut queue) = embed_queue().lock() {
-                    for job in jobs.into_iter().rev() {
-                        queue.insert(0, job);
-                    }
+                    put_back_first(&mut queue, jobs);
                 }
                 model_down_since = Some(std::time::Instant::now());
                 backlog = false;

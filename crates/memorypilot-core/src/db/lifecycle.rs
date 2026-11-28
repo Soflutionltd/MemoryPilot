@@ -154,9 +154,10 @@ impl Database {
             return;
         }
         if missing.len() <= SYNC_BACKFILL_MAX {
-            // Without the model the database still opens: these memories
-            // are handed to the background worker, which tries again.
-            if self.backfill_embeddings().is_err() {
+            // Opening a database never waits for a download: a model that
+            // is not on disk, or that fails, leaves these memories to the
+            // background worker, which tries again.
+            if !crate::embedding::is_cached() || self.backfill_embeddings().is_err() {
                 queue_startup_backfill(missing);
             }
             return;
