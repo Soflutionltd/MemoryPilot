@@ -35,5 +35,17 @@ jobs:
         with:
           key: test
 
+      # The tests that search load the embedding model. Fetched here, and
+      # kept between runs: a slow download inside a test goes past the load
+      # deadline and fails tests that have nothing to do with it.
+      - name: Cache the embedding model
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/fastembed
+          key: embedding-model-${{ hashFiles('crates/memorypilot-core/src/embedding.rs') }}
+
+      - name: Fetch the embedding model
+        run: cargo run --locked -p memorypilot-server -- prefetch-models
+
       - name: Test
         run: cargo test --workspace --locked --features http
