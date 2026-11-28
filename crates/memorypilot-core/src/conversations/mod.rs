@@ -142,7 +142,10 @@ fn sync_cursor(
     over_budget: &dyn Fn(&mut SyncReport) -> bool,
 ) -> Result<(), String> {
     let conn = cursor::open(path)?;
-    let mut composers = cursor::list_composers(&conn)?;
+    let (mut composers, unreadable) = cursor::list_composers(&conn)?;
+    if unreadable > 0 {
+        report.skipped.push(format!("{} Cursor conversations could not be read and were left out", unreadable));
+    }
     // Main conversations first, so sub-agents attach to a titled row.
     composers.sort_by_key(|c| c.conversation.origin_id != c.conversation.root_id);
     for composer in &composers {
@@ -162,7 +165,14 @@ fn sync_cursor(
             .filter(|id| seen.binary_search(&hash_key(id)).is_err())
             .cloned()
             .collect();
-        let messages = cursor::read_messages(&conn, composer, &fresh)?;
+        let (messages, unreadable) = cursor::read_messages(&conn, composer, &fresh)?;
+        if !unreadable.is_empty() {
+            report.skipped.push(format!(
+                "Cursor conversation {}: {} messages could not be read and were left out",
+                source.origin_id,
+                unreadable.len()
+            ));
+        }
         // The last turn may still be streaming: its messages stay unseen
         // so the next sync reads their final text. Without a request in
         // the batch, the whole batch continues the stored last turn.
@@ -172,6 +182,8 @@ fn sync_cursor(
             .iter()
             .map(|id| hash_key(id))
             .filter(|hash| !open_turn.contains(hash))
+            // Not marked as read: a later reader may know their form.
+            .filter(|hash| !unreadable.iter().any(|id| hash_key(id) == *hash))
             .collect();
         all_seen.sort_unstable();
         all_seen.dedup();

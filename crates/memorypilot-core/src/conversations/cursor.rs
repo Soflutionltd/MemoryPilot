@@ -120,9 +120,21 @@ struct FullBubble {
 #[derive(Deserialize)]
 struct ToolCall {
     name: Option<String>,
+    #[serde(default, deserialize_with = "text_or_json")]
     params: Option<String>,
-    #[serde(rename = "rawArgs")]
+    #[serde(default, rename = "rawArgs", deserialize_with = "text_or_json")]
     raw_args: Option<String>,
+}
+
+/// Arguments of a tool call: Cursor stores them as a JSON string, some
+/// versions as the JSON itself. Either is read as its text; refusing the
+/// second form dropped the whole message, text included, without a word.
+fn text_or_json<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Ok(match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text),
+        Some(other) => Some(other.to_string()),
+    })
 }
 
 /// Everything said in one composer, at full length.
@@ -270,7 +282,9 @@ pub struct Composer {
 
 /// Every composer, with sub-agent and best-of-N composers pointed at the
 /// conversation the user actually had.
-pub fn list_composers(conn: &Connection) -> Result<Vec<Composer>, String> {
+/// Also returns how many composers could not be read (a form of the data
+/// this reader does not know), so that none is left out without a word.
+pub fn list_composers(conn: &Connection) -> Result<(Vec<Composer>, usize), String> {
     let mut statement = conn
         .prepare("SELECT value FROM cursorDiskKV WHERE key >= 'composerData:' AND key < 'composerData;'")
         .map_err(|error| format!("Cursor composers: {}", error))?;
@@ -279,10 +293,21 @@ pub fn list_composers(conn: &Connection) -> Result<Vec<Composer>, String> {
         .map_err(|error| format!("Cursor composers: {}", error))?;
 
     let mut composers = Vec::new();
+    let mut unreadable = 0;
     let mut parent: HashMap<String, String> = HashMap::new();
     for row in rows {
-        let Ok(Some(value)) = row else { continue };
-        let Ok(data) = serde_json::from_slice::<ComposerData>(&value) else { continue };
+        let value = match row {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        let Ok(data) = serde_json::from_slice::<ComposerData>(&value) else {
+            unreadable += 1;
+            continue;
+        };
         let Some(id) = data.composer_id.clone() else { continue };
         for child in data.subagent_ids.iter().chain(data.sub_ids.iter()) {
             parent.insert(child.clone(), id.clone());
@@ -319,7 +344,7 @@ pub fn list_composers(conn: &Connection) -> Result<Vec<Composer>, String> {
         }
         composer.conversation.root_id = root;
     }
-    Ok(composers)
+    Ok((composers, unreadable))
 }
 
 /// Bubble ids of one composer. Reads keys only (covering index), so it
@@ -340,8 +365,10 @@ pub fn bubble_ids(conn: &Connection, composer_id: &str) -> Result<Vec<String>, S
         .collect())
 }
 
-/// The readable messages among `ids`, in conversation order.
-pub fn read_messages(conn: &Connection, composer: &Composer, ids: &[String]) -> Result<Vec<Message>, String> {
+/// The readable messages among `ids`, in conversation order, and the ids of
+/// the messages that are there but could not be read: those are not marked
+/// as seen, and are reported.
+pub fn read_messages(conn: &Connection, composer: &Composer, ids: &[String]) -> Result<(Vec<Message>, Vec<String>), String> {
     let position: HashMap<&str, usize> = composer
         .header_order
         .iter()
@@ -354,11 +381,23 @@ pub fn read_messages(conn: &Connection, composer: &Composer, ids: &[String]) -> 
         .map_err(|error| format!("Cursor bubble: {}", error))?;
 
     let mut messages = Vec::new();
+    let mut unreadable = Vec::new();
     for id in ids {
         let key = format!("bubbleId:{}:{}", composer.conversation.origin_id, id);
-        let value = statement.query_row([&key], |row| raw_value(row, 0)).ok().flatten();
+        let value = match statement.query_row([&key], |row| raw_value(row, 0)) {
+            Ok(value) => value,
+            // Listed in the conversation, not stored (yet): nothing to read.
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(_) => {
+                unreadable.push(id.clone());
+                continue;
+            }
+        };
         let Some(value) = value else { continue };
-        let Ok(bubble) = serde_json::from_slice::<Bubble>(&value) else { continue };
+        let Ok(bubble) = serde_json::from_slice::<Bubble>(&value) else {
+            unreadable.push(id.clone());
+            continue;
+        };
         let role = match bubble.kind {
             Some(1) => Role::User,
             Some(2) => Role::Assistant,
@@ -396,7 +435,7 @@ pub fn read_messages(conn: &Connection, composer: &Composer, ids: &[String]) -> 
         let rank = |m: &Message| (m.order.unwrap_or(usize::MAX), m.at.clone(), m.key.clone());
         rank(a).cmp(&rank(b))
     });
-    Ok(messages)
+    Ok((messages, unreadable))
 }
 
 /// `cursorDiskKV.value` is declared BLOB but Cursor writes JSON as TEXT.
@@ -425,6 +464,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_arguments_stored_as_json_do_not_drop_the_message() {
+        let dir = std::env::temp_dir().join(format!("memory-pilot-cursor-forms-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("folder");
+        let path = dir.join("state.vscdb");
+        let conn = Connection::open(&path).expect("store");
+        conn.execute_batch("CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB);").expect("table");
+        let put = |key: &str, value: serde_json::Value| {
+            conn.execute("INSERT INTO cursorDiskKV VALUES (?1, ?2)", rusqlite::params![key, value.to_string()]).expect("row");
+        };
+        put(
+            "composerData:c1",
+            serde_json::json!({ "composerId": "c1", "name": "Tickets", "createdAt": 1790000000000i64,
+                "fullConversationHeadersOnly": [{ "bubbleId": "b1" }, { "bubbleId": "b2" }, { "bubbleId": "b3" }] }),
+        );
+        put("composerData:c2", serde_json::json!({ "composerId": "c2", "createdAt": "not a number" }));
+        put("bubbleId:c1:b1", serde_json::json!({ "type": 1, "text": "Ouvre un ticket chez le fournisseur" }));
+        put(
+            "bubbleId:c1:b2",
+            serde_json::json!({ "type": 2, "text": "Le ticket est ouvert.",
+                "toolFormerData": { "name": "run_terminal_cmd", "params": { "command": "curl -X POST https://api.example.com/tickets" } } }),
+        );
+        put("bubbleId:c1:b3", serde_json::json!({ "type": "two", "text": "forme inconnue" }));
+
+        let (composers, unreadable) = list_composers(&conn).expect("composers");
+        assert_eq!((composers.len(), unreadable), (1, 1), "the composer that cannot be read is counted");
+        let ids: Vec<String> = ["b1", "b2", "b3", "b4"].iter().map(|id| id.to_string()).collect();
+        let (messages, unreadable) = read_messages(&conn, &composers[0], &ids).expect("messages");
+        assert_eq!(unreadable, ["b3"], "listed but absent (b4) is not unreadable");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].text, "Le ticket est ouvert.");
+        assert_eq!(messages[1].actions, ["run_terminal_cmd: curl -X POST https://api.example.com/tickets"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_store_under_a_folder_with_accents_and_spaces_opens() {
         let dir = std::env::temp_dir().join(format!("memory-pilot-cursor-é à #-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("folder");
@@ -434,7 +508,7 @@ mod tests {
             .expect("store");
 
         let conn = open_immutable(&path).expect("open");
-        assert!(list_composers(&conn).expect("composers").is_empty());
+        assert!(list_composers(&conn).expect("composers").0.is_empty());
         assert!(conn.execute("INSERT INTO cursorDiskKV VALUES ('k', 'v')", []).is_err(), "nothing can be written");
         let _ = std::fs::remove_dir_all(&dir);
     }

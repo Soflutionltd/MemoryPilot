@@ -69,6 +69,8 @@ pub struct ArchiveReport {
     pub out_dir: String,
     /// `composerData` rows of the store.
     pub composers: usize,
+    /// Rows this reader could not read: conversations left out of the archive.
+    pub unreadable_composers: usize,
     /// Composers holding no message: tabs opened and never used.
     pub empty_composers: usize,
     /// Sub-agent composers filed in their parent conversation.
@@ -116,12 +118,13 @@ pub fn archive_cursor(options: &ArchiveOptions) -> Result<ArchiveReport, String>
         ));
     }
     let conn = cursor::open_immutable(options.store)?;
-    let composers = cursor::list_composers(&conn)?;
+    let (composers, unreadable_composers) = cursor::list_composers(&conn)?;
     let window_folders = cursor::workspace_folders(options.store);
     let mut report = ArchiveReport {
         applied: options.apply,
         out_dir: options.out_dir.to_string_lossy().into_owned(),
         composers: composers.len(),
+        unreadable_composers,
         ..Default::default()
     };
 
