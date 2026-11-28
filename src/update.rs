@@ -53,6 +53,8 @@ const LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 3600);
 static EXECUTABLE: OnceLock<Option<Executable>> = OnceLock::new();
 static RESTART_FAILED: AtomicBool = AtomicBool::new(false);
 static HEALTHY: AtomicBool = AtomicBool::new(false);
+/// Updates this process is installing right now (one at most, see `UpdateLock`).
+static INSTALLING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -241,7 +243,7 @@ fn check_loop() {
 /// from: an update was installed and this process should switch to it.
 /// Never true for a process that must stay as it was started.
 pub fn restart_pending() -> bool {
-    if RESTART_FAILED.load(Ordering::Relaxed) {
+    if RESTART_FAILED.load(Ordering::Relaxed) || INSTALLING.load(Ordering::SeqCst) {
         return false;
     }
     let Some(exe) = executable() else { return false };
@@ -470,6 +472,9 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
         ensure_private_dir(parent)?;
     }
     ensure_private_dir(&dir)?;
+    // Declared first, released last: this process does not switch to the
+    // binary it installs before the lock and the work directory are gone.
+    let _installing = Installing::begin();
     let _lock = UpdateLock::acquire(&dir)?;
 
     let manifest = fetch_manifest()?;
@@ -506,9 +511,11 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
     let backup = backup_database(&data, &manifest.version)?;
     self_test(&new_binary, backup.as_deref(), &work.path)?;
     let schema_before = backup.as_deref().and_then(|copy| schema_version_of(copy).ok());
-    install_binary(&exe.path, &new_binary)?;
 
-    let mut state = read_state(&dir);
+    // The probation is recorded before the binary is replaced: a new binary
+    // in place without it could never be rolled back.
+    let previous = read_state(&dir);
+    let mut state = previous.clone();
     state.pending = Some(Pending {
         from: VERSION.to_string(),
         to: manifest.version.clone(),
@@ -518,6 +525,12 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
         schema_before,
     });
     write_state(&dir, &state)?;
+    if let Err(error) = install_binary(&exe.path, &new_binary) {
+        if let Err(state_error) = write_state(&dir, &previous) {
+            log(state_error);
+        }
+        return Err(error);
+    }
     prune_backups(&memory_backups_dir(&data), BACKUPS_KEPT);
     Ok(Outcome::Installed {
         version: manifest.version,
@@ -922,7 +935,7 @@ fn install_binary(exe: &Path, new_binary: &Path) -> Result<(), String> {
 // Probation and rollback
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 struct UpdateState {
     #[serde(default)]
     pending: Option<Pending>,
@@ -1146,6 +1159,22 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
             .map_err(|error| format!("{}: {}", path.display(), error))?;
     }
     Ok(())
+}
+
+/// Held while this process installs an update: see `restart_pending`.
+struct Installing;
+
+impl Installing {
+    fn begin() -> Self {
+        INSTALLING.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Installing {
+    fn drop(&mut self) {
+        INSTALLING.store(false, Ordering::SeqCst);
+    }
 }
 
 /// One update at a time across every MemoryPilot process of the machine.
@@ -1436,6 +1465,17 @@ mod tests {
             .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().contains("fresh"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn a_process_does_not_switch_while_it_installs() {
+        assert!(!INSTALLING.load(Ordering::SeqCst));
+        {
+            let _installing = Installing::begin();
+            assert!(INSTALLING.load(Ordering::SeqCst));
+            assert!(!restart_pending());
+        }
+        assert!(!INSTALLING.load(Ordering::SeqCst));
     }
 
     #[test]
