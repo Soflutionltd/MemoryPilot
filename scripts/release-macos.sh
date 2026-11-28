@@ -42,8 +42,17 @@ git diff --quiet HEAD || die "uncommitted changes: the asset must be the tag, no
 # time), while the update manifest already published pins the first one:
 # every installed copy would then refuse the update, and the manifest step
 # below would restart a rollout that may have been paused on purpose.
-if gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "latest.json"; then
-	die "${TAG} is already announced to the updater (latest.json is on the release): publish a new version instead"
+if RELEASE_ASSETS="$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' 2>"${TMPDIR:-/tmp}/release-macos.$$")"; then
+	rm -f "${TMPDIR:-/tmp}/release-macos.$$"
+	if echo "$RELEASE_ASSETS" | grep -qx "latest.json"; then
+		die "${TAG} is already announced to the updater (latest.json is on the release): publish a new version instead"
+	fi
+else
+	# No release yet is the normal first run; anything else (network, login)
+	# must not be read as "nothing published".
+	REASON="$(cat "${TMPDIR:-/tmp}/release-macos.$$")"
+	rm -f "${TMPDIR:-/tmp}/release-macos.$$"
+	echo "$REASON" | grep -qi "release not found" || die "cannot read the ${TAG} release: ${REASON}"
 fi
 
 # Nothing is signed, uploaded or announced to the updater from a tag whose

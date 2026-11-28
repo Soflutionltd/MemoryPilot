@@ -127,6 +127,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Archives rebuilt for a tag whose update manifest is already
+          # published would no longer match the digests that manifest signs.
+          if gh release view "${{ steps.tag.outputs.tag }}" --repo "${{ github.repository }}" --json assets -q '.assets[].name' | grep -qx "latest.json"; then
+            echo "::error::${{ steps.tag.outputs.tag }} is already announced to the updater (latest.json is on the release): publish a new version instead"
+            exit 1
+          fi
           if ! gh release view "${{ steps.tag.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release create "${{ steps.tag.outputs.tag }}" \
               --repo "${{ github.repository }}" \
