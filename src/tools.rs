@@ -3024,6 +3024,14 @@ fn handle_project_facts(db: &Database, args: &Value) -> Value {
 mod tests {
     use super::*;
 
+    /// The tool profile is one switch for the whole process: a test that
+    /// flips it, or reads the list it gives, holds this while it does.
+    static TOOL_PROFILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hold_tool_profile() -> std::sync::MutexGuard<'static, ()> {
+        TOOL_PROFILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn text_of(response: &Value) -> Value {
         serde_json::from_str(response["content"][0]["text"].as_str().expect("text")).expect("json")
     }
@@ -3098,6 +3106,7 @@ mod tests {
 
     #[test]
     fn the_admin_tool_is_announced_as_able_to_remove() {
+        let _profile = hold_tool_profile();
         let definitions = tool_definitions();
         let admin = definitions["tools"].as_array().expect("tools").iter().find(|t| t["name"] == "memory_admin").expect("memory_admin");
         assert_eq!(admin["annotations"]["readOnlyHint"], false);
@@ -3195,6 +3204,7 @@ mod tests {
     /// in `memory_admin` lost their hint when the list grew past the limit.
     #[test]
     fn no_tool_description_is_longer_than_what_clients_keep() {
+        let _profile = hold_tool_profile();
         for (profile, full) in [("core", false), ("full", true)] {
             TOOLS_FULL.store(full, std::sync::atomic::Ordering::Relaxed);
             let definitions = tool_definitions();
@@ -3214,6 +3224,7 @@ mod tests {
 
     #[test]
     fn every_admin_action_keeps_a_hint_and_can_be_called() {
+        let _profile = hold_tool_profile();
         TOOLS_FULL.store(false, std::sync::atomic::Ordering::Relaxed);
         let definitions = tool_definitions();
         let admin = definitions["tools"].as_array().expect("tools").iter().find(|tool| tool["name"] == "memory_admin").expect("memory_admin");
