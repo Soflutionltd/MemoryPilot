@@ -112,6 +112,13 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
         }
     }
     let server = Arc::new(server_result.unwrap());
+    // The prompt hook asks this server instead of loading the models again:
+    // it finds the port here.
+    if let Some(path) = memorypilot_core::layout::path(memorypilot_core::layout::Area::State, crate::hooks::SERVER_PORT_FILE) {
+        if let Err(error) = std::fs::write(&path, actual_port.to_string()) {
+            eprintln!("[MemoryPilot] Port not written to {}: {}", path.display(), error);
+        }
+    }
 
     eprintln!(
         "[MemoryPilot] HTTP server listening on http://127.0.0.1:{}",
@@ -167,6 +174,7 @@ pub fn start_http_server(_db: Arc<crate::db::Database>, port: u16) {
                 let response = match (request.method(), route.as_str()) {
                     (&tiny_http::Method::Get, "/health") => handle_health(),
                     (&tiny_http::Method::Post, "/tools/call") => handle_tool_call(&local_db, &mut request),
+                    (&tiny_http::Method::Post, crate::hooks::PROMPT_ROUTE) => handle_prompt_hook(&local_db, &mut request),
                     (&tiny_http::Method::Post, "/mcp") => handle_mcp_post(&local_db, &mut request),
                     (&tiny_http::Method::Get, "/mcp") => handle_mcp_sse(),
                     (&tiny_http::Method::Delete, "/mcp") => handle_mcp_session_delete(),
@@ -200,6 +208,30 @@ fn handle_health() -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     });
     tiny_http::Response::from_string(serde_json::to_string_pretty(&body).unwrap())
         .with_header(content_type_json())
+}
+
+/// The prompt hook of an agent, answered with the models this server has
+/// loaded: `{"context": <text or null>}`.
+#[cfg(feature = "http")]
+fn handle_prompt_hook(
+    db: &crate::db::Database,
+    request: &mut tiny_http::Request,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let mut body = String::new();
+    let payload = request
+        .as_reader()
+        .read_to_string(&mut body)
+        .map_err(|error| format!("Failed to read body: {}", error))
+        .and_then(|_| serde_json::from_str::<serde_json::Value>(&body).map_err(|error| format!("Invalid JSON: {}", error)));
+    match payload {
+        Ok(payload) => {
+            let answer = serde_json::json!({ "context": crate::hooks::prompt_context_in(db, &payload) });
+            tiny_http::Response::from_string(answer.to_string()).with_header(content_type_json())
+        }
+        Err(error) => tiny_http::Response::from_string(serde_json::json!({ "error": error }).to_string())
+            .with_status_code(400)
+            .with_header(content_type_json()),
+    }
 }
 
 #[cfg(feature = "http")]

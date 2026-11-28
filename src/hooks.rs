@@ -33,6 +33,7 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Hard cap on the context injected at session start (~2k tokens).
 const MAX_CONTEXT_CHARS: usize = 8000;
@@ -446,15 +447,86 @@ fn load_seen(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Route of the running HTTP server that answers a prompt hook.
+pub(crate) const PROMPT_ROUTE: &str = "/hooks/user-prompt";
+/// File of the state folder where the running HTTP server writes its port.
+pub(crate) const SERVER_PORT_FILE: &str = "http.port";
+/// A local server that is there accepts the connection at once.
+const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+/// Below the 10 s the agents give a prompt hook.
+const SERVER_ANSWER_TIMEOUT: Duration = Duration::from_secs(8);
+/// A failure after this long leaves no time to search again in this process.
+const SERVER_FALLBACK_WINDOW: Duration = Duration::from_secs(1);
+
+/// What the running server said of a prompt.
+enum ServerAnswer {
+    /// It searched: its context, or none.
+    Answered(Option<String>),
+    /// No server, or not one that knows the route: search in this process.
+    Unreachable,
+    /// It was asked and failed too late to search again.
+    Failed,
+}
+
+/// Asks the HTTP server of this installation, when one runs: its models are
+/// loaded, a process started for one prompt loads them again.
+fn ask_running_server(payload: &Value) -> ServerAnswer {
+    // A test or a trial on its own database is not what the server holds.
+    if std::env::var("MEMORYPILOT_DB").is_ok_and(|path| !path.trim().is_empty()) {
+        return ServerAnswer::Unreachable;
+    }
+    let read = |area, name| memorypilot_core::layout::path(area, name).and_then(|path| std::fs::read_to_string(path).ok());
+    let Some(port) = read(memorypilot_core::layout::Area::State, SERVER_PORT_FILE).and_then(|raw| raw.trim().parse::<u16>().ok()) else {
+        return ServerAnswer::Unreachable;
+    };
+    let Some(token) = read(memorypilot_core::layout::Area::Config, "http.token").map(|raw| raw.trim().to_string()).filter(|token| !token.is_empty()) else {
+        return ServerAnswer::Unreachable;
+    };
+    ask_server_at(port, &token, payload)
+}
+
+fn ask_server_at(port: u16, token: &str, payload: &Value) -> ServerAnswer {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(SERVER_CONNECT_TIMEOUT))
+        .timeout_global(Some(SERVER_ANSWER_TIMEOUT))
+        .build()
+        .into();
+    let asked = std::time::Instant::now();
+    let answer = agent
+        .post(format!("http://127.0.0.1:{}{}", port, PROMPT_ROUTE))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .send(payload.to_string())
+        .map_err(|error| error.to_string())
+        .and_then(|mut response| response.body_mut().read_to_string().map_err(|error| error.to_string()))
+        .and_then(|body| serde_json::from_str::<Value>(&body).map_err(|error| error.to_string()))
+        .and_then(|body| match body.get("context") {
+            Some(Value::String(context)) => Ok(Some(context.clone())),
+            Some(Value::Null) => Ok(None),
+            _ => Err("answer without a context field".to_string()),
+        });
+    match answer {
+        Ok(context) => ServerAnswer::Answered(context),
+        Err(error) if asked.elapsed() < SERVER_FALLBACK_WINDOW => {
+            log(&format!("user-prompt: server on port {} not used ({}), searching here", port, error));
+            ServerAnswer::Unreachable
+        }
+        Err(error) => {
+            log(&format!("user-prompt: server on port {} failed after {} ms: {}", port, asked.elapsed().as_millis(), error));
+            ServerAnswer::Failed
+        }
+    }
+}
+
 /// Memories that answer the prompt the user just sent, or `None`: no topic
 /// in the prompt, nothing the ranker trusts, or all of it already injected.
 fn prompt_context(payload: &Value) -> Option<String> {
-    let query = prompt_query(&str_field(payload, "prompt")?)?;
-    let seen_path = conversation_id(payload).map(|session| prompt_seen_path(&session));
-    let mut seen = seen_path.as_deref().map(load_seen).unwrap_or_default();
-    let budget = session_budget_left(seen.len());
-    if budget == 0 {
-        return None;
+    // No topic: no search, here or in the server.
+    prompt_query(&str_field(payload, "prompt")?)?;
+    match ask_running_server(payload) {
+        ServerAnswer::Answered(context) => return context,
+        ServerAnswer::Failed => return None,
+        ServerAnswer::Unreachable => {}
     }
     let db = match open_db() {
         Ok(db) => db,
@@ -463,6 +535,19 @@ fn prompt_context(payload: &Value) -> Option<String> {
             return None;
         }
     };
+    prompt_context_in(&db, payload)
+}
+
+/// [`prompt_context`] on an open database: this process's, or the one a
+/// worker of the HTTP server holds.
+pub(crate) fn prompt_context_in(db: &Database, payload: &Value) -> Option<String> {
+    let query = prompt_query(&str_field(payload, "prompt")?)?;
+    let seen_path = conversation_id(payload).map(|session| prompt_seen_path(&session));
+    let mut seen = seen_path.as_deref().map(load_seen).unwrap_or_default();
+    let budget = session_budget_left(seen.len());
+    if budget == 0 {
+        return None;
+    }
     let project = first_workspace_root(payload).and_then(|dir| db.detect_project(&dir).ok().flatten());
     let (results, confidence) = match db.search_at(chrono::Utc::now(), &query, PROMPT_SEARCH_LIMIT, None, None, None, None) {
         Ok(found) => found,
@@ -1127,6 +1212,76 @@ mod tests {
         drop(lock);
         assert!(path.exists(), "another owner's lock is left alone");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A one-request HTTP server on a free local port, answering `status`
+    /// and `body`; returns its port and what it received.
+    fn one_answer_server(status: &'static str, body: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Headers, then the body its Content-Length announces.
+            loop {
+                let read = stream.read(&mut chunk).expect("read");
+                received.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&received).to_string();
+                if let Some((head, sent)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|value| value.trim().parse::<usize>().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if sent.len() >= length {
+                        break;
+                    }
+                }
+                if read == 0 {
+                    break;
+                }
+            }
+            let answer = format!("HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, body.len(), body);
+            stream.write_all(answer.as_bytes()).expect("write");
+            String::from_utf8_lossy(&received).to_string()
+        });
+        (port, served)
+    }
+
+    #[test]
+    fn the_running_server_answers_the_prompt_hook() {
+        let payload = json!({ "prompt": "how is the update server deployed", "session_id": "s1" });
+
+        let (port, served) = one_answer_server("200 OK", r#"{"context":"Relevant memories"}"#);
+        assert!(matches!(ask_server_at(port, "secret-token", &payload), ServerAnswer::Answered(Some(context)) if context == "Relevant memories"));
+        let received = served.join().expect("server");
+        assert!(received.starts_with(&format!("POST {} ", PROMPT_ROUTE)), "{received}");
+        assert!(received.to_ascii_lowercase().contains("authorization: bearer secret-token"), "{received}");
+        assert!(received.contains("how is the update server deployed"), "the payload goes as it came: {received}");
+
+        let (port, served) = one_answer_server("200 OK", r#"{"context":null}"#);
+        assert!(matches!(ask_server_at(port, "secret-token", &payload), ServerAnswer::Answered(None)), "nothing to inject is an answer, not a failure");
+        served.join().expect("server");
+    }
+
+    #[test]
+    fn a_server_that_cannot_answer_leaves_the_search_to_this_process() {
+        let payload = json!({ "prompt": "how is the update server deployed", "session_id": "s1" });
+
+        // An older server without the route, a refused token, an answer of another shape.
+        for (status, body) in [("404 Not Found", r#"{"error":"Not found"}"#), ("401 Unauthorized", r#"{"error":"unauthorized"}"#), ("200 OK", r#"{"status":"ok"}"#)] {
+            let (port, served) = one_answer_server(status, body);
+            assert!(matches!(ask_server_at(port, "secret-token", &payload), ServerAnswer::Unreachable), "{status} {body}");
+            served.join().expect("server");
+        }
+
+        // Nothing listens on the port the file names (a server that stopped).
+        let free_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        assert!(matches!(ask_server_at(free_port, "secret-token", &payload), ServerAnswer::Unreachable));
     }
 
     #[test]
