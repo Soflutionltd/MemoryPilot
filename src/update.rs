@@ -46,6 +46,8 @@ const PROBATION: Duration = Duration::from_secs(120);
 const MAX_CRASHED_BOOTS: usize = 3;
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BACKUPS_KEPT: usize = 3;
+/// Start of the name of a database copy still being written.
+const PARTIAL_BACKUP_PREFIX: &str = ".partial-memory-before-v";
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 3600);
 
 static EXECUTABLE: OnceLock<Option<Executable>> = OnceLock::new();
@@ -588,6 +590,10 @@ fn reports_version(binary: &Path, version: &str) -> bool {
 
 /// Copy of `memory.db` taken before the new version touches it, kept in
 /// `~/.MemoryPilot/backups/memory/` (owner only). `None` on a fresh install.
+///
+/// The copy is written under a temporary name and only takes its final name
+/// once complete, and it never replaces an earlier copy made for the same
+/// version: a failed attempt leaves the earlier copies as they were.
 fn backup_database(data: &Path, version: &str) -> Result<Option<PathBuf>, String> {
     let live = memorypilot_core::layout::path_in(data, memorypilot_core::layout::Area::Data, "memory.db");
     if !live.is_file() {
@@ -598,29 +604,63 @@ fn backup_database(data: &Path, version: &str) -> Result<Option<PathBuf>, String
         ensure_private_dir(parent)?;
     }
     ensure_private_dir(&backups)?;
-    let target = backups.join(format!("memory-before-v{}.db", version));
-    let _ = fs::remove_file(&target);
-    let conn = rusqlite::Connection::open_with_flags(&live, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+    let partial = backups.join(format!("{}{}.{}", PARTIAL_BACKUP_PREFIX, version, std::process::id()));
+    let _ = fs::remove_file(&partial);
+    if let Err(error) = copy_database(&live, &partial) {
+        let _ = fs::remove_file(&partial);
+        return Err(error);
+    }
+    let target = unused_backup_path(&backups, version);
+    fs::rename(&partial, &target).map_err(|error| {
+        let _ = fs::remove_file(&partial);
+        format!("database backup to {}: {}", target.display(), error)
+    })?;
+    Ok(Some(target))
+}
+
+fn copy_database(live: &Path, target: &Path) -> Result<(), String> {
+    let conn = rusqlite::Connection::open_with_flags(live, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|error| format!("open {} for backup: {}", live.display(), error))?;
     conn.busy_timeout(Duration::from_secs(10))
         .map_err(|error| format!("backup busy timeout: {}", error))?;
     let target_text = target.to_string_lossy().into_owned();
     conn.execute("VACUUM INTO ?1", [target_text.as_str()])
         .map_err(|error| format!("database backup to {}: {}", target.display(), error))?;
-    restrict_to_owner(&target)?;
-    Ok(Some(target))
+    restrict_to_owner(target)
 }
 
+/// `memory-before-v<version>.db`, or the same name with the time of the copy
+/// when an earlier attempt at this version already left one.
+fn unused_backup_path(backups: &Path, version: &str) -> PathBuf {
+    let first = backups.join(format!("memory-before-v{}.db", version));
+    if !first.exists() {
+        return first;
+    }
+    let now = unix_now();
+    (0u32..)
+        .map(|attempt| backups.join(format!("memory-before-v{}-{}.db", version, now + u64::from(attempt))))
+        .find(|path| !path.exists())
+        .unwrap_or(first)
+}
+
+/// Keeps the `keep` latest copies and removes the unfinished ones left by
+/// update attempts whose process is gone.
 fn prune_backups(dir: &Path, keep: usize) {
     let Ok(entries) = fs::read_dir(dir) else { return };
-    let mut backups: Vec<(SystemTime, PathBuf)> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            name.starts_with("memory-before-v") && name.ends_with(".db")
-        })
-        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
-        .collect();
+    let mut backups: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix(PARTIAL_BACKUP_PREFIX) {
+            let owner = rest.rsplit('.').next().and_then(|pid| pid.parse::<u32>().ok());
+            if owner.is_none_or(|pid| !process_alive(pid)) {
+                let _ = fs::remove_file(entry.path());
+            }
+        } else if name.starts_with("memory-before-v") && name.ends_with(".db") {
+            if let Some(modified) = entry.metadata().ok().and_then(|meta| meta.modified().ok()) {
+                backups.push((modified, entry.path()));
+            }
+        }
+    }
     backups.sort_by(|left, right| right.0.cmp(&left.0));
     for (_, path) in backups.into_iter().skip(keep) {
         let _ = fs::remove_file(path);
@@ -1147,6 +1187,51 @@ mod tests {
         left.sort();
         assert_eq!(left, vec!["memory-before-v9.0.1.db", "memory-before-v9.0.2.db", "memory-before-v9.0.3.db"]);
         assert_eq!(backup_database(&data.path.join("absent"), "9.0.0").unwrap(), None);
+    }
+
+    #[test]
+    fn failed_backup_keeps_the_earlier_copy_and_a_second_one_never_replaces_it() {
+        let data = PrivateDir::create().unwrap();
+        let live = data.path.join("memory.db");
+        let conn = rusqlite::Connection::open(&live).unwrap();
+        conn.execute_batch("CREATE TABLE memories (id TEXT); INSERT INTO memories VALUES ('a');")
+            .unwrap();
+        let first = backup_database(&data.path, "9.1.0").unwrap().unwrap();
+        conn.execute_batch("INSERT INTO memories VALUES ('b');").unwrap();
+        drop(conn);
+
+        let second = backup_database(&data.path, "9.1.0").unwrap().unwrap();
+        assert_ne!(first, second);
+        let rows = |path: &Path| -> i64 {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!((rows(&first), rows(&second)), (1, 2));
+
+        fs::write(&live, b"this is not a database any more, whatever happened to the disk").unwrap();
+        assert!(backup_database(&data.path, "9.1.0").is_err());
+        assert_eq!((rows(&first), rows(&second)), (1, 2));
+        let unfinished = fs::read_dir(memory_backups_dir(&data.path))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().starts_with(PARTIAL_BACKUP_PREFIX))
+            .count();
+        assert_eq!(unfinished, 0);
+    }
+
+    #[test]
+    fn unfinished_copies_of_dead_updates_are_removed() {
+        let data = PrivateDir::create().unwrap();
+        let backups = memory_backups_dir(&data.path);
+        fs::create_dir_all(&backups).unwrap();
+        let dead = backups.join(format!("{}9.2.0.{}", PARTIAL_BACKUP_PREFIX, 0x7fff_fff0u32));
+        let running = backups.join(format!("{}9.2.0.{}", PARTIAL_BACKUP_PREFIX, std::process::id()));
+        fs::write(&dead, b"half").unwrap();
+        fs::write(&running, b"half").unwrap();
+        prune_backups(&backups, BACKUPS_KEPT);
+        assert!(!dead.exists());
+        assert!(running.exists());
     }
 
     #[test]
