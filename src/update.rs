@@ -149,6 +149,7 @@ pub fn startup_guard() {
     }
     let Some(dir) = update_dir() else { return };
     let mut state = read_state(&dir);
+    let on_probation = state.pending.clone();
     let action = on_boot(&mut state, VERSION, &exe.path, crashed_boots(&dir, VERSION));
     if let Err(error) = write_state(&dir, &state) {
         log(error);
@@ -160,6 +161,9 @@ pub fn startup_guard() {
                 log(error);
             }
             clear_boot_marker_on_signals();
+            if let Some(pending) = on_probation.as_ref() {
+                refresh_backup_before_upgrade(pending, memorypilot_core::db::SCHEMA_VERSION);
+            }
         }
         BootAction::RollBack => {
             remove_boot_markers(&dir, VERSION);
@@ -168,6 +172,24 @@ pub fn startup_guard() {
                 VERSION, MAX_CRASHED_BOOTS
             ));
             let old = old_binary(&exe.path);
+            if !old.is_file() {
+                log(format!("cannot restore {}: file missing", old.display()));
+                return;
+            }
+            if let (Some(pending), Some(root)) = (on_probation.as_ref(), data_dir()) {
+                match restore_database_before(pending, &memory_backups_dir(&root)) {
+                    Ok(Some(aside)) => log(format!(
+                        "the database v{} upgraded is kept as {}; the copy taken before the update is back in place",
+                        pending.to,
+                        aside.display()
+                    )),
+                    Ok(None) => {}
+                    Err(error) => log(format!(
+                        "the database stays as v{} left it ({}): the previous version may refuse to open it",
+                        pending.to, error
+                    )),
+                }
+            }
             if let Err(error) = fs::rename(&old, &exe.path) {
                 log(format!("cannot restore {}: {}", old.display(), error));
                 return;
@@ -483,6 +505,7 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
     }
     let backup = backup_database(&data, &manifest.version)?;
     self_test(&new_binary, backup.as_deref(), &work.path)?;
+    let schema_before = backup.as_deref().and_then(|copy| schema_version_of(copy).ok());
     install_binary(&exe.path, &new_binary)?;
 
     let mut state = read_state(&dir);
@@ -490,6 +513,9 @@ fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
         from: VERSION.to_string(),
         to: manifest.version.clone(),
         exe: Some(exe.path.clone()),
+        database: backup.as_ref().map(|_| live_database(&data)),
+        backup: backup.clone(),
+        schema_before,
     });
     write_state(&dir, &state)?;
     prune_backups(&memory_backups_dir(&data), BACKUPS_KEPT);
@@ -652,7 +678,7 @@ fn reports_version(binary: &Path, version: &str) -> bool {
 /// once complete, and it never replaces an earlier copy made for the same
 /// version: a failed attempt leaves the earlier copies as they were.
 fn backup_database(data: &Path, version: &str) -> Result<Option<PathBuf>, String> {
-    let live = memorypilot_core::layout::path_in(data, memorypilot_core::layout::Area::Data, "memory.db");
+    let live = live_database(data);
     if !live.is_file() {
         return Ok(None);
     }
@@ -675,6 +701,102 @@ fn backup_database(data: &Path, version: &str) -> Result<Option<PathBuf>, String
     Ok(Some(target))
 }
 
+fn live_database(data: &Path) -> PathBuf {
+    memorypilot_core::layout::path_in(data, memorypilot_core::layout::Area::Data, "memory.db")
+}
+
+fn schema_version_of(database: &Path) -> Result<i32, String> {
+    let conn = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("open {}: {}", database.display(), error))?;
+    conn.busy_timeout(Duration::from_secs(10))
+        .map_err(|error| format!("busy timeout: {}", error))?;
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| format!("schema version of {}: {}", database.display(), error))
+}
+
+/// First start of a version on probation that is about to upgrade the schema:
+/// the copy taken at install time is replaced by one taken now, so that a
+/// rollback loses nothing the previous version wrote in between. Skipped once
+/// the schema has moved (the copy must stay the one from before).
+fn refresh_backup_before_upgrade(pending: &Pending, schema_of_this_binary: i32) {
+    let (Some(live), Some(backup), Some(before)) =
+        (pending.database.as_deref(), pending.backup.as_deref(), pending.schema_before)
+    else {
+        return;
+    };
+    if before >= schema_of_this_binary || schema_version_of(live).ok() != Some(before) {
+        return;
+    }
+    let fresh = backup.with_extension(format!("db.fresh-{}", std::process::id()));
+    let _ = fs::remove_file(&fresh);
+    let copied = copy_database(live, &fresh).and_then(|()| schema_version_of(&fresh));
+    if copied == Ok(before) && fs::rename(&fresh, backup).is_ok() {
+        return;
+    }
+    let _ = fs::remove_file(&fresh);
+    if let Err(error) = copied {
+        log(format!("copy before the schema upgrade not refreshed: {}", error));
+    }
+}
+
+/// Rollback of a version that upgraded the schema: the previous binary cannot
+/// read that database. It is moved aside, untouched, next to the other copies
+/// and the copy taken before the update takes its place. Returns where the
+/// upgraded database went, `None` when the schema did not move.
+fn restore_database_before(pending: &Pending, backups: &Path) -> Result<Option<PathBuf>, String> {
+    let (Some(live), Some(backup), Some(before)) =
+        (pending.database.as_deref(), pending.backup.as_deref(), pending.schema_before)
+    else {
+        return Ok(None);
+    };
+    if !live.is_file() || schema_version_of(live)? <= before {
+        return Ok(None);
+    }
+    if schema_version_of(backup)? != before {
+        return Err(format!("{} is not the copy from before the update", backup.display()));
+    }
+    let staged = live.with_extension(format!("db.restore-{}", std::process::id()));
+    let _ = fs::remove_file(&staged);
+    fs::copy(backup, &staged).map_err(|error| format!("copy {}: {}", backup.display(), error))?;
+    restrict_to_owner(&staged)?;
+
+    ensure_private_dir(backups)?;
+    let aside = unused_path(backups, &format!("memory-upgraded-by-v{}", pending.to));
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for suffix in DATABASE_FILE_SUFFIXES {
+        let from = with_suffix(live, suffix);
+        if !from.exists() {
+            continue;
+        }
+        let to = with_suffix(&aside, suffix);
+        if let Err(error) = fs::rename(&from, &to) {
+            for (from, to) in moved.iter().rev() {
+                let _ = fs::rename(to, from);
+            }
+            let _ = fs::remove_file(&staged);
+            return Err(format!("move {} aside: {}", from.display(), error));
+        }
+        moved.push((from, to));
+    }
+    if let Err(error) = fs::rename(&staged, live) {
+        for (from, to) in moved.iter().rev() {
+            let _ = fs::rename(to, from);
+        }
+        let _ = fs::remove_file(&staged);
+        return Err(format!("put {} back: {}", backup.display(), error));
+    }
+    Ok(Some(aside))
+}
+
+/// The database file and what SQLite and the vector index keep next to it.
+const DATABASE_FILE_SUFFIXES: [&str; 5] = ["", "-wal", "-shm", ".ann.usearch", ".ann.usearch.keys.json"];
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 fn copy_database(live: &Path, target: &Path) -> Result<(), String> {
     let conn = rusqlite::Connection::open_with_flags(live, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|error| format!("open {} for backup: {}", live.display(), error))?;
@@ -689,13 +811,18 @@ fn copy_database(live: &Path, target: &Path) -> Result<(), String> {
 /// `memory-before-v<version>.db`, or the same name with the time of the copy
 /// when an earlier attempt at this version already left one.
 fn unused_backup_path(backups: &Path, version: &str) -> PathBuf {
-    let first = backups.join(format!("memory-before-v{}.db", version));
+    unused_path(backups, &format!("memory-before-v{}", version))
+}
+
+/// `<stem>.db` in `dir`, or `<stem>-<unix time>.db` when that name is taken.
+fn unused_path(dir: &Path, stem: &str) -> PathBuf {
+    let first = dir.join(format!("{}.db", stem));
     if !first.exists() {
         return first;
     }
     let now = unix_now();
     (0u32..)
-        .map(|attempt| backups.join(format!("memory-before-v{}-{}.db", version, now + u64::from(attempt))))
+        .map(|attempt| dir.join(format!("{}-{}.db", stem, now + u64::from(attempt))))
         .find(|path| !path.exists())
         .unwrap_or(first)
 }
@@ -804,13 +931,22 @@ struct UpdateState {
     rejected: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Pending {
     from: String,
     to: String,
     /// The binary that was replaced. Absent in a state written before v4.15.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exe: Option<PathBuf>,
+    /// The database that was copied before the update, the copy, and the
+    /// schema version both had: what a rollback needs to put the copy back
+    /// if the new version upgraded the schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    database: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema_before: Option<i32>,
 }
 
 impl Pending {
@@ -1162,6 +1298,9 @@ mod tests {
                 from: "4.11.1".into(),
                 to: "4.12.0".into(),
                 exe: Some(installed.to_path_buf()),
+                database: None,
+                backup: None,
+                schema_before: None,
             })
         };
         let mut state = UpdateState { pending: pending(), rejected: vec![] };
@@ -1195,6 +1334,108 @@ mod tests {
         let mut state = old;
         let anywhere = Path::new("/usr/local/bin/MemoryPilot");
         assert_eq!(on_boot(&mut state, "4.15.0", anywhere, MAX_CRASHED_BOOTS), BootAction::RollBack);
+    }
+
+    fn database_at(path: &Path, version: i32, ids: &[&str]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(&format!("CREATE TABLE memories (id TEXT); PRAGMA user_version = {};", version))
+            .unwrap();
+        for id in ids {
+            conn.execute("INSERT INTO memories VALUES (?1)", [id]).unwrap();
+        }
+    }
+
+    fn ids_in(path: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut statement = conn.prepare("SELECT id FROM memories ORDER BY id").unwrap();
+        let rows = statement.query_map([], |row| row.get(0)).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    fn pending_with_database(data: &Path, before: i32) -> Pending {
+        let backup = backup_database(data, "9.5.0").unwrap().unwrap();
+        Pending {
+            from: "9.4.0".into(),
+            to: "9.5.0".into(),
+            exe: None,
+            database: Some(live_database(data)),
+            backup: Some(backup),
+            schema_before: Some(before),
+        }
+    }
+
+    #[test]
+    fn rollback_puts_the_copy_back_when_the_schema_was_upgraded() {
+        let data = PrivateDir::create().unwrap();
+        let live = live_database(&data.path);
+        database_at(&live, 2, &["a"]);
+        let pending = pending_with_database(&data.path, 2);
+        let backups = memory_backups_dir(&data.path);
+
+        // Same schema: nothing to restore, the database keeps what was added.
+        rusqlite::Connection::open(&live).unwrap().execute("INSERT INTO memories VALUES ('b')", []).unwrap();
+        assert_eq!(restore_database_before(&pending, &backups).unwrap(), None);
+        assert_eq!(ids_in(&live), vec!["a", "b"]);
+
+        // The new version upgraded the schema before crashing.
+        rusqlite::Connection::open(&live)
+            .unwrap()
+            .execute_batch("ALTER TABLE memories ADD COLUMN next TEXT; PRAGMA user_version = 3;")
+            .unwrap();
+        fs::write(with_suffix(&live, ".ann.usearch"), b"index of the upgraded database").unwrap();
+        let aside = restore_database_before(&pending, &backups).unwrap().unwrap();
+        assert_eq!(schema_version_of(&live).unwrap(), 2);
+        assert_eq!(ids_in(&live), vec!["a"]);
+        assert_eq!(schema_version_of(&aside).unwrap(), 3);
+        assert_eq!(ids_in(&aside), vec!["a", "b"]);
+        assert!(!with_suffix(&live, ".ann.usearch").exists());
+        assert!(with_suffix(&aside, ".ann.usearch").exists());
+        // The copies used by a later rollback are untouched and not pruned.
+        prune_backups(&backups, 0);
+        assert!(aside.exists());
+    }
+
+    #[test]
+    fn rollback_refuses_a_copy_that_is_not_from_before_the_update() {
+        let data = PrivateDir::create().unwrap();
+        let live = live_database(&data.path);
+        database_at(&live, 3, &["a"]);
+        let mut pending = pending_with_database(&data.path, 3);
+        pending.schema_before = Some(2);
+        let error = restore_database_before(&pending, &memory_backups_dir(&data.path)).unwrap_err();
+        assert!(error.contains("not the copy from before"), "{}", error);
+        assert_eq!(schema_version_of(&live).unwrap(), 3);
+        assert_eq!(ids_in(&live), vec!["a"]);
+    }
+
+    #[test]
+    fn the_copy_is_refreshed_just_before_the_schema_upgrade_and_never_after() {
+        let data = PrivateDir::create().unwrap();
+        let live = live_database(&data.path);
+        database_at(&live, 2, &["a"]);
+        let pending = pending_with_database(&data.path, 2);
+        let backup = pending.backup.clone().unwrap();
+
+        // Written by the previous version between the install and the switch.
+        rusqlite::Connection::open(&live).unwrap().execute("INSERT INTO memories VALUES ('b')", []).unwrap();
+        refresh_backup_before_upgrade(&pending, 2);
+        assert_eq!(ids_in(&backup), vec!["a"], "no upgrade ahead: the copy is left alone");
+        refresh_backup_before_upgrade(&pending, 3);
+        assert_eq!(ids_in(&backup), vec!["a", "b"]);
+        assert_eq!(schema_version_of(&backup).unwrap(), 2);
+
+        rusqlite::Connection::open(&live)
+            .unwrap()
+            .execute_batch("INSERT INTO memories VALUES ('c'); PRAGMA user_version = 3;")
+            .unwrap();
+        refresh_backup_before_upgrade(&pending, 3);
+        assert_eq!(ids_in(&backup), vec!["a", "b"], "an upgraded database never replaces the copy");
+        let leftovers = fs::read_dir(memory_backups_dir(&data.path))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().contains("fresh"))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]
@@ -1240,7 +1481,7 @@ mod tests {
         let dir = PrivateDir::create().unwrap();
         assert_eq!(read_state(&dir.path), UpdateState::default());
         let state = UpdateState {
-            pending: Some(Pending { from: "4.11.1".into(), to: "4.12.0".into(), exe: None }),
+            pending: Some(Pending { from: "4.11.1".into(), to: "4.12.0".into(), exe: None, database: None, backup: None, schema_before: None }),
             rejected: vec!["4.11.5".into()],
         };
         write_state(&dir.path, &state).unwrap();
