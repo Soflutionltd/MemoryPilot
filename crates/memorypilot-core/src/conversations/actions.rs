@@ -36,11 +36,15 @@ fn is_quiet(name: &str) -> bool {
     QUIET.contains(&short.as_str()) || QUIET_PREFIXES.iter().any(|prefix| short.starts_with(prefix))
 }
 
+/// The text on one line, secrets masked, cut at `max` characters. Masked
+/// before the cut: a secret that straddles it would otherwise stay in clear,
+/// too short for the filter to recognise once the line is stored.
 fn one_line(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = crate::secrets::redact(&flat);
     match flat.char_indices().nth(max) {
         Some((index, _)) => format!("{}…", &flat[..index]),
-        None => flat,
+        None => flat.into_owned(),
     }
 }
 
@@ -130,6 +134,21 @@ mod tests {
         assert!(action_line("mcp__browser__get_page_text", &json!({ "url": "https://status.example.com/" })).is_some());
         let long = action_line("Bash", &json!({ "command": "echo ".repeat(200) })).expect("line");
         assert!(long.chars().count() <= MAX_ACTION_CHARS + "Bash: …".chars().count());
+    }
+
+    #[test]
+    fn a_secret_across_the_cut_is_masked_whole() {
+        let token = format!("ghp_{}", crate::secrets::tests::fake(36, 81));
+        for before in [MAX_ACTION_CHARS - 40, MAX_ACTION_CHARS - 12, MAX_ACTION_CHARS - 3] {
+            let command = format!("{} {}", "x".repeat(before - 1), token);
+            let line = action_line("Bash", &json!({ "command": command })).expect("line");
+            for kept in 8..=token.len() {
+                assert!(!line.contains(&token[..kept]), "{} characters of the token left at {}", kept, before);
+            }
+        }
+        let pushed = format!("git push https://x-access-token:{}@github.com/vendor/sdk.git {}", token, "y".repeat(300));
+        let line = action_line("Bash", &json!({ "command": pushed })).expect("line");
+        assert!(!line.contains(&token[..8]), "{}", line);
     }
 
     #[test]
