@@ -130,7 +130,11 @@ fn request_of(memory: &Memory, now: chrono::DateTime<chrono::Utc>) -> Option<(Ex
     let text = |key: &str| fields.get(key).and_then(Value::as_str).map(str::to_string);
     let status = text("status").unwrap_or_else(|| PENDING.to_string());
     let sent_at = text("sent_at")?;
-    let waiting_days = (status == PENDING).then(|| instant(&sent_at).map(|at| (now - at).num_days().max(0))).flatten();
+    // Days of the calendar, not elapsed 24-hour spans: a date alone is read
+    // at noon, so a span would say one day less every morning.
+    let waiting_days = (status == PENDING)
+        .then(|| instant(&sent_at).map(|at| (now.date_naive() - at.date_naive()).num_days().max(0)))
+        .flatten();
     Some((
         ExternalRequest {
             id: memory.id.clone(),
