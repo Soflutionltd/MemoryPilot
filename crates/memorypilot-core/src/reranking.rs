@@ -722,8 +722,9 @@ fn discard_corrupt_files(spec: OrtRerankerSpec) -> String {
 /// Threads of one rerank: half the cores, between 2 and 4. Memories are
 /// often long (pairs of up to 512 tokens), and on 12 of them four threads
 /// answer in two thirds of the time two take (measured on an M2 Max: 3.2 s
-/// with 2, 2.2 s with 4, 1.8 s with 8, model load included); beyond four,
-/// concurrent searches would fight for the cores.
+/// with 2, 2.2 s with 4, 1.8 s with 8, model load included). The pool
+/// holds one model by default, so reranks queue instead of adding up;
+/// `MEMORYPILOT_RERANK_POOL_SIZE` multiplies this figure.
 /// `MEMORYPILOT_RERANK_THREADS` overrides.
 fn rerank_intra_threads() -> usize {
     let available = std::thread::available_parallelism()
