@@ -496,10 +496,11 @@ mod tests {
     }
 
     /// An index written by the reader that cut action lines before masking
-    /// them: the cut lines go when the index is opened, and a session read
-    /// again writes its actions anew instead of adding to the old ones.
+    /// them: when the index is opened, the unfinished end of each cut line
+    /// goes and everything else stays, also for a source that is never read
+    /// again; a session read again writes its actions anew.
     #[test]
-    fn action_lines_cut_before_masking_leave_the_index() {
+    fn action_lines_cut_before_masking_lose_only_their_unfinished_end() {
         let dir = fresh_dir("cut-lines");
         let projects = dir.join("projects/-work-courly");
         std::fs::create_dir_all(&projects).unwrap();
@@ -520,21 +521,24 @@ mod tests {
         std::fs::write(projects.join("s.jsonl"), &file).unwrap();
         let path = dir.join("conversations.db");
         let fragment = format!("ghp_{}", crate::secrets::tests::fake(20, 82));
+        let key_start = crate::secrets::tests::fake(40, 83);
+        let cut = format!("Bash: curl -H 'X-Trace: on' https://api.example.com/tickets --token {}…", fragment);
+        let cut_key = format!("Bash: deploy --key -----BEGIN PRIVATE KEY----- {} {}…", key_start, &key_start[..12]);
         {
             let mut store = ConversationStore::open(&path).unwrap();
             let mut report = SyncReport::default();
             sync_claude_roots(&mut store, &[dir.join("projects")], &mut report, &|_| false);
             assert!(report.errors.is_empty(), "{:?}", report.errors);
-            // What the former reader left: a line cut across a token, on
-            // this turn and on a turn of a source that is not read again.
-            let cut = format!("Bash: {} {}…", "x".repeat(260), fragment);
+            // What the former reader left, on this turn and on a turn of a
+            // source that is not read again (with a vector already made).
             store.conn.execute("UPDATE segments SET text = text || char(10) || ?1 WHERE source_key = 'claude-code:s:u1#actions'", [&cut]).unwrap();
+            let other = format!("open: https://status.example.com/incident/42\n{}\n{}\nonlyoneword…", cut, cut_key);
             store
                 .conn
                 .execute(
-                    "INSERT INTO segments (conversation_id, origin_id, source_key, role, at, text, text_hash)
-                     SELECT conversation_id, origin_id, 'cursor:c:b1#actions', 'action', at, ?1, 'old' FROM segments LIMIT 1",
-                    [&cut],
+                    "INSERT INTO segments (conversation_id, origin_id, source_key, role, at, text, text_hash, embed_state, embedding)
+                     SELECT conversation_id, origin_id, 'cursor:c:b1#actions', 'action', at, ?1, 'old', 2, x'0102' FROM segments LIMIT 1",
+                    [&other],
                 )
                 .unwrap();
             store.conn.execute("DELETE FROM upkeep", []).unwrap();
@@ -542,9 +546,25 @@ mod tests {
         let mut store = ConversationStore::open(&path).unwrap();
         let holding: i64 = store
             .conn
-            .query_row("SELECT COUNT(*) FROM segments WHERE instr(text, ?1) > 0", [&fragment], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM segments WHERE instr(text, ?1) > 0 OR instr(text, ?2) > 0",
+                [&fragment[..8], &key_start[..12]],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(holding, 0, "the cut lines are gone as soon as the index opens");
+        assert_eq!(holding, 0, "the unfinished ends are gone as soon as the index opens");
+        assert_eq!(
+            text_of(&store, "cursor:c:b1#actions").as_deref(),
+            Some("open: https://status.example.com/incident/42\nBash: curl -H 'X-Trace: on' https://api.example.com/tickets --token …\nBash: deploy --key …"),
+            "what was done is kept"
+        );
+        let embedded: (i64, Vec<u8>) = store
+            .conn
+            .query_row("SELECT embed_state, embedding FROM segments WHERE source_key = 'cursor:c:b1#actions'", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert_eq!(embedded, (2, vec![1, 2]), "its vector is not made again");
+        let found = store.search_within(&keys_conversation(&store, "cursor:c:b1#actions"), "incident tickets", 5, false).unwrap().expect("known");
+        assert!(!found.is_empty(), "still found by its words");
 
         // The session grows: its actions are written again, whole.
         let more = call("a2", "2026-11-16T17:30:00Z", "gh issue comment 42 --repo vendor/sdk --body 'Logs joints'");
@@ -557,6 +577,10 @@ mod tests {
             Some("Bash: gh issue create --repo vendor/sdk --title 'Audio'\nBash: gh issue comment 42 --repo vendor/sdk --body 'Logs joints'")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn keys_conversation(store: &ConversationStore, key: &str) -> String {
+        store.conn.query_row("SELECT conversation_id FROM segments WHERE source_key = ?1", [key], |row| row.get(0)).unwrap()
     }
 
     /// A request made of an image alone opens a turn, and what the agent

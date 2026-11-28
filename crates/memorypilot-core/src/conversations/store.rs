@@ -114,7 +114,7 @@ impl ConversationStore {
             }
         }
         let mut conn = conn;
-        drop_action_lines_cut_before_masking(&mut conn)?;
+        trim_action_lines_cut_before_masking(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -855,14 +855,28 @@ fn upsert_actions(
     upsert_parts(tx, source, "action", &key, at, &lines.join("\n"), text::MAX_ANSWER_CHARS)
 }
 
-/// Once per index: drops the action segments holding a line cut by the
-/// reader that cut before masking. A secret across the cut stayed there in
-/// clear, too short for the filter to recognise, so no later masking pass
-/// finds it. Sessions read whole write their actions again at the next
-/// sync; a Cursor turn gets them back when its conversation is read again.
-/// Returns how many segments were dropped.
-fn drop_action_lines_cut_before_masking(conn: &mut Connection) -> Result<usize, String> {
-    const DONE: &str = "action-lines-cut-before-masking";
+/// What can be kept of an action line cut by the reader that cut before
+/// masking: a secret across the cut stayed in clear at the end of the line,
+/// too short for the filter to recognise. The unfinished last word goes,
+/// and an unfinished key block with it; the rest of the line says what was
+/// done and is kept. `None` when nothing is left to keep.
+fn trimmed_cut_line(line: &str) -> Option<String> {
+    let body = line.strip_suffix('…')?;
+    let kept = match body.rfind("-----BEGIN") {
+        Some(start) if !body[start..].contains("-----END") => body[..start].trim_end(),
+        _ => match body.trim_end().rsplit_once(char::is_whitespace) {
+            Some((before, _unfinished)) => before.trim_end(),
+            None => "",
+        },
+    };
+    (!kept.is_empty()).then(|| format!("{} …", secrets::redact(kept)))
+}
+
+/// Once per index: rewrites the action lines cut before masking (see
+/// `trimmed_cut_line`). The other lines of a turn, and the vector of the
+/// segment, stay as they are. Returns how many segments were rewritten.
+fn trim_action_lines_cut_before_masking(conn: &mut Connection) -> Result<usize, String> {
+    const DONE: &str = "action-lines-cut-before-masking-trimmed";
     let failed = |error: rusqlite::Error| format!("Conversations upkeep: {}", error);
     conn.execute_batch("CREATE TABLE IF NOT EXISTS upkeep (name TEXT PRIMARY KEY, at TEXT NOT NULL)").map_err(failed)?;
     let done: Option<String> =
@@ -871,32 +885,44 @@ fn drop_action_lines_cut_before_masking(conn: &mut Connection) -> Result<usize, 
         return Ok(0);
     }
     let tx = conn.transaction().map_err(failed)?;
-    let cut: Vec<String> = {
-        let mut statement = tx.prepare("SELECT source_key, text FROM segments WHERE role = 'action'").map_err(failed)?;
-        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(failed)?;
-        let mut turns = std::collections::BTreeSet::new();
+    let cut: Vec<(i64, String)> = {
+        let mut statement = tx.prepare("SELECT id, text FROM segments WHERE role = 'action'").map_err(failed)?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).map_err(failed)?;
+        let mut found = Vec::new();
         for row in rows {
-            let (key, text) = row.map_err(failed)?;
+            let (id, text) = row.map_err(failed)?;
             if text.lines().any(|line| line.ends_with('…')) {
-                // `turn#actions`, `turn#actions#p2`…: every part of the turn goes.
-                turns.insert(key.split_once("#actions").map(|(turn, _)| format!("{}#actions", turn)).unwrap_or(key));
+                found.push((id, text));
             }
         }
-        turns.into_iter().collect()
+        found
     };
-    let mut dropped = 0;
-    for key in &cut {
-        for part in 0..MAX_PARTS {
-            let part_key = if part == 0 { key.clone() } else { format!("{}#p{}", key, part + 1) };
-            if segment_exists(&tx, &part_key)? {
-                delete_segment(&tx, &part_key)?;
-                dropped += 1;
-            }
+    for (id, text) in &cut {
+        let lines: Vec<String> = text
+            .lines()
+            .filter_map(|line| if line.ends_with('…') { trimmed_cut_line(line) } else { Some(line.to_string()) })
+            .collect();
+        let body = lines.join("\n");
+        tx.execute("DELETE FROM segments_fts WHERE rowid = ?1", [id]).map_err(failed)?;
+        if body.is_empty() {
+            tx.execute("DELETE FROM refs WHERE segment_id = ?1", [id]).map_err(failed)?;
+            tx.execute("DELETE FROM segments WHERE id = ?1", [id]).map_err(failed)?;
+            continue;
         }
+        tx.execute(
+            "UPDATE segments SET text = ?2, text_hash = ?3 WHERE id = ?1",
+            params![id, body, crate::db::content_hash(&body)],
+        )
+        .map_err(failed)?;
+        tx.execute(
+            "INSERT INTO segments_fts (rowid, body) VALUES (?1, ?2)",
+            params![id, format!("{}\n{}", body, crate::stemming::stem_text(&body))],
+        )
+        .map_err(failed)?;
     }
     tx.execute("INSERT INTO upkeep (name, at) VALUES (?1, ?2)", params![DONE, chrono::Utc::now().to_rfc3339()]).map_err(failed)?;
     tx.commit().map_err(failed)?;
-    Ok(dropped)
+    Ok(cut.len())
 }
 
 /// Writes the FTS row and the references of a segment whose old ones
