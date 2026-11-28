@@ -459,10 +459,20 @@ fn automatic_updates_blocked() -> Option<String> {
     if auto_update_disabled(std::env::var("MEMORYPILOT_AUTO_UPDATE").ok().as_deref()) {
         return Some("MEMORYPILOT_AUTO_UPDATE=0".to_string());
     }
+    // The copy and the self-test are made on the database of the installation:
+    // a server on another one (a test, a trial) would install a version that
+    // was never tried on the database it serves.
+    if serves_another_database(std::env::var("MEMORYPILOT_DB").ok().as_deref()) {
+        return Some("MEMORYPILOT_DB is set: this server is not on the database of the installation".to_string());
+    }
     let Some(exe) = executable() else {
         return Some("executable path unknown".to_string());
     };
     installation_blocked(&exe.path, cfg!(debug_assertions)).map(str::to_string)
+}
+
+fn serves_another_database(raw: Option<&str>) -> bool {
+    raw.is_some_and(|path| !path.trim().is_empty())
 }
 
 fn auto_update_disabled(raw: Option<&str>) -> bool {
@@ -744,15 +754,8 @@ fn backup_database(data: &Path, version: &str) -> Result<Option<PathBuf>, String
     Ok(Some(target))
 }
 
-/// The database the servers of this machine open: `MEMORYPILOT_DB` when the
-/// process that updates has it, else `data/memory.db`.
 fn live_database(data: &Path) -> PathBuf {
-    database_chosen(std::env::var("MEMORYPILOT_DB").ok().as_deref())
-        .unwrap_or_else(|| memorypilot_core::layout::path_in(data, memorypilot_core::layout::Area::Data, "memory.db"))
-}
-
-fn database_chosen(raw: Option<&str>) -> Option<PathBuf> {
-    raw.filter(|path| !path.trim().is_empty()).map(PathBuf::from)
+    memorypilot_core::layout::path_in(data, memorypilot_core::layout::Area::Data, "memory.db")
 }
 
 fn schema_version_of(database: &Path) -> Result<i32, String> {
@@ -1543,13 +1546,6 @@ mod tests {
     }
 
     #[test]
-    fn the_database_chosen_by_the_environment_is_the_one_copied() {
-        assert_eq!(database_chosen(None), None);
-        assert_eq!(database_chosen(Some("  ")), None);
-        assert_eq!(database_chosen(Some("/srv/memory/team.db")), Some(PathBuf::from("/srv/memory/team.db")));
-    }
-
-    #[test]
     fn development_builds_stay_out_of_updates() {
         let installed = Path::new("/Users/someone/.local/bin/MemoryPilot");
         assert_eq!(development_build(installed, false), None);
@@ -1709,5 +1705,8 @@ mod tests {
         for off in ["0", "off", "false", "no", " OFF "] {
             assert!(auto_update_disabled(Some(off)), "{}", off);
         }
+        assert!(!serves_another_database(None));
+        assert!(!serves_another_database(Some("  ")));
+        assert!(serves_another_database(Some("/tmp/trial.db")));
     }
 }
