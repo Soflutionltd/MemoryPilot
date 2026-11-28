@@ -38,6 +38,14 @@ git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null || die "ta
 [ "$(git rev-parse HEAD)" = "$(git rev-parse "${TAG}^{commit}")" ] || die "HEAD is not ${TAG}: check out the tag"
 git diff --quiet HEAD || die "uncommitted changes: the asset must be the tag, nothing else"
 
+# Signing again gives the archive another digest (the signature carries its
+# time), while the update manifest already published pins the first one:
+# every installed copy would then refuse the update, and the manifest step
+# below would restart a rollout that may have been paused on purpose.
+if gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "latest.json"; then
+	die "${TAG} is already announced to the updater (latest.json is on the release): publish a new version instead"
+fi
+
 # Nothing is signed, uploaded or announced to the updater from a tag whose
 # tests fail: a build that compiles is not a build that works.
 echo "▸ test ${TAG}"
