@@ -51,7 +51,7 @@ fn add_known_secret_writes_only_the_print() {
     assert!(stdout.contains(&print[..4]) && !stdout.contains(print) && !stdout.contains(token));
     assert!(!content.contains(token));
 
-    let known = secrets::load_known_secrets_from(Some(&file), None);
+    let (known, _) = secrets::load_known_secrets_from(Some(&file), None);
     assert_eq!(
         secrets::redact_with(&text, &known),
         format!("TOKEN_ID {} dans le .env", secrets::mask("known", token))
