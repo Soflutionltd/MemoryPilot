@@ -610,3 +610,110 @@ fn gc_merge_leaves_temporary_memories_alone() {
     }
     cleanup(&path);
 }
+
+// ─── November 2026 audit: without the embedding model ────────────────────
+
+/// A model that could not be loaded stopped the whole process (`panic!`
+/// with `panic = "abort"`): no search, even by words.
+#[test]
+fn a_search_goes_on_by_words_when_the_model_is_down() {
+    let path = temp_db_path("words-only");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let (wanted, _) = add(&db, "The quokkaledger export runs on the cron host every night", "fact", "proj");
+        add(&db, "The login page uses the new session cookie", "fact", "proj");
+
+        let _outage = crate::embedding::outage::start();
+        let (found, confidence) = db
+            .search_at(chrono::Utc::now(), "quokkaledger export on the cron host", 10, None, None, None, None)
+            .expect("a search without the model is still a search");
+        assert!(found.iter().any(|hit| hit.memory.id == wanted.id), "the words of the query find the memory");
+        assert_eq!(confidence.degraded, Some(super::SearchConfidence::WORDS_ONLY));
+        assert!(confidence.abstain, "without a cosine the search never claims to be sure");
+        assert_eq!(confidence.top_cosine, 0.0);
+        let said = serde_json::to_value(&confidence).unwrap();
+        assert_eq!(said["degraded"], super::SearchConfidence::WORDS_ONLY);
+
+        let (nothing, verdict) = db
+            .search_at(chrono::Utc::now(), "zyxwvutsrq unmatched nonsense token", 10, Some("proj"), None, None, None)
+            .expect("search");
+        assert!(nothing.is_empty());
+        assert!(verdict.degraded.is_some(), "an empty answer by words says it searched by words");
+    }
+    cleanup(&path);
+}
+
+/// With the model there, the verdict carries no warning.
+#[test]
+fn a_normal_search_says_nothing_of_a_degraded_mode() {
+    let path = temp_db_path("not-degraded");
+    {
+        let db = Database::open_at(&path).expect("db");
+        add(&db, "The wombatqueue worker retries a failed job three times", "fact", "proj");
+        let (_, confidence) = db
+            .search_at(chrono::Utc::now(), "wombatqueue worker retries", 10, None, None, None, None)
+            .expect("search");
+        assert_eq!(confidence.degraded, None);
+        assert!(serde_json::to_value(&confidence).unwrap().get("degraded").is_none());
+    }
+    cleanup(&path);
+}
+
+/// A memory waiting for its vector made `Database::open` embed it at once:
+/// without the model the database could no longer be opened at all.
+#[test]
+fn a_database_opens_without_the_model_and_keeps_what_waits_for_a_vector() {
+    let path = temp_db_path("open-without-model");
+    let waiting = {
+        let db = Database::open_at(&path).expect("db");
+        let (memory, _) = add(&db, "The numbatcache key includes the tenant id", "fact", "proj");
+        db.conn.execute("UPDATE memories SET embedding=NULL", []).unwrap();
+        memory.id
+    };
+    {
+        let _outage = crate::embedding::outage::start();
+        let db = Database::open_at(&path).expect("the database opens without the model");
+        let kept = db.get_memory(&waiting).unwrap().expect("the memory is still there");
+        assert!(kept.content.contains("numbatcache"));
+        let (listed, total) = db.list_memories(Some("proj"), None, None, 10, 0).unwrap();
+        assert_eq!((listed.len(), total), (1, 1));
+        let (found, _) = db.search_at(chrono::Utc::now(), "numbatcache tenant id", 5, None, None, None, None).expect("search");
+        assert!(found.iter().any(|hit| hit.memory.id == waiting));
+        assert!(db.backfill_embeddings().is_err(), "a backfill without the model says so instead of pretending");
+    }
+    cleanup(&path);
+}
+
+/// An import embedded each memory on the spot, so it stopped with the model.
+#[test]
+fn an_import_without_the_model_keeps_the_memories_for_a_later_vector() {
+    let path = temp_db_path("import-without-model");
+    {
+        let db = Database::open_at(&path).expect("db");
+        let _outage = crate::embedding::outage::start();
+        let imported = db
+            .import_batch(&[("The bilbyrouter sends EU traffic to Frankfurt".to_string(), "fact".to_string(), Some("proj".to_string()), Vec::new(), "test".to_string())])
+            .expect("import");
+        assert_eq!(imported, 1);
+        let without_vector: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories WHERE content LIKE '%bilbyrouter%' AND embedding IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(without_vector, 1, "kept, to be embedded once the model is back");
+    }
+    cleanup(&path);
+}
+
+/// Episodes are ranked on their words when the query has no vector.
+#[test]
+fn episodes_are_searched_by_words_without_the_model() {
+    let path = temp_db_path("episodes-without-model");
+    {
+        let db = Database::open_at(&path).expect("db");
+        seed_episode(&db, "e-hour", "interval", "The dunnartbilling migration moved invoices to the new ledger", "[]", "[]");
+        let _outage = crate::embedding::outage::start();
+        let hits = db.search_episodes("dunnartbilling migration invoices", 5, None).expect("episodes");
+        assert_eq!(hits.len(), 1);
+    }
+    cleanup(&path);
+}
